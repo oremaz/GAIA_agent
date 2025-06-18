@@ -15,7 +15,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry import trace
 from langfuse import Langfuse
-from smolagents import PythonInterpreterTool, FinalAnswerTool
+from smolagents import PythonInterpreterTool, FinalAnswerTool, SpeechToTextTool
 
 
 import requests
@@ -23,8 +23,11 @@ from markdownify import markdownify
 from requests.exceptions import RequestException
 from smolagents import tool
 import re
+import mimetypes
+
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
 
 class WebSearchTool(Tool):
     name = "web_search"
@@ -114,7 +117,7 @@ class BM25RetrieverTool(Tool):
     BM25 retriever tool for document search when text documents are available
     """
     name = "bm25_retriever"
-    description = "Uses BM25 search to retrieve relevant parts of uploaded documents. Use this when the question references an attached file or document."
+    description = "Uses BM25 search to retrieve relevant parts of uploaded documents. Use this when the question references an attached file or document (except for images)."
     inputs = {
         "query": {
             "type": "string",
@@ -238,7 +241,8 @@ class GAIAAgent:
             tools=base_tools + [
                 WebSearchTool(),
                 PythonInterpreterTool(),
-                FinalAnswerTool()],
+                FinalAnswerTool(), 
+                SpeechToTextTool()],
             model=self.model,
             description=self.system_prompt, 
             max_steps=5, 
@@ -253,29 +257,38 @@ class GAIAAgent:
 ]       )
 
 
-    def load_documents_from_file(self, file_path: str):
-        """Load and process documents from a file for BM25 retrieval"""
-        try:
-            # Read file content
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
 
-            # Split into chunks
+    def load_documents_from_file(self, file_path: str):
+        """Load and process text documents for BM25, or return raw content for media files."""
+        try:
+            # Devine le type MIME du fichier
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if mime_type is None:
+                mime_type = ""
+            print(f"Detected MIME type: {mime_type} for file {file_path}")
+            # Traitement selon le type de fichier
+            if mime_type.startswith("image") or mime_type.startswith("video") or mime_type.startswith("audio"):
+                with open(file_path, "rb") as f:
+                    binary_content = f.read()
+                print(f"Loaded {mime_type} file: {file_path}")
+                return binary_content
+            else : 
+            # Si fichier texte → traitement BM25
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            # Split en chunks
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
                 separators=["\n\n", "\n", ".", " ", ""]
             )
 
-            # Create documents
             chunks = text_splitter.split_text(content)
-            docs = [Document(page_content=chunk, metadata={"source": file_path}) 
+            docs = [Document(page_content=chunk, metadata={"source": file_path})
                     for chunk in chunks]
 
-            # Update retriever tool
+            # BM25 + agent
             self.retriever_tool = BM25RetrieverTool(docs)
-
-            # Recreate agent with updated retriever
             self._create_agent()
 
             print(f"Loaded {len(docs)} document chunks from {file_path}")
@@ -285,17 +298,30 @@ class GAIAAgent:
             print(f"Error loading documents from {file_path}: {e}")
             return False
 
+
     def download_gaia_file(self, task_id: str, api_url: str = "https://agents-course-unit4-scoring.hf.space") -> str:
-        """Download file associated with GAIA task_id"""
+        """Download file associated with GAIA task_id and return its path"""
         try:
             response = requests.get(f"{api_url}/files/{task_id}", timeout=30)
             response.raise_for_status()
 
-            filename = f"task_{task_id}_file.txt"
+            # Try to get filename from headers
+            print(f"Response headers: {response.headers}")
+            content_disp = response.headers.get("content-disposition", "")
+            match = re.search(r'filename="(.+)"', content_disp)
+            if match:
+                filename = match.group(1)
+            else:
+                # Error
+                raise ValueError("Filename not found in response headers")
+
+            # Save the file
             with open(filename, 'wb') as f:
                 f.write(response.content)
 
-            return filename
+            print(f"Downloaded file saved as {filename}")
+            return os.path.abspath(filename)  # Or just return `filename` for relative path
+
         except Exception as e:
             print(f"Failed to download file for task {task_id}: {e}")
             return None
@@ -344,7 +370,7 @@ class GAIAAgent:
                 prompt = f"""
     Question: {question}
     {f'Task ID: {task_id}' if task_id else ''}
-    {f'File loaded: Yes' if file_loaded else 'File loaded: No'}
+    {f'File loaded: Yes as {file_path}' if file_loaded else 'File loaded: No'}
 
                 """
 
@@ -446,13 +472,12 @@ if __name__ == "__main__":
 
     # Example question
     question_data = {
-        "Question": "How many studio albums Mercedes Sosa has published between 2000-2009? Search on the English Wikipedia webpage.",
-        "task_id": ""
+        "Question": "Hi, I'm making a pie but I could use some help with my shopping list. I have everything I need for the crust, but I'm not sure about the filling. I got the recipe from my friend Aditi, but she left it as a voice memo and the speaker on my phone is buzzing so I can't quite make out what she's saying. Could you please listen to the recipe and list all of the ingredients that my friend described? I only want the ingredients for the filling, as I have everything I need to make my favorite pie crust. I've attached the recipe as Strawberry pie.mp3.  In your response, please only list the ingredients, not any measurements. So if the recipe calls for ""a pinch of salt"" or ""two cups of ripe strawberries"" the ingredients on the list would be ""salt"" and ""ripe strawberries"". Please format your response as a comma separated list of ingredients. Also, please alphabetize the ingredients.",
+        "task_id": "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3"
     }
 
     # Solve with full observability
     answer = agent.solve_gaia_question(
         question_data, 
-        tags=["music-question", "discography"]
     )
     print(f"Answer: {answer}")

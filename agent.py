@@ -408,15 +408,13 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
     Returns a list of Document objects containing the extracted content.
     """
     # Get URL from search
-    #search_results = base_duckduckgo_tool(query, max_results=1)
-    #url_match = re.search(r"https?://\S+", str(search_results))
+    search_results = base_duckduckgo_tool(query, max_results=1)
+    url_match = re.search(r"https?://\S+", str(search_results))
     
-    #if not url_match:
-        #return [Document(text="No URL could be extracted from the search results.")]
+    if not url_match:
+        return [Document(text="No URL could be extracted from the search results.")]
     
-    #url = url_match.group(0)[:-2]
-    url = "https://en.wikipedia.org/wiki/Mercedes_Sosa"
-    print(url)
+    url = url_match.group(0)[:-2]
     documents = []
 
     try:

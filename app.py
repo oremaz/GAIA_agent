@@ -67,6 +67,7 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
         response = requests.get(questions_url, timeout=15)
         response.raise_for_status()
         questions_data = response.json()
+        print(questions_data)
         if not questions_data:
              print("Fetched questions list is empty.")
              return "Fetched questions list is empty or invalid format.", None

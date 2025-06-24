@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.retrievers import BM25Retriever
-from smolagents import CodeAgent, OpenAIServerModel, Tool
+from smolagents import CodeAgent, OpenAIServerModel, Tool, ToolCallingAgent
 from smolagents import PythonInterpreterTool, SpeechToTextTool
 
 # Langfuse observability imports
@@ -15,7 +15,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry import trace
 from langfuse import Langfuse
-from smolagents import PythonInterpreterTool, FinalAnswerTool, SpeechToTextTool
+from smolagents import PythonInterpreterTool
 
 
 import requests
@@ -28,7 +28,125 @@ import mimetypes
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
+from smolagents import Tool
+from google import genai
+from google.genai import types
+import os
+import mimetypes
+from typing import Dict, Any
 
+agent_type = "ToolAgent"
+
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+
+def llm_reformat(response: str, question: str, type: str = "number") -> str:
+    """
+    Use LLM to extract ONLY the number from the response, using the question context to ensure the correct number is chosen.
+    """
+    if type != "number":
+        return response  # Only process if type is number
+
+    format_prompt = f"""Given the following question and response, extract ONLY the number that directly answers the question, following GAIA formatting rules.
+
+
+Examples:
+Question: "How many papers were published in total?"
+Response: "The analysis shows 156 papers were published in total."
+Answer: 156
+
+Question: "How many stars are there?"
+Response: "There are approximately 3.14e+8 stars."
+Answer: 3.14e+8
+
+Now, given:
+Question: {question}
+Response: {response}
+
+Extract ONLY the number that answers the question:
+Answer:"""
+
+    try:
+        formatting_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[format_prompt]
+        )
+        answer = formatting_response.text.strip()
+        # Remove any accidental prefix
+        if "Answer:" in answer:
+            answer = answer.split("Answer:")[-1].strip()
+        return answer
+    except Exception as e:
+        print(f"LLM reformatting failed: {e}")
+        return response
+    
+class FinalAnswerTool(Tool):
+    name = "final_answer"
+    description = "Provides a final answer to the given problem with automatic formatting based on question keywords."
+    inputs = {
+        "answer": {
+            "type": "any", 
+            "description": "The final answer to the problem"
+        },
+        "original_question": {
+            "type": "string", 
+            "description": "The original question to determine answer format", 
+            "nullable": True  # Optional parameter
+        }
+    }
+    output_type = "any"
+    
+    def __init__(self):
+        super().__init__()
+        self.keywords = {
+            "how many": "number",
+            "how much": "number", 
+            "count": "number",
+            "total": "number",
+            "sum": "number",
+            "average": "number",
+            "median": "number",
+            "percentage": "number",
+            "number" : "string",
+        }
+    
+    def _detect_keyword(self, question: str) -> str:
+        """Detect which keyword pattern matches the question."""
+        question_lower = question.lower().strip()
+        
+        for keyword, format_type in self.keywords.items():
+            if keyword in question_lower:
+                return format_type
+        
+        return "string"  # Default format
+    
+    def _format_answer(self, answer: Any, format_type: str, original_question) -> Any:
+        """Format the answer based on the detected keyword type."""
+        print(f"Detected format type: {format_type} for question: {original_question}")
+        if format_type == "number":
+            # Try to extract/convert to number
+            if isinstance(answer, (int, float)):
+                return answer
+            elif isinstance(answer, str):
+                # Extract first number from string
+                answer2 = llm_reformat(answer, original_question, type="number")
+                return answer2 if answer2 else answer
+        return answer
+    
+    def forward(self, answer: Any, original_question: str = "") -> Any:
+        """Process the answer with automatic formatting based on question keywords."""
+        
+        if not original_question:
+            return answer
+        
+        # Detect the expected format from the question
+        format_type = self._detect_keyword(original_question)
+        
+        # Format the answer accordingly
+        formatted_answer = self._format_answer(answer, format_type, original_question)
+        
+        return formatted_answer
+
+    
 class WebSearchTool(Tool):
     name = "web_search"
     description = """Performs a duckduckgo web search based on your query (think a Google search) then returns the top search results."""
@@ -112,6 +230,221 @@ def visit_webpage(url: str) -> str:
         return f"An unexpected error occurred: {str(e)}"
     
 
+class UnifiedMultimodalTool(Tool):
+    name = "multimodal_processor"
+    description = """
+    Unified tool for processing audio, video, and image files.
+    Supports transcription, analysis, content extraction, captioning, and cross-modal tasks.
+    Handles common formats: mp3, wav, m4a, mp4, avi, mov, jpg, png, gif, etc.
+    """
+    
+    # Required: Define inputs attribute
+    inputs = {
+        "file_path": {
+            "type": "string", 
+            "description": "Path to the media file (audio, video, or image) to process"
+        },
+        "task": {
+            "type": "string",
+            "description": "Processing task: analyze, transcribe, extract, caption, summarize, or search",
+            "nullable": True  # Optional parameter
+        },
+        "modality": {
+            "type": "string", 
+            "description": "Force specific modality: auto, audio, video, or image",
+            "nullable": True  # Optional parameter
+        },
+        "additional_context": {
+            "type": "string",
+            "description": "Extra instructions for processing",
+            "nullable": True  # Optional parameter
+        }
+    }
+    
+    # Required: Define output type
+    output_type = "string"
+    
+    def __init__(self, api_key: str):
+        super().__init__()
+        self.client = genai.Client(api_key=api_key)
+        # Initialize mimetypes for better detection
+        mimetypes.init()
+        
+    def forward(self, 
+                file_path: str, 
+                task: str = "analyze", 
+                modality: str = "auto",
+                additional_context: str = "") -> str:
+        """
+        Process multimedia files with unified interface
+        
+        Args:
+            file_path: Path to media file
+            task: Processing task (analyze, transcribe, extract, caption, summarize, search)
+            modality: Force specific modality (auto, audio, video, image)
+            additional_context: Extra instructions for processing
+        """
+        try:
+            # Auto-detect modality if not specified
+            if modality == "auto":
+                modality = self._detect_modality(file_path)
+            
+            # Check file size for upload method selection
+            file_size = os.path.getsize(file_path)
+            use_files_api = file_size > 20 * 1024 * 1024  # 20MB threshold
+            
+            # Generate appropriate prompt based on task and modality
+            prompt = self._generate_prompt(task, modality, additional_context)
+            
+            # Process file
+            if use_files_api:
+                return self._process_with_files_api(file_path, prompt)
+            else:
+                return self._process_inline(file_path, prompt)
+                
+        except Exception as e:
+            return f"Error processing {modality} file: {str(e)}"
+    
+    def _detect_modality(self, file_path: str) -> str:
+        """Auto-detect file modality using mimetypes.guess_type()"""
+        # Use mimetypes.guess_type for reliable MIME type detection
+        mime_type, encoding = mimetypes.guess_type(file_path)
+        
+        if mime_type:
+            if mime_type.startswith('audio/'):
+                return 'audio'
+            elif mime_type.startswith('video/'):
+                return 'video'
+            elif mime_type.startswith('image/'):
+                return 'image'
+        
+        # Fallback to extension-based detection if MIME type is unknown
+        ext = file_path.lower().split('.')[-1]
+        audio_exts = {'mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'wma'}
+        video_exts = {'mp4', 'avi', 'mov', 'mkv', 'webm', 'flv', 'wmv', '3gp'}
+        image_exts = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'tiff', 'svg'}
+        
+        if ext in audio_exts:
+            return 'audio'
+        elif ext in video_exts:
+            return 'video'
+        elif ext in image_exts:
+            return 'image'
+        else:
+            return 'unknown'
+    
+    def _get_mime_type(self, file_path: str) -> str:
+        """Get MIME type using mimetypes.guess_type()"""
+        mime_type, encoding = mimetypes.guess_type(file_path)
+        
+        if mime_type:
+            return mime_type
+        
+        # Fallback mappings for common formats not detected by mimetypes
+        ext = file_path.lower().split('.')[-1]
+        fallback_mappings = {
+            'm4a': 'audio/mp4',
+            'mkv': 'video/x-matroska',
+            'webm': 'video/webm',
+            'flac': 'audio/flac',
+            'ogg': 'audio/ogg',
+            'webp': 'image/webp'
+        }
+        
+        return fallback_mappings.get(ext, 'application/octet-stream')
+    
+    def _generate_prompt(self, task: str, modality: str, context: str) -> str:
+        """Generate contextual prompts based on task and modality"""
+        
+        base_prompts = {
+            'analyze': {
+                'audio': 'Analyze this audio file. Describe the content, identify sounds, speech, music, and any notable audio characteristics.',
+                'video': 'Analyze this video comprehensively. Describe visual content, actions, audio elements, and their relationship.',
+                'image': 'Analyze this image in detail. Describe objects, scenes, text, colors, composition, and any notable features.'
+            },
+            'transcribe': {
+                'audio': 'Transcribe all speech in this audio file accurately. Include speaker changes if multiple speakers.',
+                'video': 'Transcribe all speech and dialogue in this video. Note visual context when relevant.',
+                'image': 'Extract and transcribe any text visible in this image using OCR.'
+            },
+            'extract': {
+                'audio': 'Extract key information, topics, or specific content from this audio.',
+                'video': 'Extract key visual and audio information from this video.',
+                'image': 'Extract all text, objects, and important visual elements from this image.'
+            },
+            'caption': {
+                'audio': 'Generate descriptive captions for this audio content.',
+                'video': 'Generate detailed captions describing both visual and audio elements of this video.',
+                'image': 'Generate a comprehensive caption describing this image.'
+            },
+            'summarize': {
+                'audio': 'Provide a concise summary of the main points in this audio.',
+                'video': 'Summarize the key visual and audio content of this video.',
+                'image': 'Summarize the main elements and content of this image.'
+            },
+            'search': {
+                'audio': 'Make this audio content searchable by extracting keywords, topics, and semantic information.',
+                'video': 'Extract searchable content from both visual and audio elements of this video.',
+                'image': 'Extract searchable keywords and descriptions from this image.'
+            }
+        }
+        
+        prompt = base_prompts.get(task, base_prompts['analyze']).get(modality, 'Analyze this media file.')
+        
+        if context:
+            prompt += f" Additional context: {context}"
+            
+        return prompt
+    
+    def _process_with_files_api(self, file_path: str, prompt: str) -> str:
+        """Process large files using Files API"""
+        uploaded_file = self.client.files.upload(file=file_path)
+        
+        response = self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt, uploaded_file]
+        )
+        
+        return response.text
+    
+    def _process_inline(self, file_path: str, prompt: str) -> str:
+        """Process smaller files inline"""
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+        
+        mime_type = self._get_mime_type(file_path)
+        
+        # Correct way to create parts in the new SDK
+        contents = [
+            prompt,  # Text can be passed directly
+            types.Part.from_bytes(
+                data=file_data,
+                mime_type=mime_type
+            )
+        ]
+        
+        response = self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents
+        )
+        
+        return response.text
+
+    def get_file_info(self, file_path: str) -> Dict[str, str]:
+        """Get detailed file information including MIME type and modality"""
+        mime_type, encoding = mimetypes.guess_type(file_path)
+        modality = self._detect_modality(file_path)
+        file_size = os.path.getsize(file_path)
+        
+        return {
+            'file_path': file_path,
+            'mime_type': mime_type or 'unknown',
+            'encoding': encoding or 'none',
+            'modality': modality,
+            'file_size': f"{file_size:,} bytes",
+            'processing_method': 'Files API' if file_size > 20 * 1024 * 1024 else 'Inline'
+        }
+
 class BM25RetrieverTool(Tool):
     """
     BM25 retriever tool for document search when text documents are available
@@ -161,9 +494,9 @@ class GAIAAgent:
         # Initialize Langfuse observability
         self._setup_langfuse_observability()
 
-        # Initialize Gemini 2.0 Flash model
+        # Initialize Gemini 2.5 Flash model
         self.model = OpenAIServerModel(
-            model_id="gemini-2.0-flash",
+            model_id="gemini-2.5-flash",
             api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=gemini_api_key,
             temperature=0.0, 
@@ -174,11 +507,15 @@ class GAIAAgent:
         self.user_id = user_id or "gaia-user"
         self.session_id = session_id or "gaia-session"
 
+
+        # Add a hard coded list of key words in the question and expected format of the answer
+        # This is used to help the agent understand the question and expected answer format
+
         # GAIA system prompt from the leaderboard
-        self.system_prompt = """You are a general AI assistant. I will ask you a question. Report your thoughts, and finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
+        self.system_prompt = f"""You are a general AI assistant. I will ask you a question. Report your thoughts. 
                 IMPORTANT:
                 - In the last step of your reasoning, if you think your reasoning is not able to answer the question, answer the question directy with your internal reasoning, without using the BM25 retriever tool or the visit_webpage tool.
-                - Always use the final_answer tool to return your final answer, even if you think you can answer the question without using the tools.
+                - Finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
                 """
 
         # Initialize retriever tool (will be updated when documents are loaded)
@@ -233,29 +570,65 @@ class GAIAAgent:
 
     def _create_agent(self):
         """Create the CodeAgent with tools"""
-        base_tools = [
-            self.retriever_tool, 
-            visit_webpage,
-        ]
-        self.agent = CodeAgent(
-            tools=base_tools + [
-                WebSearchTool(),
-                PythonInterpreterTool(),
-                FinalAnswerTool(), 
-                SpeechToTextTool()],
-            model=self.model,
-            description=self.system_prompt, 
-            max_steps=5, 
-            additional_authorized_imports = [
-    "math",             # basic calculations
-    "statistics",       # common numeric helpers
-    "itertools",        # safe functional helpers
-    "datetime",         # date handling
-    "random",           # simple randomness (no os access)
-    "re",               # regular expressions
-    "json",             # serialisation / parsing
-]       )
+        if agent_type == "ToolAgent":
+            # Create a ToolCallingAgent if using tool calling
 
+            coder_agent = CodeAgent(
+                name = "coder_agent",
+                tools=[
+                    PythonInterpreterTool(),
+                    FinalAnswerTool()],
+                model=self.model,
+                description="You are a highly skilled coding specialist agent. Your mission is to solve programming, mathematical, and analytical problems end-to-end.",
+                max_steps=5,
+                additional_authorized_imports=[
+                    "math",             # basic calculations
+                    "statistics",       # common numeric helpers
+                    "itertools",        # safe functional helpers
+                    "datetime",         # date handling
+                    "random",           # simple randomness (no os access)
+                    "re",               # regular expressions
+                    "json",             # serialisation / parsing
+                ]
+            )
+            retriever_agent = ToolCallingAgent(
+                name = "retriever_agent",
+                tools=[self.retriever_tool],
+                model=self.model,
+                description="You are a specialized document retrieval agent. Your mission is to retrieve relevant parts of documents based on user queries.",
+                max_steps=5
+            )
+            self.agent = ToolCallingAgent(
+                tools=[
+                    WebSearchTool(),
+                    visit_webpage,  # Custom tool for visiting webpages
+                    FinalAnswerTool(), 
+                    UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
+                model=self.model,
+                description=self.system_prompt,
+                max_steps=5, 
+                managed_agents = [coder_agent, retriever_agent])
+        else : 
+            self.agent = CodeAgent(
+                tools= [
+                    WebSearchTool(),
+                    visit_webpage,  # Custom tool for visiting webpages
+                    self.retriever_tool,
+                    PythonInterpreterTool(),
+                    FinalAnswerTool(), 
+                    UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
+                model=self.model,
+                description=self.system_prompt, 
+                max_steps=5, 
+                additional_authorized_imports = [
+        "math",             # basic calculations
+        "statistics",       # common numeric helpers
+        "itertools",        # safe functional helpers
+        "datetime",         # date handling
+        "random",           # simple randomness (no os access)
+        "re",               # regular expressions
+        "json",             # serialisation / parsing
+    ]       )
 
 
     def load_documents_from_file(self, file_path: str):
@@ -470,11 +843,12 @@ if __name__ == "__main__":
         session_id="test-session-456"
     )
 
-    # Example question
+    #Example question
     question_data = {
         "Question": "Hi, I'm making a pie but I could use some help with my shopping list. I have everything I need for the crust, but I'm not sure about the filling. I got the recipe from my friend Aditi, but she left it as a voice memo and the speaker on my phone is buzzing so I can't quite make out what she's saying. Could you please listen to the recipe and list all of the ingredients that my friend described? I only want the ingredients for the filling, as I have everything I need to make my favorite pie crust. I've attached the recipe as Strawberry pie.mp3.  In your response, please only list the ingredients, not any measurements. So if the recipe calls for ""a pinch of salt"" or ""two cups of ripe strawberries"" the ingredients on the list would be ""salt"" and ""ripe strawberries"". Please format your response as a comma separated list of ingredients. Also, please alphabetize the ingredients.",
         "task_id": "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3"
     }
+
 
     # Solve with full observability
     answer = agent.solve_gaia_question(

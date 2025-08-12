@@ -146,7 +146,40 @@ class FinalAnswerTool(Tool):
         
         return formatted_answer
 
-    
+@tool
+def get_youtube_transcript(youtube_url: str) -> str:
+    """
+    Fetches the transcript of a YouTube video given its URL, if available.
+
+    Args:
+        youtube_url: The URL of the YouTube video to fetch the transcript for.
+
+    Returns:
+        The transcript text if available, or an error message if not.
+    """
+    try:
+        from youtube_transcript_api._api import YouTubeTranscriptApi
+        from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+        import re
+        # Extract video ID from URL
+        match = re.search(r"(?:v=|youtu.be/)([\w-]{11})", youtube_url)
+        if not match:
+            return "Could not extract video ID from the provided URL."
+        video_id = match.group(1)
+        # Fetch transcript
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        # Combine transcript text
+        transcript_text = " ".join([entry['text'] for entry in transcript])
+        return transcript_text
+    except ImportError:
+        return "You must install the 'youtube-transcript-api' package to use this tool. Try: pip install youtube-transcript-api."
+    except TranscriptsDisabled:
+        return "Transcripts are disabled for this video."
+    except NoTranscriptFound:
+        return "No transcript found for this video."
+    except Exception as e:
+        return f"Error fetching transcript: {str(e)}"
+
 class WebSearchTool(Tool):
     name = "web_search"
     description = """Performs a duckduckgo web search based on your query (think a Google search) then returns the top search results."""
@@ -401,7 +434,7 @@ class UnifiedMultimodalTool(Tool):
         uploaded_file = self.client.files.upload(file=file_path)
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=[prompt, uploaded_file]
         )
         
@@ -424,7 +457,7 @@ class UnifiedMultimodalTool(Tool):
         ]
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-pro",
             contents=contents
         )
         
@@ -494,9 +527,9 @@ class GAIAAgent:
         # Initialize Langfuse observability
         self._setup_langfuse_observability()
 
-        # Initialize Gemini 2.5 Flash model
+        # Initialize Gemini 2.5 model
         self.model = OpenAIServerModel(
-            model_id="gemini-2.5-flash",
+            model_id="gemini-2.5-pro",
             api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=gemini_api_key,
             temperature=0.0, 
@@ -602,11 +635,12 @@ class GAIAAgent:
                 tools=[
                     WebSearchTool(),
                     visit_webpage,  # Custom tool for visiting webpages
-                    FinalAnswerTool(), 
+                    FinalAnswerTool(),
+                    get_youtube_transcript, 
                     UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
                 model=self.model,
                 description=self.system_prompt,
-                max_steps=5, 
+                max_steps=6, 
                 managed_agents = [coder_agent, retriever_agent])
         else : 
             self.agent = CodeAgent(
@@ -614,6 +648,7 @@ class GAIAAgent:
                     WebSearchTool(),
                     visit_webpage,  # Custom tool for visiting webpages
                     self.retriever_tool,
+                    get_youtube_transcript,
                     PythonInterpreterTool(),
                     FinalAnswerTool(), 
                     UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
@@ -855,3 +890,4 @@ if __name__ == "__main__":
         question_data, 
     )
     print(f"Answer: {answer}")
+

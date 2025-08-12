@@ -2,16 +2,17 @@ from typing import Optional, List, Any
 from pydantic import Field, PrivateAttr
 from llama_index.core.llms import CustomLLM, CompletionResponse, CompletionResponseGen, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
 import torch
 from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
-from sentence_transformers import SentenceTransformer
-from PIL import Image
-            
-class QwenVL7BCustomLLM(CustomLLM):
-    model_name: str = Field(default="Qwen/Qwen2.5-VL-7B-Instruct")
+from transformers import AwqConfig
+
+
+class QwenVLCustomLLM(CustomLLM):
+    model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
     context_window: int = Field(default=32768)
     num_output: int = Field(default=256)
     _model = PrivateAttr()
@@ -19,10 +20,18 @@ class QwenVL7BCustomLLM(CustomLLM):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_name, torch_dtype=torch.bfloat16, device_map='balanced'
+        quantization_config = AwqConfig(
+            bits=4,
+            fuse_max_seq_len=512,
+            do_fuse=True,
         )
-        self._processor = AutoProcessor.from_pretrained(self.model_name)
+        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model_name,
+            quantization_config=quantization_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -77,328 +86,247 @@ class QwenVL7BCustomLLM(CustomLLM):
         for token in response.text:
             yield CompletionResponse(text=token, delta=token)
 
-class MultimodalCLIPEmbedding(BaseEmbedding):
+
+class GPTOSSInternVLRouterLLM(CustomLLM):
     """
-    Custom embedding class using CLIP for multimodal capabilities.
+    Routes text-only prompts to GPT-OSS-20B and multimodal (image+text) prompts to InternVL3-8B.
+    GPT-OSS uses its native MXFP4 precision (no BitsAndBytes), InternVL loads in 4-bit.
     """
-    
-    def __init__(self, model_name: str = "clip-ViT-B-32", **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._model = SentenceTransformer(model_name)
-        
-    @classmethod
-    def class_name(cls) -> str:
-        return "multimodal_clip"
-    
-    def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        if image_path:
-            image = Image.open(image_path)
-            embedding = self._model.encode(image)
-            return embedding.tolist()
-        else:
-            embedding = self._model.encode(query)
-            return embedding.tolist()
-    
-    def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        if image_path:
-            image = Image.open(image_path)
-            embedding = self._model.encode(image)
-            return embedding.tolist()
-        else:
-            embedding = self._model.encode(text)
-            return embedding.tolist()
-    
-    def _get_text_embeddings(self, texts: List[str], image_paths: Optional[List[str]] = None) -> List[List[float]]:
-        embeddings = []
-        image_paths = image_paths or [None] * len(texts)
-        
-        for text, img_path in zip(texts, image_paths):
-            if img_path:
-                image = Image.open(img_path)
-                emb = self._model.encode(image)
-            else:
-                emb = self._model.encode(text)
-            embeddings.append(emb.tolist())
-        
-        return embeddings
-    
-    async def _aget_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        return self._get_query_embedding(query, image_path)
-    
-    async def _aget_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        return self._get_text_embedding(text, image_path)
-    
-# BAAI embedding class
-# To run on Terminal before running the app, you need to install the FlagEmbedding package.
-# This can be done by cloning the repository and installing it in editable mode.
-#!git clone https://github.com/FlagOpen/FlagEmbedding.git
-#cd FlagEmbedding/research/visual_bge
-#pip install -e .
-#go back to the app directory
-#cd ../../..
-
-
-
-class BaaiMultimodalEmbedding(BaseEmbedding):
-    """
-    Custom embedding class using BAAI's FlagEmbedding for multimodal capabilities.
-    Implements the visual_bge Visualized_BGE model with bge-m3 backend.
-    """
-
-    def __init__(self, 
-                 model_name_bge: str = "BAAI/bge-m3", 
-                 model_weight: str = "Visualized_m3.pth",
-                 device: str = "cuda:1",
-                 **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-
-        # Set device
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        print(f"BaaiMultimodalEmbedding initializing on device: {self.device}")
-
-        # Import the visual_bge module
-        from visual_bge.modeling import Visualized_BGE
-        self._model = Visualized_BGE(
-            model_name_bge=model_name_bge, 
-            model_weight=model_weight
-        )
-        self._model.to(self.device)
-        self._model.eval()
-        print(f"Successfully loaded BAAI Visualized_BGE with {model_name_bge}")
-
-    @classmethod
-    def class_name(cls) -> str:
-        return "baai_multimodal"
-
-    def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        """Get embedding for query with optional image"""
-        with torch.no_grad():
-            if hasattr(self._model, 'encode') and hasattr(self._model, 'preprocess_val'):
-                # Using visual_bge
-                if image_path and query:
-                    # Combined text and image query
-                    embedding = self._model.encode(image=image_path, text=query)
-                elif image_path:
-                    # Image only
-                    embedding = self._model.encode(image=image_path)
-                else:
-                    # Text only
-                    embedding = self._model.encode(text=query)
-            else:
-                # Fallback to sentence-transformers
-                if image_path:
-                    from PIL import Image
-                    image = Image.open(image_path)
-                    embedding = self._model.encode(image)
-                else:
-                    embedding = self._model.encode(query)
-
-            return embedding.cpu().numpy().tolist() if torch.is_tensor(embedding) else embedding.tolist()
-
-    def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        """Get embedding for text with optional image"""
-        return self._get_query_embedding(text, image_path)
-
-    def _get_text_embeddings(self, texts: List[str], image_paths: Optional[List[str]] = None) -> List[List[float]]:
-        """Get embeddings for multiple texts with optional images"""
-        embeddings = []
-        image_paths = image_paths or [None] * len(texts)
-
-        for text, img_path in zip(texts, image_paths):
-            emb = self._get_text_embedding(text, img_path)
-            embeddings.append(emb)
-        return embeddings
-
-    async def _aget_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        return self._get_query_embedding(query, image_path)
-
-    async def _aget_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        return self._get_text_embedding(text, image_path)
-
-
-class PixtralQuantizedLLM(CustomLLM):
-    """
-    Pixtral 12B quantized model implementation for Kaggle compatibility.
-    Uses float8 quantization for memory efficiency.
-    """
-
-    model_name: str = Field(default="mistralai/Pixtral-12B-2409")
-    context_window: int = Field(default=128000)
+    gpt_model_name: str = Field(default="openai/gpt-oss-20b")
+    vlm_model_name: str = Field(default="OpenGVLab/InternVL3-8B")
+    context_window: int = Field(default=32768)
     num_output: int = Field(default=512)
-    quantization: str = Field(default="fp8")
-    _model = PrivateAttr()
-    _processor = PrivateAttr()
+
+    _gpt_model = PrivateAttr()
+    _gpt_tokenizer = PrivateAttr()
+    _vlm_model = PrivateAttr()
+    _vlm_tokenizer = PrivateAttr()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 
-        # Check if we're in a Kaggle environment or have limited resources
-        import psutil
-        available_memory = psutil.virtual_memory().available / (1024**3)  # GB
-
-        if available_memory < 20:  # Less than 20GB RAM
-            print(f"Limited memory detected ({available_memory:.1f}GB), using quantized version")
-            self._load_quantized_model()
-        else:
-            print("Sufficient memory available, attempting full model load")
-            try:
-                self._load_full_model()
-            except Exception as e:
-                print(f"Full model loading failed: {e}, falling back to quantized")
-                self._load_quantized_model()
-
-    def _load_quantized_model(self):
-        """Load quantized Pixtral model for resource-constrained environments"""
-        try:
-            # Try to use a pre-quantized version from HuggingFace
-            quantized_models = [
-                "RedHatAI/pixtral-12b-FP8-dynamic"            ]
-
-            model_loaded = False
-            for model_id in quantized_models:
-                try:
-                    print(f"Attempting to load quantized model: {model_id}")
-
-                    # Standard quantized model loading
-                    from transformers import AutoModelForCausalLM, AutoProcessor
-                    self._model = AutoModelForCausalLM.from_pretrained(
-                        model_id,
-                        torch_dtype=torch.float8,
-                        device_map="auto",
-                        trust_remote_code=True
-                    )
-                    self._processor = AutoProcessor.from_pretrained(model_id)
-
-                    print(f"Successfully loaded quantized Pixtral: {model_id}")
-                    model_loaded = True
-                    break
-
-                except Exception as e:
-                    print(f"Failed to load {model_id}: {e}")
-                    continue
-
-            if not model_loaded:
-                print("All quantized models failed, using CPU-only fallback")
-                self._load_cpu_fallback()
-
-        except Exception as e:
-            print(f"Quantized loading failed: {e}")
-            self._load_cpu_fallback()
-
-    def _load_full_model(self):
-        """Load full Pixtral model"""
-        from transformers import AutoModelForCausalLM, AutoProcessor
-
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name,
-            torch_dtype=torch.bfloat16,
+        # Load GPT-OSS-20B (text LLM) with native MXFP4 (no BitsAndBytes)
+        self._gpt_model = AutoModelForCausalLM.from_pretrained(
+            self.gpt_model_name,
+            torch_dtype="auto",
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
         )
-        self._processor = AutoProcessor.from_pretrained(self.model_name)
+        self._gpt_tokenizer = AutoTokenizer.from_pretrained(
+            self.gpt_model_name, use_fast=True, trust_remote_code=True
+        )
 
-    def _load_cpu_fallback(self):
-        """Fallback to CPU-only inference"""
-        try:
-            from transformers import AutoModelForCausalLM, AutoProcessor
-
-            self._model = AutoModelForCausalLM.from_pretrained(
-                "microsoft/DialoGPT-medium",  # Smaller fallback model
-                torch_dtype=torch.float32,
-                device_map="cpu"
-            )
-            self._processor = AutoProcessor.from_pretrained("microsoft/DialoGPT-medium")
-            print("Using CPU fallback model (DialoGPT-medium)")
-
-        except Exception as e:
-            print(f"CPU fallback failed: {e}")
-            # Use a minimal implementation
-            self._model = None
-            self._processor = None
+        # Load InternVL3-8B (VLM) in 4-bit
+        self._vlm_model = AutoModel.from_pretrained(
+            self.vlm_model_name,
+            load_in_4bit=True,
+            torch_dtype="auto",
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).eval()
+        self._vlm_tokenizer = AutoTokenizer.from_pretrained(
+            self.vlm_model_name, trust_remote_code=True, use_fast=False
+        )
 
     @property
     def metadata(self) -> LLMMetadata:
         return LLMMetadata(
             context_window=self.context_window,
             num_output=self.num_output,
-            model_name=f"{self.model_name}-{self.quantization}",
+            model_name=f"router:{self.gpt_model_name}|{self.vlm_model_name}",
         )
+
+    def _build_vlm_pixel_values(self, image_paths: List[str]):
+        """Minimal image preprocessing to 448x448 with ImageNet normalization.
+        Returns a torch.Tensor shaped [N, 3, 448, 448].
+        """
+        import torch
+        from PIL import Image
+        try:
+            import torchvision.transforms as T
+            from torchvision.transforms.functional import InterpolationMode
+        except Exception as e:
+            raise RuntimeError("torchvision is required for InternVL3 image preprocessing") from e
+
+        IMAGENET_MEAN = (0.485, 0.456, 0.406)
+        IMAGENET_STD = (0.229, 0.224, 0.225)
+        transform = T.Compose([
+            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
+            T.Resize((448, 448), interpolation=InterpolationMode.BICUBIC),
+            T.ToTensor(),
+            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ])
+
+        images = []
+        for p in image_paths:
+            img = Image.open(p)
+            images.append(transform(img))
+        pixel_values = torch.stack(images)  # [N, 3, 448, 448]
+        # InternVL expects bf16 where possible
+        if torch.cuda.is_available():
+            pixel_values = pixel_values.to(torch.bfloat16).cuda()
+        return pixel_values
+
+    def _gpt_respond(self, prompt: str) -> str:
+        import torch
+        tok = self._gpt_tokenizer
+        # Use chat template if available (Harmony format)
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            text = prompt
+
+        inputs = tok(text, return_tensors="pt").to(self._gpt_model.device)
+        with torch.no_grad():
+            out = self._gpt_model.generate(
+                **inputs,
+                max_new_tokens=self.num_output,
+                do_sample=False,
+                temperature=0.0,
+                pad_token_id=tok.eos_token_id,
+                eos_token_id=tok.eos_token_id,
+            )
+        gen = out[0, inputs["input_ids"].shape[1]:]
+        return tok.decode(gen, skip_special_tokens=True)
+
+    def _vlm_respond(self, prompt: str, image_paths: List[str]) -> str:
+        # Minimal single/multi-image handling using InternVL3 .chat API
+        pixel_values = self._build_vlm_pixel_values(image_paths)
+        question = ("<image>\n" if len(image_paths) > 0 else "") + (prompt or "Describe the image(s).")
+        gen_cfg = dict(max_new_tokens=min(self.num_output, 1024), do_sample=False)
+        # InternVL3 returns (response, history) when return_history=True
+        try:
+            response, _history = self._vlm_model.chat(
+                self._vlm_tokenizer,
+                pixel_values,
+                question,
+                gen_cfg,
+                history=None,
+                return_history=True,
+            )
+            return response if isinstance(response, str) else str(response)
+        except TypeError:
+            # Some versions return just the response string
+            response = self._vlm_model.chat(
+                self._vlm_tokenizer, pixel_values, question, gen_cfg
+            )
+            return response if isinstance(response, str) else str(response)
 
     @llm_completion_callback()
     def complete(
         self,
         prompt: str,
         image_paths: Optional[List[str]] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> CompletionResponse:
-
-        if self._model is None:
-            return CompletionResponse(text="Model not available in current environment")
-
-        try:
-            # Prepare multimodal input if images provided
-            if image_paths and hasattr(self._processor, 'apply_chat_template'):
-                # Handle multimodal input
-                messages = [{"role": "user", "content": []}]
-
-                if image_paths:
-                    for path in image_paths[:4]:  # Limit to 4 images for memory
-                        messages[0]["content"].append({"type": "image", "image": path})
-
-                messages[0]["content"].append({"type": "text", "text": prompt})
-
-                # Process the input
-                inputs = self._processor(messages, return_tensors="pt", padding=True)
-                inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-
-                # Generate
-                with torch.no_grad():
-                    outputs = self._model.generate(
-                        **inputs,
-                        max_new_tokens=min(self.num_output, 256),  # Limit for memory
-                        do_sample=True,
-                        temperature=0.7,
-                        pad_token_id=self._processor.tokenizer.eos_token_id
-                    )
-
-                # Decode response
-                response = self._processor.batch_decode(outputs, skip_special_tokens=True)[0]
-                # Extract only the new generated part
-                if len(messages[0]["content"]) > 0:
-                    response = response.split(prompt)[-1].strip()
-
-            else:
-                # Text-only fallback
-                inputs = self._processor(prompt, return_tensors="pt", padding=True)
-                inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
-
-                with torch.no_grad():
-                    outputs = self._model.generate(
-                        **inputs,
-                        max_new_tokens=min(self.num_output, 256),
-                        do_sample=True,
-                        temperature=0.7,
-                        pad_token_id=self._processor.tokenizer.eos_token_id
-                    )
-
-                response = self._processor.batch_decode(outputs, skip_special_tokens=True)[0]
-                response = response.replace(prompt, "").strip()
-
-            return CompletionResponse(text=response)
-
-        except Exception as e:
-            error_msg = f"Generation error: {str(e)}"
-            print(error_msg)
-            return CompletionResponse(text=error_msg)
+        image_paths = image_paths or []
+        if len(image_paths) > 0:
+            text = self._vlm_respond(prompt, image_paths)
+        else:
+            text = self._gpt_respond(prompt)
+        return CompletionResponse(text=text)
 
     @llm_completion_callback()
     def stream_complete(
         self,
         prompt: str,
         image_paths: Optional[List[str]] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> CompletionResponseGen:
-        # For quantized models, streaming might not be efficient
-        # Return the complete response as a single chunk
-        response = self.complete(prompt, image_paths, **kwargs)
-        yield response
+        resp = self.complete(prompt, image_paths, **kwargs)
+        for ch in resp.text:
+            yield CompletionResponse(text=ch, delta=ch)
+
+    
+class JinaEmbeddingsV4(BaseEmbedding):
+    """
+    Multimodal embedding class using jinaai/jina-embeddings-v4 loaded in 4-bit with Transformers.
+    Supports text-only, image-only, and text+image inputs with mean pooling.
+    """
+
+    model_name: str = Field(default="jinaai/jina-embeddings-v4")
+    _model = PrivateAttr()
+    _processor = PrivateAttr()
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        from transformers import AutoModel, AutoProcessor
+        # Load in 4-bit with bitsandbytes
+        self._model = AutoModel.from_pretrained(
+            self.model_name,
+            load_in_4bit=True,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=True,
+            task="retrieval",  # <-- set task
+        ).eval()
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_name,
+            trust_remote_code=True,
+            task="retrieval",  # <-- set task
+        )
+    @classmethod
+    def class_name(cls) -> str:
+        return "jina_v4"
+
+
+
+    def _embed(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None) -> List[List[float]]:
+        # Use the official encode_text/encode_image API from the model for pooling and embedding
+        image_paths = image_paths or [None] * len(texts)
+        if len(image_paths) == 1 and len(texts) > 1:
+            image_paths = image_paths * len(texts)
+
+        # Load images (if any)
+        images = []
+        have_any_image = False
+        for p in image_paths:
+            if p:
+                from PIL import Image
+                img = Image.open(p).convert("RGB")
+                images.append(img)
+                have_any_image = True
+            else:
+                images.append(None)
+
+        # Use encode_text for text-only, encode_image for image-only, and encode for multimodal
+        model = self._model
+        device = model.device
+        results = []
+        for text, img in zip(texts, images):
+            with torch.no_grad():
+                if img is not None and text:
+                    # Multimodal: both text and image
+                    emb = model.encode(text=text, image=img)
+                elif img is not None:
+                    # Image only
+                    emb = model.encode_image(img)
+                else:
+                    # Text only
+                    emb = model.encode_text(text)
+                if isinstance(emb, torch.Tensor):
+                    emb = emb.cpu().numpy()
+                elif hasattr(emb, 'detach'):
+                    emb = emb.detach().cpu().numpy()
+                if emb.ndim == 2:
+                    emb = emb[0]
+                results.append(emb.tolist())
+        return results
+
+    def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
+        return self._embed([query], [image_path] if image_path else None)[0]
+
+    def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
+        return self._embed([text], [image_path] if image_path else None)[0]
+
+    def _get_text_embeddings(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None) -> List[List[float]]:
+        return self._embed(texts, image_paths)
+
+    async def _aget_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
+        return self._get_query_embedding(query, image_path)
+
+    async def _aget_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
+        return self._get_text_embedding(text, image_path)

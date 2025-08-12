@@ -2,15 +2,14 @@
 import logging
 import os
 import re
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List
 from urllib.parse import urlparse
 import torch
 import asyncio
 
 # Third-party imports
 import requests
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from custom_models import QwenVL7BCustomLLM, BaaiMultimodalEmbedding
+from custom_models import QwenVLCustomLLM, JinaEmbeddingsV4
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings
@@ -93,7 +92,7 @@ def initialize_models(use_api_mode=False):
 
             # Main LLM - Gemini 2.0 Flash
             proj_llm = Gemini(
-                model="models/gemini-2.0-flash",
+                model="models/gemini-2.5-flash",
                 api_key=google_api_key,
                 max_tokens=16000,
                 temperature=0.6,
@@ -106,7 +105,7 @@ def initialize_models(use_api_mode=False):
 
             # Vertex AI multimodal embedding
             embed_model = GeminiEmbedding(
-                model_name="models/embedding-001",
+                model_name="models/embedding-005",
                 api_key=google_api_key,
                 task_type="retrieval_document"
             )
@@ -120,21 +119,24 @@ def initialize_models(use_api_mode=False):
         # Non-API Mode - Using HuggingFace models
         print("Initializing models in non-API mode with local models...")
 
-        try : 
-            proj_llm = QwenVL7BCustomLLM()
+        try:
+            # Main LLM: Qwen2.5-VL (Vision-Language)
+            proj_llm = QwenVLCustomLLM()
 
+            # Embedding model: Jina AI v4 (multimodal)
+            embed_model = JinaEmbeddingsV4()
 
-            embed_model = MultimodalCLIPEmbedding()
-            embed_model.max_seq_length = 1024
-            # Code LLM
+            # Code LLM (unchanged)
             code_llm = HuggingFaceLLM(
                 model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
                 tokenizer_name="Qwen/Qwen2.5-Coder-3B-Instruct",
                 device_map="auto",
-                model_kwargs={"torch_dtype": "auto"},
+                model_kwargs={
+                    "torch_dtype": "auto",
+                    "load_in_4bit": True
+                },
                 generate_kwargs={"do_sample": False}
             )
-
             return proj_llm, code_llm, embed_model
         except Exception as e:
             print(f"Error initializing models: {e}")

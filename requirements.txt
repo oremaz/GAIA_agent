@@ -1,14 +1,28 @@
-# Core
+
+# =====================
+# Core UI
+# =====================
 gradio==5.32.1
 
-# Core ML and NLP
+# =====================
+# Core ML & NLP
+# =====================
 torch>=2.0.0
-transformers>=4.30.0
+torchvision
+torchaudio
 sentence-transformers>=2.2.0
 huggingface-hub>=0.15.0
-FlagEmbedding
+bitsandbytes
 
-# LlamaIndex ecosystem
+# =====================
+# Transformers Ecosystem (optional, uncomment if needed)
+# =====================
+#transformers
+#accelerate
+
+# =====================
+# LlamaIndex Ecosystem
+# =====================
 llama-index>=0.10.0
 llama-index-core>=0.10.0
 llama-index-llms-huggingface>=0.2.0
@@ -23,43 +37,56 @@ llama-index-readers-assemblyai>=0.1.0
 llama-index-postprocessor-colpali-rerank
 llama-index-tools-duckduckgo>=0.1.0
 
-# NEW: API Mode Dependencies (Optional)
+# --- API Mode (Optional) ---
 llama-index-llms-gemini>=0.1.0
 llama-index-embeddings-gemini>=0.1.0
 llama-index-llms-vllm>=0.1.0
 llama-cloud-services>=0.1.0
 
-# Document processing
+# =====================
+# Document & Data Processing
+# =====================
 pypdf>=3.0.0
 python-docx>=0.8.11
 openpyxl>=3.1.0
 pandas>=2.0.0
 Pillow>=9.0.0
+beautifulsoup4>=4.11.0
+lxml>=4.9.0
+unstructured>=0.10.0
+python-multipart>=0.0.5
+poppler-utils
 
-# Qwen
-accelerate
+# =====================
+# Qwen & Multimodal
+# =====================
 qwen-vl-utils[decord]
 
-# NEW: Audio/Video processing (for VideoAudioReader)
+# =====================
+# Audio/Video Processing
+# =====================
 pydub>=0.25.1
 speechrecognition>=3.10.0
 ffmpeg-python>=0.2.0
 
-# Web scraping and APIs
+# =====================
+# Web Scraping & APIs
+# =====================
 requests>=2.28.0
 trafilatura>=1.6.0
 duckduckgo-search>=3.0.0
 arxiv>=1.4.0
 
-# Monitoring and logging
+# =====================
+# Monitoring & Logging
+# =====================
 weave
 
-# Utilities
-scipy>=1.10.0
-tqdm>=4.65.0
+# =====================
+# Data Science & Utilities
+# =====================
 numpy
-pandas
-scipy
+scipy>=1.10.0
 matplotlib
 seaborn
 plotly
@@ -69,65 +96,60 @@ lightgbm
 statsmodels
 opencv-python
 scikit-image
-requests
 nltk
 spacy
 pytz
-tqdm
+tqdm>=4.65.0
 sympy
-torch
-torchvision 
-torchaudio
 
-# NEW: Enhanced document parsing
-python-multipart>=0.0.5
-poppler-utils
-
-# Core smolagents framework
+# =====================
+# Core smolagents Framework
+# =====================
 smolagents[openai]>=1.0.0
 
-# LLM and model dependencies
+# =====================
+# LLM & Model Dependencies
+# =====================
 litellm>=1.0.0
 
-# BM25 retriever and document processing
+# =====================
+# BM25 Retriever & Document Processing
+# =====================
 langchain>=0.1.0
 langchain-community>=0.0.20
 rank-bm25>=0.2.2
 
-# Web browser automation
+# =====================
+# Web Browser Automation
+# =====================
 selenium>=4.0.0
 helium>=3.0.0
 webdriver-manager>=3.8.0
 
-# Image processing for screenshots
-Pillow>=9.0.0
-
-# Document processing
-beautifulsoup4>=4.11.0
-lxml>=4.9.0
-
-# HTTP requests
-requests>=2.28.0
-
-# Environment variables
+# =====================
+# Environment Variables
+# =====================
 python-dotenv>=0.19.0
 
-# Text processing
-unstructured>=0.10.0
-
-# Optional: For better text splitting
+# =====================
+# Text Processing
+# =====================
 tiktoken>=0.4.0
 
-# System utilities
+# =====================
+# System Utilities
+# =====================
 psutil>=5.9.0
 
-# Langfuse
+# =====================
+# Langfuse & Observability
+# =====================
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-http
-
-# Langfuse integration
 langfuse
 
-# OpenInference instrumentation for smolagents
+# =====================
+# OpenInference Instrumentation
+# =====================
 openinference-instrumentation-smolagents

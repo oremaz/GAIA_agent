@@ -7,11 +7,11 @@ gradio==5.32.1
 # =====================
 # Core ML & NLP
 # =====================
-torch>=2.0.0
+torch>=2.6.0
 torchvision
 torchaudio
-sentence-transformers>=2.2.0
-huggingface-hub>=0.15.0
+sentence-transformers
+huggingface-hub
 bitsandbytes
 autoawq
 
@@ -20,43 +20,43 @@ autoawq
 # =====================
 transformers == 4.55.1
 accelerate
-peft
+peft==0.17.0
 qwen_vl_utils
 # =====================
 # LlamaIndex Ecosystem
 # =====================
-llama-index>=0.10.0
-llama-index-core>=0.10.0
-llama-index-llms-huggingface>=0.2.0
-llama-index-embeddings-huggingface>=0.2.0
-llama-index-callbacks-wandb>=0.1.0
-llama-index-tools-arxiv>=0.1.0
-llama-index-readers-file>=0.1.0
-llama-index-readers-web>=0.1.0
-llama-index-readers-youtube-transcript>=0.1.0
-llama-index-readers-json>=0.1.0
-llama-index-readers-assemblyai>=0.1.0
+llama-index
+llama-index-core
+llama-index-llms-huggingface
+llama-index-embeddings-huggingface
+llama-index-callbacks-wandb
+llama-index-tools-arxiv
+llama-index-readers-file
+llama-index-readers-web
+llama-index-readers-youtube-transcript
+llama-index-readers-json
+llama-index-readers-assemblyai
 llama-index-postprocessor-colpali-rerank
-llama-index-tools-duckduckgo>=0.1.0
+llama-index-tools-duckduckgo
 
 # --- API Mode (Optional) ---
-llama-index-llms-gemini>=0.1.0
-llama-index-embeddings-gemini>=0.1.0
-llama-index-llms-vllm>=0.1.0
-llama-cloud-services>=0.1.0
+llama-index-llms-gemini
+llama-index-embeddings-gemini
+llama-index-llms-vllm
+llama-cloud-services
 
 # =====================
 # Document & Data Processing
 # =====================
-pypdf>=3.0.0
-python-docx>=0.8.11
-openpyxl>=3.1.0
-pandas>=2.0.0
-Pillow>=9.0.0
-beautifulsoup4>=4.11.0
-lxml>=4.9.0
-unstructured>=0.10.0
-python-multipart>=0.0.5
+pypdf
+python-docx
+openpyxl
+pandas
+Pillow
+beautifulsoup4
+lxml
+unstructured
+python-multipart
 poppler-utils
 
 # =====================
@@ -67,17 +67,17 @@ qwen-vl-utils[decord]
 # =====================
 # Audio/Video Processing
 # =====================
-pydub>=0.25.1
-speechrecognition>=3.10.0
-ffmpeg-python>=0.2.0
+pydub
+speechrecognition
+ffmpeg-python
 
 # =====================
 # Web Scraping & APIs
 # =====================
-requests>=2.28.0
-trafilatura>=1.6.0
-duckduckgo-search>=3.0.0
-arxiv>=1.4.0
+requests    
+trafilatura
+duckduckgo-search
+arxiv
 
 # =====================
 # Monitoring & Logging
@@ -88,7 +88,7 @@ weave
 # Data Science & Utilities
 # =====================
 numpy
-scipy>=1.10.0
+scipy
 matplotlib
 seaborn
 plotly
@@ -101,47 +101,40 @@ scikit-image
 nltk
 spacy
 pytz
-tqdm>=4.65.0
+tqdm
 sympy
 
 # =====================
 # Core smolagents Framework
 # =====================
-smolagents[openai]>=1.0.0
+smolagents[openai]
 
 # =====================
 # LLM & Model Dependencies
 # =====================
-litellm>=1.0.0
+litellm
 
 # =====================
 # BM25 Retriever & Document Processing
 # =====================
-langchain>=0.1.0
-langchain-community>=0.0.20
-rank-bm25>=0.2.2
-
-# =====================
-# Web Browser Automation
-# =====================
-selenium>=4.0.0
-helium>=3.0.0
-webdriver-manager>=3.8.0
+langchain
+langchain-community
+rank-bm25
 
 # =====================
 # Environment Variables
 # =====================
-python-dotenv>=0.19.0
+python-dotenv
 
 # =====================
 # Text Processing
 # =====================
-tiktoken>=0.4.0
+tiktoken
 
 # =====================
 # System Utilities
 # =====================
-psutil>=5.9.0
+psutil
 
 # =====================
 # Langfuse & Observability

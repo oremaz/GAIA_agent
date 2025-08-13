@@ -8,8 +8,7 @@ from qwen_vl_utils import process_vision_info
 import torch
 from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
-from transformers import AwqConfig
-
+from transformers import AutoModel, BitsAndBytesConfig
 
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
@@ -20,14 +19,8 @@ class QwenVLCustomLLM(CustomLLM):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        quantization_config = AwqConfig(
-            bits=4,
-            fuse_max_seq_len=512,
-            do_fuse=True,
-        )
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_name,
-            quantization_config=quantization_config,
             device_map="auto",
             trust_remote_code=True,
         )
@@ -209,89 +202,222 @@ class GPTOSSInternVLRouterLLM(CustomLLM):
             yield CompletionResponse(text=ch, delta=ch)
 
     
+
+# If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.
+# from llama_index.core.embeddings.base import BaseEmbedding
+
 class JinaEmbeddingsV4(BaseEmbedding):
     """
-    Multimodal embedding class using jinaai/jina-embeddings-v4 loaded in 4-bit with Transformers.
-    Supports text-only, image-only, and text+image inputs with mean pooling.
+    Multimodal embedding wrapper for jinaai/jina-embeddings-v4.
+    Supports:
+      - Text-only: model.encode_text(..., task=..., prompt_name=...)
+      - Image-only: model.encode_image(..., task=...)
+      - Text+Image: model.encode(text=..., image=..., task=...)
+    Pass task/prompt_name at encode time per the official docs.
     """
-
     model_name: str = Field(default="jinaai/jina-embeddings-v4")
-    _model = PrivateAttr()
-    _processor = PrivateAttr()
+
+    # Keep a handle to the HF model (initialized in __init__)
+    _model = PrivateAttr(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        from transformers import AutoModel, AutoProcessor
-        # Load in 4-bit with bitsandbytes
-        self._model = AutoModel.from_pretrained(
-            self.model_name,
-            load_in_4bit=True,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
-            task="retrieval",  # <-- set task
-        ).eval()
-        self._processor = AutoProcessor.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-            task="retrieval",  # <-- set task
-        )
+        # Load the model once. Prefer float16 for stability first.
+        # To try 4-bit later, see the commented block below.
+        import torch
+        from transformers import AutoModel
+
+        if self._model is None:
+            #self._model = AutoModel.from_pretrained(
+                #self.model_name,
+                #trust_remote_code=True,
+                #torch_dtype=torch.float16,   # stable default
+                #device_map="auto",
+            #).eval()
+
+            # If you prefer explicit device placement (instead of device_map="auto"):
+            # self._model.to("cuda" if torch.cuda.is_available() else "cpu")
+
+            # To enable 4-bit (only after ensuring peft/transformers/bitsandbytes/CUDA versions are aligned):
+            self._bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+
+            device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+
+            self._model = AutoModel.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                quantization_config=self._bnb_config,
+                device_map=device_map,
+            ).eval()
+
     @classmethod
     def class_name(cls) -> str:
         return "jina_v4"
 
+    def _embed(
+        self,
+        texts: List[str],
+        image_paths: Optional[List[Optional[str]]] = None,
+        task: str = "retrieval",
+        prompt_name: Optional[str] = "passage",  # "query" for queries, "passage" for docs; not used for images
+        return_multivector: bool = False,
+        truncate_dim: Optional[int] = None,      # e.g., 128, 256, 512, 1024, 2048
+        max_length: Optional[int] = None,        # for texts
+        max_pixels: Optional[int] = None,        # for images
+        batch_size: Optional[int] = None,
+    ) -> List[List[float]]:
+        """
+        Encodes a batch of inputs; each item can be text-only, image-only, or text+image.
+        - task: "retrieval" | "text-matching" | "code"
+        - prompt_name: for retrieval/code text inputs ("query" or "passage"); not used for image-only
+        - return_multivector: if True, returns multi-vector outputs (here flattened per item)
+        """
+        import torch
+        from PIL import Image
 
+        model = self._model
+        assert model is not None, "Model is not initialized."
 
-    def _embed(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None) -> List[List[float]]:
-        # Use the official encode_text/encode_image API from the model for pooling and embedding
+        # Normalize image_paths to align with texts
         image_paths = image_paths or [None] * len(texts)
         if len(image_paths) == 1 and len(texts) > 1:
             image_paths = image_paths * len(texts)
 
-        # Load images (if any)
-        images = []
-        have_any_image = False
-        for p in image_paths:
-            if p:
-                from PIL import Image
-                img = Image.open(p).convert("RGB")
-                images.append(img)
-                have_any_image = True
-            else:
-                images.append(None)
+        results: List[List[float]] = []
 
-        # Use encode_text for text-only, encode_image for image-only, and encode for multimodal
-        model = self._model
-        device = model.device
-        results = []
-        for text, img in zip(texts, images):
-            with torch.no_grad():
-                if img is not None and text:
-                    # Multimodal: both text and image
-                    emb = model.encode(text=text, image=img)
-                elif img is not None:
-                    # Image only
-                    emb = model.encode_image(img)
+        # Helper to coerce model outputs to a single vector (first item if batched)
+        def _to_list_vector(arr):
+            # torch.Tensor -> numpy
+            try:
+                import torch
+                if isinstance(arr, torch.Tensor):
+                    arr = arr.detach().cpu().numpy()
+            except Exception:
+                pass
+        
+            # numpy -> list
+            try:
+                import numpy as np
+                if isinstance(arr, np.ndarray):
+                    # If batched (N, D), take first item
+                    if arr.ndim == 2:
+                        return arr[0].tolist()
+                    return arr.tolist()
+            except Exception:
+                pass
+        
+            # Python list cases
+            if isinstance(arr, list):
+                # If it's a list of vectors (batch), take the first vector
+                if len(arr) > 0 and isinstance(arr[0], (list, tuple)):
+                    return list(arr[0])
+                # If it's already a single vector (list of floats), return as-is
+                return list(arr)
+        
+            # Fallback: wrap scalars
+            return [float(arr)]
+
+        with torch.no_grad():
+            for text, img_path in zip(texts, image_paths):
+                # Determine path: multimodal, image-only, or text-only
+                if img_path is not None and text:
+                    # Multimodal
+                    img = Image.open(img_path).convert("RGB")
+                    emb = model.encode(
+                        text=text,
+                        image=img,
+                        task=task,
+                        return_multivector=return_multivector,
+                        truncate_dim=truncate_dim,
+                        max_length=max_length,
+                        max_pixels=max_pixels,
+                        batch_size=batch_size,
+                    )
+                    # For multimodal, remote code returns either single or multivector embedding
+                    # Flatten to a single vector if not returning multivector explicitly
+                    if return_multivector:
+                        # If multivector, you may want to keep the nested structure.
+                        # Here we average to return a single vector for compatibility.
+                        if hasattr(emb, "detach"):
+                            emb = emb.detach().cpu().numpy()
+                        elif hasattr(emb, "cpu"):
+                            emb = emb.cpu().numpy()
+                        if emb.ndim == 3:
+                            # shape (1, num_vecs, dim) -> avg across num_vecs
+                            emb = emb.mean(axis=1)[0]
+                        else:
+                            emb = emb[0] if emb.ndim == 2 else emb
+                        results.append(emb.tolist())
+                    else:
+                        results.append(_to_list_vector(emb))
+
+                elif img_path is not None:
+                    # Image-only
+                    img = Image.open(img_path).convert("RGB")
+                    emb = model.encode_image(
+                        images=[img],
+                        task=task,
+                        return_multivector=return_multivector,
+                        truncate_dim=truncate_dim,
+                        max_pixels=max_pixels,
+                        batch_size=batch_size,
+                    )
+                    results.append(_to_list_vector(emb))
+
                 else:
-                    # Text only
-                    emb = model.encode_text(text)
-                if isinstance(emb, torch.Tensor):
-                    emb = emb.cpu().numpy()
-                elif hasattr(emb, 'detach'):
-                    emb = emb.detach().cpu().numpy()
-                if emb.ndim == 2:
-                    emb = emb[0]
-                results.append(emb.tolist())
+                    # Text-only
+                    kwargs = {
+                        "texts": [text],
+                        "task": task,
+                        "return_multivector": return_multivector,
+                        "truncate_dim": truncate_dim,
+                        "max_length": max_length,
+                        "batch_size": batch_size,
+                    }
+                    # Only text tasks use prompt_name (retrieval/code); text-matching is symmetric
+                    if prompt_name:
+                        kwargs["prompt_name"] = prompt_name
+
+                    emb = model.encode_text(**kwargs)
+                    results.append(_to_list_vector(emb))
+
         return results
 
     def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        return self._embed([query], [image_path] if image_path else None)[0]
+        # Retrieval query uses prompt_name="query"
+        return self._embed(
+            [query],
+            [image_path] if image_path else None,
+            task="retrieval",
+            prompt_name="query" if image_path is None else None,
+        )[0]
 
     def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        return self._embed([text], [image_path] if image_path else None)[0]
+        # Retrieval passage (for indexing) uses prompt_name="passage"
+        return self._embed(
+            [text],
+            [image_path] if image_path else None,
+            task="retrieval",
+            prompt_name="passage" if image_path is None else None,
+        )[0]
 
-    def _get_text_embeddings(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None) -> List[List[float]]:
-        return self._embed(texts, image_paths)
+    def _get_text_embeddings(
+        self,
+        texts: List[str],
+        image_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[List[float]]:
+        # Default to retrieval passages for document embeddings
+        return self._embed(
+            texts,
+            image_paths,
+            task="retrieval",
+            prompt_name="passage",
+        )
 
     async def _aget_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
         return self._get_query_embedding(query, image_path)

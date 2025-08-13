@@ -93,19 +93,17 @@ class GPTOSSInternVLRouterLLM(CustomLLM):
     GPT-OSS uses its native MXFP4 precision (no BitsAndBytes), InternVL loads in 4-bit.
     """
     gpt_model_name: str = Field(default="openai/gpt-oss-20b")
-    vlm_model_name: str = Field(default="OpenGVLab/InternVL3-8B")
+    vlm_model_name: str = Field(default="Qwen/Qwen2.5-VL-7B-Instruct-AWQ")
     context_window: int = Field(default=32768)
     num_output: int = Field(default=512)
 
     _gpt_model = PrivateAttr()
     _gpt_tokenizer = PrivateAttr()
-    _vlm_model = PrivateAttr()
-    _vlm_tokenizer = PrivateAttr()
+    _vlm = PrivateAttr()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
-
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         # Load GPT-OSS-20B (text LLM) with native MXFP4 (no BitsAndBytes)
         self._gpt_model = AutoModelForCausalLM.from_pretrained(
             self.gpt_model_name,
@@ -116,19 +114,8 @@ class GPTOSSInternVLRouterLLM(CustomLLM):
         self._gpt_tokenizer = AutoTokenizer.from_pretrained(
             self.gpt_model_name, use_fast=True, trust_remote_code=True
         )
-
-        # Load InternVL3-8B (VLM) in 4-bit
-        self._vlm_model = AutoModel.from_pretrained(
-            self.vlm_model_name,
-            load_in_4bit=True,
-            torch_dtype="auto",
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        ).eval()
-        self._vlm_tokenizer = AutoTokenizer.from_pretrained(
-            self.vlm_model_name, trust_remote_code=True, use_fast=False
-        )
+        # Load Qwen2.5-VL-7B-Instruct-AWQ as VLM
+        self._vlm = QwenVLCustomLLM(model_name=self.vlm_model_name)
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -193,27 +180,8 @@ class GPTOSSInternVLRouterLLM(CustomLLM):
         return tok.decode(gen, skip_special_tokens=True)
 
     def _vlm_respond(self, prompt: str, image_paths: List[str]) -> str:
-        # Minimal single/multi-image handling using InternVL3 .chat API
-        pixel_values = self._build_vlm_pixel_values(image_paths)
-        question = ("<image>\n" if len(image_paths) > 0 else "") + (prompt or "Describe the image(s).")
-        gen_cfg = dict(max_new_tokens=min(self.num_output, 1024), do_sample=False)
-        # InternVL3 returns (response, history) when return_history=True
-        try:
-            response, _history = self._vlm_model.chat(
-                self._vlm_tokenizer,
-                pixel_values,
-                question,
-                gen_cfg,
-                history=None,
-                return_history=True,
-            )
-            return response if isinstance(response, str) else str(response)
-        except TypeError:
-            # Some versions return just the response string
-            response = self._vlm_model.chat(
-                self._vlm_tokenizer, pixel_values, question, gen_cfg
-            )
-            return response if isinstance(response, str) else str(response)
+        # Use QwenVLCustomLLM for multimodal completion
+        return self._vlm.complete(prompt, image_paths=image_paths).text
 
     @llm_completion_callback()
     def complete(

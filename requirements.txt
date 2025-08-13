@@ -15,11 +15,11 @@ huggingface-hub>=0.15.0
 bitsandbytes
 
 # =====================
-# Transformers Ecosystem (optional, uncomment if needed)
+# Transformers Ecosystem
 # =====================
-#transformers
-#accelerate
-
+transformers == 4.55.1
+accelerate
+peft
 # =====================
 # LlamaIndex Ecosystem
 # =====================

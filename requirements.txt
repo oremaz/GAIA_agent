@@ -13,6 +13,7 @@ torchaudio
 sentence-transformers>=2.2.0
 huggingface-hub>=0.15.0
 bitsandbytes
+autoawq
 
 # =====================
 # Transformers Ecosystem
@@ -20,6 +21,7 @@ bitsandbytes
 transformers == 4.55.1
 accelerate
 peft
+qwen_vl_utils
 # =====================
 # LlamaIndex Ecosystem
 # =====================

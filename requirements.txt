@@ -57,7 +57,6 @@ beautifulsoup4
 lxml
 unstructured
 python-multipart
-poppler-utils
 
 # =====================
 # Qwen & Multimodal
@@ -99,7 +98,6 @@ statsmodels
 opencv-python
 scikit-image
 nltk
-spacy
 pytz
 tqdm
 sympy

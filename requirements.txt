@@ -62,7 +62,7 @@ poppler-utils
 # =====================
 # Qwen & Multimodal
 # =====================
-qwen-vl-utils[decord]
+qwen-vl-utils
 
 # =====================
 # Audio/Video Processing
@@ -103,48 +103,3 @@ spacy
 pytz
 tqdm
 sympy
-
-# =====================
-# Core smolagents Framework
-# =====================
-smolagents[openai]
-
-# =====================
-# LLM & Model Dependencies
-# =====================
-litellm
-
-# =====================
-# BM25 Retriever & Document Processing
-# =====================
-langchain
-langchain-community
-rank-bm25
-
-# =====================
-# Environment Variables
-# =====================
-python-dotenv
-
-# =====================
-# Text Processing
-# =====================
-tiktoken
-
-# =====================
-# System Utilities
-# =====================
-psutil
-
-# =====================
-# Langfuse & Observability
-# =====================
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-exporter-otlp-proto-http
-langfuse
-
-# =====================
-# OpenInference Instrumentation
-# =====================
-openinference-instrumentation-smolagents

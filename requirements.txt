@@ -96,7 +96,6 @@ xgboost
 lightgbm
 statsmodels
 opencv-python
-scikit-image
 nltk
 pytz
 tqdm

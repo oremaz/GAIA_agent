@@ -20,8 +20,8 @@ autoawq
 # =====================
 transformers == 4.55.1
 accelerate
-peft==0.17.0
-qwen_vl_utils
+peft>=0.17.0
+
 # =====================
 # LlamaIndex Ecosystem
 # =====================

@@ -39,12 +39,14 @@ llama-index-readers-web==0.5.0
 llama-index-readers-youtube-transcript==0.4.0
 llama-index-readers-json==0.4.0
 llama-index-readers-assemblyai==0.4.0
+llama-index-readers-smart-pdf-loader==0.1.0
 llama-index-tools-duckduckgo==0.4.0
 llama-index-llms-gemini==0.6.0
 llama-index-embeddings-gemini==0.4.0
 llama-index-llms-vllm==0.6.0
 llama-cloud-services
 
+pymupdf==1.22.0
 pypdf==5.9.0
 python-docx==1.2.0
 openpyxl==3.1.5

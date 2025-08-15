@@ -40,7 +40,6 @@ llama-index-readers-youtube-transcript==0.4.0
 llama-index-readers-json==0.4.0
 llama-index-readers-assemblyai==0.4.0
 llama-index-readers-smart-pdf-loader==0.4.0
-llama-index-tools-duckduckgo==0.4.0
 llama-index-llms-gemini==0.6.0
 llama-index-embeddings-gemini==0.4.0
 llama-index-llms-vllm==0.6.0
@@ -65,7 +64,6 @@ ffmpeg-python==0.2.0
 
 requests==2.32.3
 trafilatura==2.0.0
-duckduckgo-search==6.4.2
 arxiv==2.2.0
 
 weave==0.51.0
@@ -84,3 +82,4 @@ nltk==3.9.1
 pytz==2025.2
 tqdm==4.66.4
 sympy==1.14.0
+ddgs==9.5.2

@@ -30,7 +30,6 @@ from llama_index.readers.json import JSONReader
 from llama_index.readers.web import BeautifulSoupWebReader
 from llama_index.readers.youtube_transcript import YoutubeTranscriptReader
 from llama_index.core.agent.workflow import AgentWorkflow
-from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
 
 # Optional utilities that may come from external packages or later imports
 try:
@@ -53,7 +52,7 @@ from llama_index.readers.file import (
 )
 from llama_index.readers.smart_pdf_loader import SmartPDFLoader
 import weave
-
+from ddgs import DDGS
 
 
 class MultimodalPDFReader:
@@ -434,29 +433,41 @@ class DynamicQueryEngineManager:
 # Global instance
 dynamic_qe_manager = DynamicQueryEngineManager()
 
-# 1. Create the base DuckDuckGo search tool from the official spec.
-# This tool returns text summaries of search results, not just URLs.
-
-base_duckduckgo_tool = DuckDuckGoSearchToolSpec().to_tool_list()[1]
-
 def search_and_extract_content_from_url(query: str) -> List[Document]:
     """
     Searches web, gets top URL, and extracts both text content and images.
     Returns a list of Document objects containing the extracted content.
     """
-    # Get URL from search
-    search_results = base_duckduckgo_tool(query, max_results=1)
-    url_match = re.search(r"https?://\S+", str(search_results))
-    
-    if not url_match:
+    # Try using ddgs (DDGS) with the 'google' backend first (preferred per request)
+    url = None
+    try:
+        with DDGS() as ddg:
+            results = list(ddg.text(query, max_results=1, backend="google"))
+        if results and len(results) > 0:
+            first = results[0]
+            # ddgs may expose the link under several keys depending on backend/version
+            url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
+            # sometimes ddgs returns a dict-like string; coerce
+            if not url:
+                # try common keys by inspecting full dict
+                for k in ("href", "link", "url", "FirstURL", "first_url"):
+                    if k in first:
+                        url = first[k]
+                        break
+
+    except Exception as e:
+        url = None
+
+    if not url:
         return [Document(text="No URL could be extracted from the search results.")]
-    
-    url = url_match.group(0)[:-2]
-    documents = []
+
+    # sanitize URL
+    url = str(url).rstrip(").,;:'\"")
+    documents: List[Document] = []
 
     try:
-        # Check if it's a YouTube URL
-        if "youtube" in urlparse(url).netloc or "youtu.be" in urlparse(url).netloc:
+        netloc = urlparse(url).netloc.lower()
+        if "youtube" in netloc or "youtu.be" in netloc:
             loader = YoutubeTranscriptReader()
             documents = loader.load_data(youtubelinks=[url])
         else:
@@ -464,13 +475,13 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
             documents = loader.load_data(urls=[url])
 
         for doc in documents:
+            if not getattr(doc, "metadata", None):
+                doc.metadata = {}
             doc.metadata["source"] = url
             doc.metadata["type"] = "web_text"
 
         return documents
     except Exception as e:
-        # Handle any exceptions that occur during content extraction
-        print(e)
         return [Document(text=f"Error extracting content from URL: {str(e)}")]
 
 def enhanced_web_search_and_update(query: str) -> str:
@@ -900,7 +911,6 @@ If you are asked for a comma separated list, apply the above rules depending of 
 
 async def main():
 
-    res = enhanced_web_search_and_update("test")
     agent = EnhancedGAIAAgent()
 
     question_data = {

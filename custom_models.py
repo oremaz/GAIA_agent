@@ -9,9 +9,6 @@ import torch
 from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
 from transformers import AutoModel, BitsAndBytesConfig
-from llama_index.core.postprocessor import BaseNodePostprocessor
-from llama_index.core.schema import NodeWithScore
-import logging
 
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")

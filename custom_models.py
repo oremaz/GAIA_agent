@@ -459,14 +459,6 @@ class JinaMultimodalReranker:
             from transformers import AutoModel, BitsAndBytesConfig
             import torch
 
-            # Prefer 4-bit quantized load to reduce GPU memory usage (align with embeddings)
-            self._bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-
             # Determine target device. Prefer cuda:1 when multiple GPUs exist,
             # otherwise fall back to cuda:0. If no CUDA, use CPU.
             if self.device == "auto":
@@ -486,25 +478,176 @@ class JinaMultimodalReranker:
 
             device_map = {"": target_dev} if target_dev != "cpu" else "cpu"
 
-            # Try to load quantized 4-bit model onto the requested device map
-            try:
-                self._model = AutoModel.from_pretrained(
-                    self.model_name,
-                    trust_remote_code=True,
-                    quantization_config=self._bnb_config,
-                    device_map=device_map,
-                )
-            except Exception as e:
-                # If 4-bit loading fails (incompatible bitsandbytes/transformers/CUDA),
-                # fall back to a standard (non-4bit) load on the same device_map.
-                print(f"4-bit load failed for reranker: {e}. Falling back to non-4bit load.")
-                self._model = AutoModel.from_pretrained(
-                    self.model_name,
-                    torch_dtype="auto",
-                    trust_remote_code=True,
-                    device_map=device_map,
-                )
+            # Only attempt BitsAndBytes 4-bit quantized load when using CUDA device(s).
+            if target_dev != "cpu" and torch.cuda.is_available():
+                # Prefer 4-bit quantized load to reduce GPU memory usage (align with embeddings)
+                try:
+                    bnb_cfg = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_compute_dtype=torch.bfloat16,
+                    )
+                    self._model = AutoModel.from_pretrained(
+                        self.model_name,
+                        trust_remote_code=True,
+                        quantization_config=bnb_cfg,
+                        device_map=device_map,
+                    )
+                except Exception as e:
+                    # If 4-bit loading fails, fall back to regular load on the same device_map.
+                    print(f"4-bit load failed for reranker: {e}. Falling back to non-4bit load.")
+                    self._model = AutoModel.from_pretrained(
+                        self.model_name,
+                        torch_dtype="auto",
+                        trust_remote_code=True,
+                        device_map=device_map,
+                    )
+            else:
+                # For CPU targets, prefer a GGUF (llama.cpp) runtime if available
+                # so we avoid heavy PyTorch CPU model loading. Try HF GGUF repo then llama_cpp.
+                from huggingface_hub import list_repo_files, hf_hub_download
+                # Try to find a gguf file in the companion repo (common naming convention)
+                repo_id = f"{self.model_name}-GGUF" if not self.model_name.endswith("-GGUF") else self.model_name
+                files = list_repo_files(repo_id)
+                gguf_candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
+                if gguf_candidates:
+                    gguf_file = gguf_candidates[0]
+                    gguf_path = hf_hub_download(repo_id=repo_id, filename=gguf_file)
+                    try:
+                        from llama_cpp import Llama
 
+                        llm = Llama(model_path=gguf_path)
+
+                        class _GGUFFallbackWrapper:
+                            """Robust wrapper exposing compute_score(pairs, ...) using embeddings from llama_cpp.
+
+                            Features:
+                            - Attempts a single batched embedding call where supported.
+                            - Normalizes multiple possible embedding return shapes.
+                            - Validates embedding dimensions and returns 0.0 for invalid pairs.
+                            """
+                            def __init__(self, llm_obj):
+                                self._llm = llm_obj
+
+                            def _call_embed(self, texts: List[str]) -> List[List[float]]:
+                                """Return a list of embedding vectors for the input texts.
+
+                                Tries a batched API first, falls back to per-text calls.
+                                Normalizes possible return formats.
+                                """
+                                embeddings: List[List[float]] = []
+
+                                # Try batched call first
+                                try:
+                                    # llama_cpp Llama.embed accepts a single string or a list
+                                    res = self._llm.embed(texts)
+                                    # Normalize response shapes
+                                    # Possible forms: {'data': [{'embedding': [...]}, ...]} or list of embeddings
+                                    if isinstance(res, dict) and 'data' in res:
+                                        for item in res['data']:
+                                            if isinstance(item, dict) and 'embedding' in item:
+                                                embeddings.append(list(item['embedding']))
+                                            else:
+                                                # Unexpected item -> try to coerce
+                                                try:
+                                                    embeddings.append(list(item))
+                                                except Exception:
+                                                    embeddings.append([0.0])
+                                    elif isinstance(res, list):
+                                        # Assume list of embeddings or list of dicts
+                                        for item in res:
+                                            if isinstance(item, dict) and 'embedding' in item:
+                                                embeddings.append(list(item['embedding']))
+                                            else:
+                                                try:
+                                                    embeddings.append(list(item))
+                                                except Exception:
+                                                    embeddings.append([0.0])
+                                    else:
+                                        # Single embedding returned for whole batch
+                                        try:
+                                            embeddings = [list(res)] * len(texts)
+                                        except Exception:
+                                            embeddings = [[0.0] for _ in texts]
+                                    # If result length mismatches, fall back to per-text
+                                    if len(embeddings) != len(texts):
+                                        raise RuntimeError("Batch embed length mismatch")
+                                    return embeddings
+                                except Exception:
+                                    # Fall back to per-text embedding calls
+                                    embeddings = []
+                                    for t in texts:
+                                        try:
+                                            r = self._llm.embed(t)
+                                            if isinstance(r, dict) and 'data' in r:
+                                                emb = r['data'][0].get('embedding')
+                                                embeddings.append(list(emb) if emb is not None else [0.0])
+                                            elif isinstance(r, list):
+                                                embeddings.append(list(r[0]) if r and isinstance(r[0], (list, tuple)) else list(r))
+                                            else:
+                                                embeddings.append(list(r) if hasattr(r, '__iter__') else [0.0])
+                                        except Exception:
+                                            embeddings.append([0.0])
+                                    return embeddings
+
+                            def compute_score(self, pairs, max_length=1024, doc_type="text"):
+                                # pairs: list of [query, doc_text]
+                                if not pairs:
+                                    return []
+
+                                # Build flattened list for embeddings requests: [q0, d0, q1, d1, ...]
+                                texts: List[str] = []
+                                for q, d in pairs:
+                                    texts.append(q if isinstance(q, str) else str(q))
+                                    texts.append(d if isinstance(d, str) else str(d))
+
+                                embeddings = self._call_embed(texts)
+
+                                # Compute cosine similarity for each pair with validation
+                                scores: List[float] = []
+                                import math
+                                for i in range(0, len(embeddings), 2):
+                                    try:
+                                        qv = embeddings[i]
+                                        dv = embeddings[i + 1]
+                                    except Exception:
+                                        scores.append(0.0)
+                                        continue
+
+                                    # Validate numeric vectors
+                                    if not qv or not dv or len(qv) != len(dv):
+                                        scores.append(0.0)
+                                        continue
+
+                                    # Compute dot and norms robustly
+                                    try:
+                                        dot = 0.0
+                                        nq = 0.0
+                                        nd = 0.0
+                                        for a, b in zip(qv, dv):
+                                            fa = float(a)
+                                            fb = float(b)
+                                            dot += fa * fb
+                                            nq += fa * fa
+                                            nd += fb * fb
+                                        if nq <= 0 or nd <= 0:
+                                            scores.append(0.0)
+                                            continue
+                                        scores.append(dot / (math.sqrt(nq) * math.sqrt(nd) + 1e-12))
+                                    except Exception:
+                                        scores.append(0.0)
+
+                                return scores
+                        self._model = _GGUFFallbackWrapper(llm)
+                        print(f"Loaded GGUF reranker via llama_cpp from {repo_id} using file {gguf_file}")
+                    except Exception as e:
+                        print(f"llama_cpp GGUF init failed: {e}. Falling back to PyTorch CPU model.")
+                        # Fall through to PyTorch CPU load below
+                        raise
+                else:
+                    # No gguf file found -- raise to trigger the PyTorch fallback
+                    raise RuntimeError("No GGUF candidate found in HF repo")
             # If device_map is 'cpu', ensure model is on CPU. Otherwise device_map already placed weights.
             if device_map == 'cpu':
                 self._model.to('cpu')

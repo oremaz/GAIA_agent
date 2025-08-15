@@ -1,5 +1,4 @@
 # Ignore VS Code and editor history folders
 .history/
 .env
-main.ipynb
 __pycache__/

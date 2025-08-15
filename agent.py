@@ -9,41 +9,35 @@ import asyncio
 
 # Third-party imports
 import requests
-from custom_models import QwenVLCustomLLM, JinaEmbeddingsV4
+# Third-party imports
+from custom_models import QwenVLCustomLLM, JinaEmbeddingsV4, JinaMultimodalReranker
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings
-from llama_index.core.agent.workflow import FunctionAgent, ReActAgent, AgentStream
+from llama_index.core.agent.workflow import ReActAgent, AgentStream
 from llama_index.core.node_parser import UnstructuredElementNodeParser, SentenceSplitter
 from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core.query_engine import RetrieverQueryEngine
-from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.tools import FunctionTool
 from llama_index.core.workflow import Context
-from llama_index.postprocessor.colpali_rerank import ColPaliRerank
 from llama_index.core.schema import ImageNode, TextNode
 
 # LlamaIndex specialized imports
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.readers.assemblyai import AssemblyAIAudioTranscriptReader
 from llama_index.readers.json import JSONReader
 from llama_index.readers.web import BeautifulSoupWebReader
 from llama_index.readers.youtube_transcript import YoutubeTranscriptReader
-from llama_index.tools.arxiv import ArxivToolSpec
 from llama_index.core.agent.workflow import AgentWorkflow
-from llama_index.llms.vllm import Vllm
 from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
 
 # Import all required official LlamaIndex Readers
 from llama_index.readers.file import (
-    PDFReader,
+    LayoutPDFReader,
     DocxReader,
     CSVReader,
     PandasExcelReader,
     VideoAudioReader  # Adding VideoAudioReader for handling audio/video without API
 )
-from pydantic import PrivateAttr
 
 
 # Optional API-based imports (conditionally loaded)
@@ -62,8 +56,6 @@ try:
 except ImportError:
     LLAMAPARSE_AVAILABLE = False
 
-import importlib.util
-import sys
 import weave
 
 weave.init("gaia-llamaindex-agents")
@@ -183,7 +175,7 @@ def read_and_parse_content(input_path: str) -> List[Document]:
 
     # Readers map
     readers_map = {
-        '.pdf': PDFReader(),
+    '.pdf': LayoutPDFReader(),
         '.docx': DocxReader(),
         '.doc': DocxReader(),
         '.csv': CSVReader(),
@@ -320,51 +312,16 @@ class DynamicQueryEngineManager:
 
         class HybridReranker:
             def __init__(self):
-                self.text_reranker = SentenceTransformerRerank(
-                    model="cross-encoder/ms-marco-MiniLM-L-2-v2",
-                    top_n=3, 
-                    device = "cpu"
-                )
-
-                self.visual_reranker = ColPaliRerank(
-                    top_n=3,
-                    model="vidore/colpali-v1.2",
-                    keep_retrieval_score=True,
-                    device="cpu"
+                # Use the new Jina multimodal reranker
+                self.jina_reranker = JinaMultimodalReranker(
+                    model_name="jinaai/jina-reranker-m0",
+                    top_n=5,
+                    device="auto"
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):
-                # Separate text and visual nodes
-                text_nodes = []
-                visual_nodes = []
-
-                for node in nodes:
-                    if (hasattr(node, 'image_path') and node.image_path) or                        (hasattr(node, 'metadata') and node.metadata.get('file_type') in ['jpg', 'png', 'jpeg', 'pdf']) or                        (hasattr(node, 'metadata') and node.metadata.get('type') in ['image', 'web_image']):
-                        visual_nodes.append(node)
-                    else:
-                        text_nodes.append(node)
-
-                # Apply appropriate reranker
-                reranked_text = []
-                reranked_visual = []
-
-                if text_nodes:
-                    reranked_text = self.text_reranker.postprocess_nodes(text_nodes, query_bundle)
-
-                if visual_nodes:
-                    reranked_visual = self.visual_reranker.postprocess_nodes(visual_nodes, query_bundle)
-
-                # Interleave results
-                combined_results = []
-                max_len = max(len(reranked_text), len(reranked_visual))
-
-                for i in range(max_len):
-                    if i < len(reranked_text):
-                        combined_results.append(reranked_text[i])
-                    if i < len(reranked_visual):
-                        combined_results.append(reranked_visual[i])
-
-                return combined_results[:5]
+                # Use Jina multimodal reranker for all content types
+                return self.jina_reranker.postprocess_nodes(nodes, query_bundle)
 
         hybrid_reranker = HybridReranker()
 
@@ -381,8 +338,9 @@ class DynamicQueryEngineManager:
             query_engine=query_engine,
             name="dynamic_hybrid_multimodal_rag_tool",
             description=(
-                "Advanced dynamic knowledge base with hybrid reranking. "
-                "Uses ColPali for visual content and SentenceTransformer for text content. "
+                "Advanced dynamic knowledge base with multimodal reranking. "
+                "Uses Jina reranker-m0 for unified text and visual content reranking. "
+                "Supports text-to-text, text-to-image, image-to-text, and image-to-image ranking. "
                 "Automatically updated with web search content."
             )
         )

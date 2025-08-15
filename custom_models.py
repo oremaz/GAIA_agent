@@ -9,6 +9,9 @@ import torch
 from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
 from transformers import AutoModel, BitsAndBytesConfig
+from llama_index.core.postprocessor import BaseNodePostprocessor
+from llama_index.core.schema import NodeWithScore
+import logging
 
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
@@ -424,3 +427,180 @@ class JinaEmbeddingsV4(BaseEmbedding):
 
     async def _aget_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
         return self._get_text_embedding(text, image_path)
+
+
+class JinaMultimodalReranker:
+    """
+    Custom Jina multimodal reranker using jinaai/jina-reranker-m0.
+    Supports text-to-text, text-to-image, image-to-text, and image-to-image reranking.
+    """
+    
+    def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "auto"):
+        self.model_name = model_name
+        self.top_n = top_n
+        self.device = device
+        self._model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load the Jina reranker model"""
+        try:
+            from transformers import AutoModel
+            import torch
+            
+            # Load with flash attention if available and compatible GPU
+            try:
+                self._model = AutoModel.from_pretrained(
+                    self.model_name,
+                    torch_dtype="auto",
+                    trust_remote_code=True,
+                    attn_implementation="flash_attention_2"
+                )
+            except Exception:
+                # Fallback without flash attention
+                self._model = AutoModel.from_pretrained(
+                    self.model_name,
+                    torch_dtype="auto",
+                    trust_remote_code=True
+                )
+            
+            # Move to device
+            if self.device == "auto":
+                if torch.cuda.is_available():
+                    self._model.to('cuda')
+                else:
+                    self._model.to('cpu')
+            else:
+                self._model.to(self.device)
+            
+            self._model.eval()
+            print(f"Loaded Jina reranker model: {self.model_name}")
+            
+        except Exception as e:
+            print(f"Error loading Jina reranker model: {e}")
+            raise
+    
+    def postprocess_nodes(self, nodes, query_bundle):
+        """
+        Rerank nodes using Jina multimodal reranker.
+        Automatically detects content types and uses appropriate reranking method.
+        """
+        if not nodes:
+            return []
+        
+        query = query_bundle.query_str
+        
+        # Prepare query-document pairs for reranking
+        text_pairs = []
+        image_pairs = []
+        node_indices = []
+        
+        for i, node in enumerate(nodes):
+            # Check if node contains image content
+            has_image = self._node_has_image(node)
+            
+            if has_image:
+                # Get image path/URL from node
+                image_path = self._extract_image_path(node)
+                if image_path:
+                    image_pairs.append([query, image_path])
+                    node_indices.append(('image', i))
+            else:
+                # Text content
+                text_content = node.get_content()
+                text_pairs.append([query, text_content])
+                node_indices.append(('text', i))
+        
+        # Compute scores
+        all_scores = []
+        
+        try:
+            # Score text pairs
+            if text_pairs:
+                text_scores = self._model.compute_score(
+                    text_pairs, 
+                    max_length=1024, 
+                    doc_type="text"
+                )
+                all_scores.extend([(score, 'text', idx) for score, (_, idx) in zip(text_scores, [x for x in node_indices if x[0] == 'text'])])
+            
+            # Score image pairs  
+            if image_pairs:
+                image_scores = self._model.compute_score(
+                    image_pairs, 
+                    max_length=2048, 
+                    doc_type="image"
+                )
+                all_scores.extend([(score, 'image', idx) for score, (_, idx) in zip(image_scores, [x for x in node_indices if x[0] == 'image'])])
+        
+        except Exception as e:
+            print(f"Error during reranking: {e}")
+            # Return original nodes if reranking fails
+            return nodes[:self.top_n]
+        
+        # Sort by score (descending)
+        all_scores.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return top N reranked nodes
+        reranked_nodes = []
+        for score, content_type, node_idx in all_scores[:self.top_n]:
+            if node_idx < len(nodes):
+                node = nodes[node_idx]
+                # Update node score
+                if hasattr(node, 'score'):
+                    node.score = score
+                reranked_nodes.append(node)
+        
+        return reranked_nodes
+    
+    def _node_has_image(self, node) -> bool:
+        """Check if a node contains image content"""
+        # Check metadata for image indicators
+        metadata = getattr(node, 'metadata', {})
+        
+        # Check file type
+        file_type = metadata.get('file_type', '').lower()
+        if file_type in ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'pdf']:
+            return True
+        
+        # Check content type
+        content_type = metadata.get('type', '').lower()
+        if content_type in ['image', 'web_image']:
+            return True
+        
+        # Check if node has image_path attribute
+        if hasattr(node, 'image_path') and node.image_path:
+            return True
+        
+        # Check if metadata contains image_data
+        if 'image_data' in metadata:
+            return True
+        
+        # Check source path for image extensions
+        source = metadata.get('source', '').lower()
+        if any(ext in source for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
+            return True
+        
+        return False
+    
+    def _extract_image_path(self, node) -> Optional[str]:
+        """Extract image path from node"""
+        # Try image_path attribute first
+        if hasattr(node, 'image_path') and node.image_path:
+            return node.image_path
+        
+        # Try metadata
+        metadata = getattr(node, 'metadata', {})
+        
+        # Check for direct path
+        if 'path' in metadata:
+            return metadata['path']
+        
+        # Check source if it's an image
+        source = metadata.get('source', '')
+        if source and any(ext in source.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']):
+            return source
+        
+        # For PDF or other documents with images, we might need special handling
+        # For now, return None if we can't find a direct image path
+        return None

@@ -292,35 +292,49 @@ class JinaEmbeddingsV4(BaseEmbedding):
 
         # Helper to coerce model outputs to a single vector (first item if batched)
         def _to_list_vector(arr):
-            # torch.Tensor -> numpy
+            # Robust conversion to a plain Python list[float].
             try:
                 import torch
-                if isinstance(arr, torch.Tensor):
-                    arr = arr.detach().cpu().numpy()
             except Exception:
-                pass
-        
-            # numpy -> list
+                torch = None
             try:
                 import numpy as np
-                if isinstance(arr, np.ndarray):
-                    # If batched (N, D), take first item
-                    if arr.ndim == 2:
-                        return arr[0].tolist()
-                    return arr.tolist()
             except Exception:
-                pass
-        
-            # Python list cases
+                np = None
+
+            # If it's a torch Tensor, convert to numpy first
+            if torch is not None and isinstance(arr, torch.Tensor):
+                arr = arr.detach().cpu().numpy()
+
+            # If it's a numpy array, reduce batch dims and return list
+            if np is not None and isinstance(arr, np.ndarray):
+                # Handle possible shapes: (N, D), (N, M, D), (D,)
+                if arr.ndim == 3:
+                    # average across the middle dimension (num_vecs) then take first batch
+                    arr = arr.mean(axis=1)
+                if arr.ndim == 2:
+                    arr = arr[0]
+                return [float(x) for x in arr.tolist()]
+
+            # If it's a list, try to coerce the first item's vector
             if isinstance(arr, list):
-                # If it's a list of vectors (batch), take the first vector
-                if len(arr) > 0 and isinstance(arr[0], (list, tuple)):
-                    return list(arr[0])
-                # If it's already a single vector (list of floats), return as-is
-                return list(arr)
-        
-            # Fallback: wrap scalars
-            return [float(arr)]
+                if len(arr) == 0:
+                    return []
+                first = arr[0]
+                # If first element is tensor/ndarray/list, recurse on it
+                if (torch is not None and isinstance(first, torch.Tensor)) or (
+                    np is not None and isinstance(first, np.ndarray)
+                ) or isinstance(first, (list, tuple)):
+                    return _to_list_vector(first)
+                # Otherwise assume it's already a flat list of numbers
+                return [float(x) for x in arr]
+
+            # Scalars and other types -> coerce to float
+            try:
+                return [float(arr)]
+            except Exception:
+                # Last resort: stringify then cast
+                return [float(str(arr))]
 
         with torch.no_grad():
             for text, img_path in zip(texts, image_paths):

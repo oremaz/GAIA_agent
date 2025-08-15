@@ -183,7 +183,7 @@ def initialize_models(use_api_mode=False):
             proj_llm = QwenVLCustomLLM()
 
             # Embedding model: Jina AI v4 (multimodal)
-            embed_model = JinaEmbeddingsV4(device="cpu")
+            embed_model = JinaEmbeddingsV4()
 
             # Code LLM (unchanged)
             code_llm = HuggingFaceLLM(
@@ -392,7 +392,7 @@ class DynamicQueryEngineManager:
                 self.jina_reranker = JinaMultimodalReranker(
                     model_name="jinaai/jina-reranker-m0",
                     top_n=5,
-                    device="auto"
+                    device="cpu"
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):

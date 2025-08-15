@@ -529,6 +529,24 @@ class JinaMultimodalReranker:
                             """
                             def __init__(self, llm_obj):
                                 self._llm = llm_obj
+                                # Mirror a minimal PyTorch model surface so callers can .to()/.eval()
+                                self.device = 'cpu'
+
+                            def to(self, device):
+                                """No-op device move for GGUF wrapper. Records device string."""
+                                try:
+                                    # normalize device string
+                                    if isinstance(device, str):
+                                        self.device = device
+                                    else:
+                                        self.device = str(device)
+                                except Exception:
+                                    self.device = 'cpu'
+                                return self
+
+                            def eval(self):
+                                """No-op eval (keeps parity with torch models)."""
+                                return self
 
                             def _call_embed(self, texts: List[str]) -> List[List[float]]:
                                 """Return a list of embedding vectors for the input texts.

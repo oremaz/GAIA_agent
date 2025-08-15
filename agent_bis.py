@@ -7,17 +7,18 @@ from urllib.parse import urlparse
 import torch
 import asyncio
 import mimetypes
+# Using PyMuPDFReader from llama_index.readers.file instead of direct fitz usage
 
 # Third-party imports
 import requests
-
-# Third-party imports (custom/local modules explicitly referenced by the original file)
+# Third-party imports
 from custom_models import QwenVLCustomLLM, JinaEmbeddingsV4, JinaMultimodalReranker
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.core.agent.workflow import ReActAgent, AgentStream
 from llama_index.core.node_parser import UnstructuredElementNodeParser, SentenceSplitter
+from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.tools import FunctionTool
 from llama_index.core.workflow import Context
 from llama_index.core.schema import ImageNode, TextNode
@@ -47,18 +48,17 @@ from llama_index.readers.file import (
     DocxReader,
     CSVReader,
     PandasExcelReader,
-    VideoAudioReader,  # Adding VideoAudioReader for handling audio/video without API
+    VideoAudioReader  # Adding VideoAudioReader for handling audio/video without API
 )
-
 from llama_index.readers.smart_pdf_loader import SmartPDFLoader
-
 import weave
 from ddgs import DDGS
 
 
 class MultimodalPDFReader:
     """Reader that combines SmartPDFLoader (layout-aware text/tables) with
-    PyMuPDF image extraction. Falls back to plain text when needed.
+    PyMuPDF (fitz) image extraction. Falls back to PyMuPDFReader if SmartPDFLoader
+    is not available, and to a plain-text fallback as last resort.
     """
 
     def __init__(self):
@@ -68,45 +68,45 @@ class MultimodalPDFReader:
         docs: List[Document] = []
 
         # 1) Text / layout-aware parsing: SmartPDFLoader
-        try:
-            loader = SmartPDFLoader()
-            text_docs = loader.load_data(file_path)
-            if text_docs:
-                docs.extend(text_docs)
-        except Exception as e:
-            docs.append(Document(text=f"Warning: SmartPDFLoader failed: {e}", metadata={"source": file_path}))
+        loader = SmartPDFLoader()
+        text_docs = loader.load_data(file_path)
+        if text_docs:
+            docs.extend(text_docs)
 
-        # 2) Use the LlamaIndex PyMuPDFReader for page-level text (and any image docs it may provide).
-        # Normalize metadata and text from potential bytes payloads.
-        try:
-            py_reader = PyMuPDFReader()
-            py_docs = py_reader.load_data(file_path)
+        # 2) Use the LlamaIndex PyMuPDFReader for page-level text (and any image
+        #    documents it may provide). PyMuPDFReader returns Documents where
+        #    page text is often bytes and extra_info holds metadata; normalize
+        #    both metadata and extra_info here.
+        py_reader = PyMuPDFReader()
+        py_docs = py_reader.load_data(file_path)
 
-            for d in py_docs:
-                md = getattr(d, "metadata", {}) or {}
-                extra = getattr(d, "extra_info", {}) or {}
-                combined = {**extra, **md}
+        for d in py_docs:
+            # Normalize metadata and extra_info into a single dict
+            md = getattr(d, "metadata", {}) or {}
+            extra = getattr(d, "extra_info", {}) or {}
+            combined = {**extra, **md}
 
-                text = d.text
-                if isinstance(text, (bytes, bytearray)):
-                    try:
-                        text = text.decode("utf-8")
-                    except Exception:
-                        text = text.decode("latin-1", errors="ignore")
+            # Decode bytes text if necessary
+            text = d.text
+            if isinstance(text, (bytes, bytearray)):
+                try:
+                    text = text.decode("utf-8")
+                except Exception:
+                    text = text.decode("latin-1", errors="ignore")
 
-                is_image = combined.get("type") in ("image", "web_image") or "image_data" in combined
-                if is_image:
-                    docs.append(Document(text=text or "IMAGE_CONTENT_BINARY", metadata=combined))
-        except Exception as e:
-            docs.append(Document(text=f"Warning: PyMuPDFReader failed: {e}", metadata={"source": file_path}))
+            # Determine if this doc represents an image (some readers may
+            # surface image docs via extra_info or metadata)
+            is_image = combined.get("type") in ("image", "web_image") or "image_data" in combined
 
+            if is_image:
+                # Preserve any image_data if present
+                docs.append(Document(text=text or "IMAGE_CONTENT_BINARY", metadata=combined))
         # Ensure source metadata exists
         for d in docs:
             if not d.metadata.get("source"):
                 d.metadata["source"] = file_path
 
         return docs
-
 
 # Optional API-based imports (conditionally loaded)
 try:
@@ -127,7 +127,6 @@ except ImportError:
 
 weave.init("gaia-llamaindex-agents")
 
-
 def get_max_memory_config(max_memory_per_gpu):
     """Generate max_memory config for available GPUs"""
     if torch.cuda.is_available():
@@ -137,7 +136,6 @@ def get_max_memory_config(max_memory_per_gpu):
             max_memory[i] = max_memory_per_gpu
         return max_memory
     return None
-
 
 # Initialize models based on API availability
 def initialize_models(use_api_mode=False):
@@ -151,14 +149,14 @@ def initialize_models(use_api_mode=False):
                 print("WARNING: GOOGLE_API_KEY not found. Falling back to non-API mode.")
                 return initialize_models(use_api_mode=False)
 
-            # Main LLM - Gemini 2.0 Flash (or closest available per environment)
+            # Main LLM - Gemini 2.0 Flash
             proj_llm = Gemini(
                 model="models/gemini-2.5-flash",
                 api_key=google_api_key,
                 max_tokens=16000,
                 temperature=0.6,
                 top_p=0.95,
-                top_k=20,
+                top_k=20
             )
 
             # Same model for code since Gemini is good at code
@@ -168,7 +166,7 @@ def initialize_models(use_api_mode=False):
             embed_model = GeminiEmbedding(
                 model_name="models/embedding-005",
                 api_key=google_api_key,
-                task_type="retrieval_document",
+                task_type="retrieval_document"
             )
 
             return proj_llm, code_llm, embed_model
@@ -177,29 +175,31 @@ def initialize_models(use_api_mode=False):
             print("Falling back to non-API mode...")
             return initialize_models(use_api_mode=False)
     else:
-        # Non-API Mode - Using HuggingFace/local models
+        # Non-API Mode - Using HuggingFace models
         print("Initializing models in non-API mode with local models...")
+
         try:
-            # Main LLM: Qwen2.5-VL (Vision-Language) via custom wrapper
+            # Main LLM: Qwen2.5-VL (Vision-Language)
             proj_llm = QwenVLCustomLLM()
 
             # Embedding model: Jina AI v4 (multimodal)
             embed_model = JinaEmbeddingsV4()
 
-            # Code LLM
+            # Code LLM (unchanged)
             code_llm = HuggingFaceLLM(
                 model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
                 tokenizer_name="Qwen/Qwen2.5-Coder-3B-Instruct",
                 device_map="auto",
-                model_kwargs={"torch_dtype": "auto", "load_in_4bit": True},
-                generate_kwargs={"do_sample": False},
+                model_kwargs={
+                    "torch_dtype": "auto",
+                    "load_in_4bit": True
+                },
+                generate_kwargs={"do_sample": False}
             )
-
             return proj_llm, code_llm, embed_model
         except Exception as e:
             print(f"Error initializing models: {e}")
             raise
-
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -215,7 +215,6 @@ proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE)
 # Set global settings
 Settings.llm = proj_llm
 Settings.embed_model = embed_model
-
 
 def read_and_parse_content(input_path: str) -> List[Document]:
     """
@@ -271,22 +270,25 @@ def read_and_parse_content(input_path: str) -> List[Document]:
         try:
             with open(input_path, 'rb') as f:
                 image_data = f.read()
-            return [
-                Document(
-                    text="IMAGE_CONTENT_BINARY",
-                    metadata={
-                        "source": input_path,
-                        "type": "image",
-                        "path": input_path,
-                        "image_data": image_data,
-                    },
-                )
-            ]
+            return [Document(
+                text=f"IMAGE_CONTENT_BINARY",
+                metadata={
+                    "source": input_path,
+                    "type": "image",
+                    "path": input_path,
+                    "image_data": image_data
+                }
+            )]
         except Exception as e:
             return [Document(text=f"Error reading image: {e}")]
 
     # Use appropriate reader for supported file types
     documents: List[Document] = []
+
+    # Use the module-level MultimodalPDFReader implementation above via readers_map
+
+    # PDF handling is delegated to MultimodalPDFReader via readers_map
+
     if file_extension in readers_map:
         loader = readers_map[file_extension]
         try:
@@ -305,8 +307,8 @@ def read_and_parse_content(input_path: str) -> List[Document]:
     # Add source metadata
     for doc in documents:
         doc.metadata["source"] = input_path
-    return documents
 
+    return documents
 
 class DynamicQueryEngineManager:
     """Single unified manager for all RAG operations - replaces the entire static approach."""
@@ -339,16 +341,14 @@ class DynamicQueryEngineManager:
         image_documents = []
 
         for doc in documents:
-            doc_type = doc.metadata.get("type", "") if getattr(doc, "metadata", None) else ""
-            source = doc.metadata.get("source", "").lower() if getattr(doc, "metadata", None) else ""
-            file_type = doc.metadata.get("file_type", "") if getattr(doc, "metadata", None) else ""
+            doc_type = doc.metadata.get("type", "")
+            source = doc.metadata.get("source", "").lower()
+            file_type = doc.metadata.get("file_type", "")
 
             # Identify image documents
-            if (
-                doc_type in ["image", "web_image"]
-                or file_type in ['jpg', 'png', 'jpeg', 'gif', 'bmp', 'webp']
-                or any(ext in source for ext in ['.jpg', '.png', '.jpeg', '.gif', '.bmp', '.webp'])
-            ):
+            if (doc_type in ["image", "web_image"] or
+                file_type in ['jpg', 'png', 'jpeg', 'gif', 'bmp', 'webp'] or
+                any(ext in source for ext in ['.jpg', '.png', '.jpeg', '.gif', '.bmp', '.webp'])):
                 image_documents.append(doc)
             else:
                 text_documents.append(doc)
@@ -372,7 +372,7 @@ class DynamicQueryEngineManager:
                         text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
                         metadata=img_doc.metadata,
                         image_path=img_doc.metadata.get("path"),
-                        image=img_doc.metadata.get("image_data"),
+                        image=img_doc.metadata.get("image_data")
                     )
                     nodes.append(image_node)
                 except Exception as e:
@@ -380,23 +380,23 @@ class DynamicQueryEngineManager:
                     # Fallback to regular TextNode for images
                     text_node = TextNode(
                         text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
-                        metadata=img_doc.metadata,
+                        metadata=img_doc.metadata
                     )
                     nodes.append(text_node)
 
-        # Build index
         index = VectorStoreIndex(nodes)
 
-        # Jina multimodal reranker (as node postprocessor)
         class HybridReranker:
             def __init__(self):
+                # Use the new Jina multimodal reranker
                 self.jina_reranker = JinaMultimodalReranker(
                     model_name="jinaai/jina-reranker-m0",
                     top_n=5,
-                    device="cpu",
+                    device="cpu"
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):
+                # Use Jina multimodal reranker for all content types
                 return self.jina_reranker.postprocess_nodes(nodes, query_bundle)
 
         hybrid_reranker = HybridReranker()
@@ -404,7 +404,7 @@ class DynamicQueryEngineManager:
         query_engine = index.as_query_engine(
             similarity_top_k=20,
             node_postprocessors=[hybrid_reranker],
-            response_mode="tree_summarize",
+            response_mode="tree_summarize"
         )
 
         # Create QueryEngineTool
@@ -418,7 +418,7 @@ class DynamicQueryEngineManager:
                 "Uses Jina reranker-m0 for unified text and visual content reranking. "
                 "Supports text-to-text, text-to-image, image-to-text, and image-to-image ranking. "
                 "Automatically updated with web search content."
-            ),
+            )
         )
 
     def add_documents(self, new_documents: List[Document]):
@@ -430,10 +430,8 @@ class DynamicQueryEngineManager:
     def get_tool(self):
         return self.query_engine_tool
 
-
 # Global instance
 dynamic_qe_manager = DynamicQueryEngineManager()
-
 
 def search_and_extract_content_from_url(query: str) -> List[Document]:
     """
@@ -448,19 +446,16 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
         if results and len(results) > 0:
             first = results[0]
             # ddgs may expose the link under several keys depending on backend/version
-            url = (
-                first.get("href")
-                or first.get("link")
-                or first.get("url")
-                or first.get("FirstURL")
-                or first.get("first_url")
-            )
+            url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
+            # sometimes ddgs returns a dict-like string; coerce
             if not url:
+                # try common keys by inspecting full dict
                 for k in ("href", "link", "url", "FirstURL", "first_url"):
                     if k in first:
                         url = first[k]
                         break
-    except Exception:
+
+    except Exception as e:
         url = None
 
     if not url:
@@ -489,7 +484,6 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
     except Exception as e:
         return [Document(text=f"Error extracting content from URL: {str(e)}")]
 
-
 def enhanced_web_search_and_update(query: str) -> str:
     """
     Performs web search, extracts content, and adds it to the dynamic query engine.
@@ -505,23 +499,22 @@ def enhanced_web_search_and_update(query: str) -> str:
         text_docs = [doc for doc in documents if doc.metadata.get("type") == "web_text"]
         image_docs = [doc for doc in documents if doc.metadata.get("type") == "web_image"]
 
-        summary = "Successfully added web content to knowledge base:\n"
+        summary = f"Successfully added web content to knowledge base:\n"
         summary += f"- {len(text_docs)} text documents\n"
         summary += f"- {len(image_docs)} images\n"
         summary += f"Source: {documents[0].metadata.get('source', 'Unknown')}"
+
         return summary
     else:
         error_msg = documents[0].text if documents else "No content extracted"
         return f"Failed to extract web content: {error_msg}"
 
-
 # Create the enhanced web search tool
 enhanced_web_search_tool = FunctionTool.from_defaults(
     fn=enhanced_web_search_and_update,
     name="enhanced_web_search",
-    description="Search the web, extract content and images, and add them to the knowledge base for future queries.",
+    description="Search the web, extract content and images, and add them to the knowledge base for future queries."
 )
-
 
 def safe_import(module_name):
     """Safely import a module, return None if not available"""
@@ -530,7 +523,6 @@ def safe_import(module_name):
     except ImportError:
         return None
 
-
 safe_globals = {
     "__builtins__": {
         "len": len, "str": str, "int": int, "float": float,
@@ -538,7 +530,7 @@ safe_globals = {
         "round": round, "abs": abs, "sorted": sorted, "enumerate": enumerate,
         "range": range, "zip": zip, "map": map, "filter": filter,
         "any": any, "all": all, "type": type, "isinstance": isinstance,
-        "print": print, "open": open, "bool": bool, "set": set, "tuple": tuple,
+        "print": print, "open": open, "bool": bool, "set": set, "tuple": tuple
     }
 }
 
@@ -551,7 +543,7 @@ core_modules = [
     "base64", "hashlib", "secrets", "hmac", "textwrap", "string",
     "difflib", "socket", "ipaddress", "logging", "warnings", "traceback",
     "pprint", "threading", "queue", "sqlite3", "urllib", "html", "xml",
-    "configparser",
+    "configparser"
 ]
 
 for module in core_modules:
@@ -581,7 +573,7 @@ optional_modules = {
     "sympy": "sympy",
     "tqdm": "tqdm",
     "yaml": "yaml",
-    "toml": "toml",
+    "toml": "toml"
 }
 
 for alias, module_name in optional_modules.items():
@@ -598,7 +590,6 @@ if safe_globals.get("PIL"):
     if image_module:
         safe_globals["Image"] = image_module
 
-
 def execute_python_code(code: str) -> str:
     try:
         exec_locals = {}
@@ -610,13 +601,11 @@ def execute_python_code(code: str) -> str:
     except Exception as e:
         return f"Code execution failed: {str(e)}"
 
-
 code_execution_tool = FunctionTool.from_defaults(
     fn=execute_python_code,
     name="Python Code Execution",
-    description="Executes Python code safely for calculations and data processing",
+    description="Executes Python code safely for calculations and data processing"
 )
-
 
 def clean_response(response: str) -> str:
     """Clean response by removing common prefixes"""
@@ -625,13 +614,14 @@ def clean_response(response: str) -> str:
         "FINAL ANSWER:", "Answer:", "The answer is:",
         "Based on my analysis,", "After reviewing,",
         "The result is:", "Final result:", "According to",
-        "In conclusion,", "Therefore,", "Thus,",
+        "In conclusion,", "Therefore,", "Thus,"
     ]
+
     for prefix in prefixes_to_remove:
         if response_clean.startswith(prefix):
             response_clean = response_clean[len(prefix):].strip()
-    return response_clean
 
+    return response_clean
 
 def llm_reformat(response: str, question: str) -> str:
     """Use LLM to reformat the response according to GAIA requirements"""
@@ -662,39 +652,47 @@ Answer: C++, Java, Python
 Now extract the exact answer:
 Question: {question}
 Response: {response}
+
 Answer:"""
 
     try:
+        # Use the global LLM instance
         formatting_response = proj_llm.complete(format_prompt)
         answer = str(formatting_response).strip()
+
+        # Extract just the answer after "Answer:"
         if "Answer:" in answer:
             answer = answer.split("Answer:")[-1].strip()
+
         return answer
     except Exception as e:
         print(f"LLM reformatting failed: {e}")
         return response
 
-
 def final_answer_tool(agent_response: str, question: str) -> str:
     """
     Simplified final answer tool using only LLM reformatting.
-
     Args:
         agent_response: The raw response from agent reasoning
         question: The original question for context
     Returns:
         Exact answer in GAIA format
     """
+    # Step 1: Clean the response
     cleaned_response = clean_response(agent_response)
+
+    # Step 2: Use LLM reformatting
     formatted_answer = llm_reformat(cleaned_response, question)
+
     print(f"Original response cleaned: {cleaned_response[:100]}...")
     print(f"LLM formatted answer: {formatted_answer}")
-    return formatted_answer
 
+    return formatted_answer
 
 class EnhancedGAIAAgent:
     def __init__(self):
         print("Initializing Enhanced GAIA Agent...")
+
         # Vérification du token HuggingFace
         hf_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
         if not hf_token:
@@ -707,30 +705,31 @@ class EnhancedGAIAAgent:
         self.external_knowledge_agent = ReActAgent(
             name="external_knowledge_agent",
             description="Advanced information retrieval with dynamic knowledge base",
-            system_prompt=(
-                "You are an advanced information specialist with a sophisticated RAG system.\n"
-                "Your knowledge base uses hybrid reranking and grows dynamically with each web search and document addition.\n\n"
-                "IMPORTANT INSTRUCTIONS FOR YOUR REASONING PROCESS:\n"
-                "1. Pay careful attention to ALL details in the user's question.\n"
-                "2. Think step by step about what is being asked, breaking down the requirements.\n"
-                "3. Identify specific qualifiers (e.g., \"studio albums\" vs just \"albums\", \"between 2000-2010\" vs \"all time\").\n"
-                "4. If searching for information, include ALL important details in your search query.\n"
-                "5. Double-check that your final answer addresses the EXACT question asked, not a simplified version.\n\n"
-                "For example:\n"
-                "- If asked \"How many studio albums did Taylor Swift release between 2006-2010?\", don't just search for\n"
-                "\"Taylor Swift albums\" - include \"studio albums\" AND the specific date range in your search.\n"
-                "- If asked about \"Fortune 500 companies headquartered in California\", don't just search for\n"
-                "\"Fortune 500 companies\" - include the location qualifier.\n\n"
-                "Always add relevant content to your knowledge base, then query it for answers."
-            ),
+            system_prompt="""You are an advanced information specialist with a sophisticated RAG system.
+Your knowledge base uses hybrid reranking and grows dynamically with each web search and document addition.
+
+IMPORTANT INSTRUCTIONS FOR YOUR REASONING PROCESS:
+1. Pay careful attention to ALL details in the user's question.
+2. Think step by step about what is being asked, breaking down the requirements.
+3. Identify specific qualifiers (e.g., "studio albums" vs just "albums", "between 2000-2010" vs "all time").
+4. If searching for information, include ALL important details in your search query.
+5. Double-check that your final answer addresses the EXACT question asked, not a simplified version.
+
+For example:
+- If asked "How many studio albums did Taylor Swift release between 2006-2010?", don't just search for 
+  "Taylor Swift albums" - include "studio albums" AND the specific date range in your search.
+- If asked about "Fortune 500 companies headquartered in California", don't just search for 
+  "Fortune 500 companies" - include the location qualifier.
+
+Always add relevant content to your knowledge base, then query it for answers.""",
             tools=[
                 enhanced_web_search_tool,
                 self.dynamic_qe_manager.get_tool(),
-                code_execution_tool,
+                code_execution_tool
             ],
             llm=proj_llm,
             max_steps=8,
-            verbose=True,
+            verbose=True
         )
 
         self.code_agent = ReActAgent(
@@ -740,56 +739,55 @@ class EnhancedGAIAAgent:
             tools=[code_execution_tool],
             llm=code_llm,
             max_steps=6,
-            verbose=True,
+            verbose=True
         )
 
-        # Coordinator initialization
+        # Fixed indentation: coordinator initialization inside __init__
         self.coordinator = AgentWorkflow(
             agents=[self.external_knowledge_agent, self.code_agent],
-            root_agent="external_knowledge_agent",
+            root_agent="external_knowledge_agent"
         )
-
-        # Optional: placeholders for BM25 per original code’s intent
-        self.retriever_tool = None
 
     def load_documents_from_file(self, file_path: str):
         """Load and process text documents for BM25, or return raw content for media files."""
         try:
+            # Devine le type MIME du fichier
             mime_type, _ = mimetypes.guess_type(file_path)
             if mime_type is None:
                 mime_type = ""
             print(f"Detected MIME type: {mime_type} for file {file_path}")
-
-            # Media: return binary
+            # Traitement selon le type de fichier
             if mime_type.startswith("image") or mime_type.startswith("video") or mime_type.startswith("audio"):
                 with open(file_path, "rb") as f:
                     binary_content = f.read()
                 print(f"Loaded {mime_type} file: {file_path}")
                 return binary_content
-            else:
-                # If file is likely text → process for BM25 if available
+            else : 
+            # Si fichier texte → traitement BM25
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
+            # Split en chunks
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                separators=["\n\n", "\n", ".", " ", ""]
+            )
 
-                if RecursiveCharacterTextSplitter is None or BM25RetrieverTool is None:
-                    print("BM25 or text splitter not available; returning raw content.")
-                    return content
+            chunks = text_splitter.split_text(content)
+            docs = [Document(page_content=chunk, metadata={"source": file_path})
+                    for chunk in chunks]
 
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200,
-                    separators=["\n\n", "\n", ".", " ", ""],
-                )
-                chunks = text_splitter.split_text(content)
-                docs = [Document(page_content=chunk, metadata={"source": file_path}) for chunk in chunks]
+            # BM25 + agent
+            self.retriever_tool = BM25RetrieverTool(docs)
+            self._create_agent()
 
-                self.retriever_tool = BM25RetrieverTool(docs)
-                # Refresh an agent that could use BM25 if wired later
-                print(f"Loaded {len(docs)} document chunks from {file_path}")
-                return True
+            print(f"Loaded {len(docs)} document chunks from {file_path}")
+            return True
+
         except Exception as e:
             print(f"Error loading documents from {file_path}: {e}")
             return False
+
 
     def download_gaia_file(self, task_id: str, api_url: str = "https://agents-course-unit4-scoring.hf.space") -> str:
         """Download file associated with GAIA task_id and return its path"""
@@ -797,18 +795,23 @@ class EnhancedGAIAAgent:
             response = requests.get(f"{api_url}/files/{task_id}", timeout=30)
             response.raise_for_status()
 
+            # Try to get filename from headers
             print(f"Response headers: {response.headers}")
             content_disp = response.headers.get("content-disposition", "")
             match = re.search(r'filename="(.+)"', content_disp)
             if match:
                 filename = match.group(1)
             else:
+                # Error
                 raise ValueError("Filename not found in response headers")
 
+            # Save the file
             with open(filename, 'wb') as f:
                 f.write(response.content)
+
             print(f"Downloaded file saved as {filename}")
-            return os.path.abspath(filename)
+            return os.path.abspath(filename)  # Or just return `filename` for relative path
+
         except Exception as e:
             print(f"Failed to download file for task {task_id}: {e}")
             return None
@@ -825,9 +828,10 @@ class EnhancedGAIAAgent:
                 self.external_knowledge_agent.tools = [
                     enhanced_web_search_tool,
                     self.dynamic_qe_manager.get_tool(),  # Get the updated tool
-                    code_execution_tool,
+                    code_execution_tool
                 ]
-            return True
+
+                return True
         except Exception as e:
             print(f"Failed to add documents from {file_path}: {e}")
             return False
@@ -851,13 +855,13 @@ class EnhancedGAIAAgent:
             except Exception as e:
                 print(f"Failed to download/process file for task {task_id}: {e}")
 
-        # Context prompt driving the workflow
+        # Enhanced context prompt with dynamic knowledge base awareness and step-by-step reasoning
         context_prompt = f"""
 GAIA Task ID: {task_id}
 Question: {question}
 {f'File processed and added to knowledge base: {file_path}' if file_path else 'No additional files'}
 
-You are a general AI assistant. I will ask you a question.
+You are a general AI assistant. I will ask you a question. 
 
 IMPORTANT INSTRUCTIONS:
 1. Think through this STEP BY STEP, carefully analyzing all aspects of the question.
@@ -866,11 +870,10 @@ IMPORTANT INSTRUCTIONS:
 4. Report your thoughts and reasoning process clearly.
 5. Finish your answer with: FINAL ANSWER: [YOUR FINAL ANSWER]
 
-YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings.
-If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise.
-If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise.
-If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
-""".strip()
+YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. 
+If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. 
+If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. 
+If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string."""
 
         try:
             ctx = Context(self.coordinator)
@@ -879,6 +882,7 @@ If you are asked for a comma separated list, apply the above rules depending of 
 
             handler = self.coordinator.run(ctx=ctx, user_msg=context_prompt)
             full_response = ""
+
             async for event in handler.stream_events():
                 if isinstance(event, AgentStream):
                     print(event.delta, end="", flush=True)
@@ -886,6 +890,11 @@ If you are asked for a comma separated list, apply the above rules depending of 
 
             final_response = await handler
             print("\n=== END REASONING ===")
+
+            # Extract the final formatted answer
+            #final_answer = final_answer_tool(str(final_response), question)
+            #print(f"Final GAIA formatted answer: {final_answer}")
+            #print(f"Knowledge base now contains {len(self.dynamic_qe_manager.documents)} documents")
 
             return final_response
         except Exception as e:
@@ -897,20 +906,23 @@ If you are asked for a comma separated list, apply the above rules depending of 
         """Get statistics about the current knowledge base"""
         return {
             "total_documents": len(self.dynamic_qe_manager.documents),
-            "document_sources": [doc.metadata.get("source", "Unknown") for doc in self.dynamic_qe_manager.documents],
+            "document_sources": [doc.metadata.get("source", "Unknown") for doc in self.dynamic_qe_manager.documents]
         }
 
-
 async def main():
+
     agent = EnhancedGAIAAgent()
+
     question_data = {
         "Question": "How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? List them !",
-        "task_id": "",
+        "task_id": ""
     }
-    print(question_data)
-    answer = await agent.solve_gaia_question(question_data)
-    print(f"Answer: {answer}")
 
+    print(question_data)
+
+   
+    answer = await agent.solve_gaia_question(question_data)   
+    print(f"Answer: {answer}")
 
 if __name__ == '__main__':
     asyncio.run(main())

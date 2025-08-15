@@ -456,36 +456,61 @@ class JinaMultimodalReranker:
     def _load_model(self):
         """Load the Jina reranker model"""
         try:
-            from transformers import AutoModel
+            from transformers import AutoModel, BitsAndBytesConfig
             import torch
-            
-            # Load with flash attention if available and compatible GPU
+
+            # Prefer 4-bit quantized load to reduce GPU memory usage (align with embeddings)
+            self._bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+
+            # Determine target device. Prefer cuda:1 when multiple GPUs exist,
+            # otherwise fall back to cuda:0. If no CUDA, use CPU.
+            if self.device == "auto":
+                if torch.cuda.is_available():
+                    try:
+                        dev_count = torch.cuda.device_count()
+                    except Exception:
+                        dev_count = 1
+                    if dev_count > 1:
+                        target_dev = "cuda:1"
+                    else:
+                        target_dev = "cuda:0"
+                else:
+                    target_dev = "cpu"
+            else:
+                target_dev = self.device
+
+            device_map = {"": target_dev} if target_dev != "cpu" else "cpu"
+
+            # Try to load quantized 4-bit model onto the requested device map
             try:
+                self._model = AutoModel.from_pretrained(
+                    self.model_name,
+                    trust_remote_code=True,
+                    quantization_config=self._bnb_config,
+                    device_map=device_map,
+                )
+            except Exception as e:
+                # If 4-bit loading fails (incompatible bitsandbytes/transformers/CUDA),
+                # fall back to a standard (non-4bit) load on the same device_map.
+                print(f"4-bit load failed for reranker: {e}. Falling back to non-4bit load.")
                 self._model = AutoModel.from_pretrained(
                     self.model_name,
                     torch_dtype="auto",
                     trust_remote_code=True,
-                    attn_implementation="flash_attention_2"
+                    device_map=device_map,
                 )
-            except Exception:
-                # Fallback without flash attention
-                self._model = AutoModel.from_pretrained(
-                    self.model_name,
-                    torch_dtype="auto",
-                    trust_remote_code=True
-                )
-            
-            # Move to device
-            if self.device == "auto":
-                if torch.cuda.is_available():
-                    self._model.to('cuda')
-                else:
-                    self._model.to('cpu')
-            else:
-                self._model.to(self.device)
-            
+
+            # If device_map is 'cpu', ensure model is on CPU. Otherwise device_map already placed weights.
+            if device_map == 'cpu':
+                self._model.to('cpu')
+
             self._model.eval()
-            print(f"Loaded Jina reranker model: {self.model_name}")
+            print(f"Loaded Jina reranker model: {self.model_name} on {target_dev}")
             
         except Exception as e:
             print(f"Error loading Jina reranker model: {e}")

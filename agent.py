@@ -392,7 +392,7 @@ class DynamicQueryEngineManager:
                 self.jina_reranker = JinaMultimodalReranker(
                     model_name="jinaai/jina-reranker-m0",
                     top_n=5,
-                    device="auto"
+                    device="cuda:1"
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):

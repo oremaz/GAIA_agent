@@ -4,9 +4,10 @@ import base64
 from typing import Dict, Any, List
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
 from smolagents import CodeAgent, OpenAIServerModel, Tool, ToolCallingAgent
-from smolagents import PythonInterpreterTool, SpeechToTextTool
+from smolagents import PythonInterpreterTool
 
 # Langfuse observability imports
 from opentelemetry.sdk.trace import TracerProvider
@@ -31,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from smolagents import Tool
 from google import genai
 from google.genai import types
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import os
 import mimetypes
 from typing import Dict, Any
@@ -38,6 +40,9 @@ from typing import Dict, Any
 agent_type = "ToolAgent"
 
 client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+
+
+# use GoogleGenerativeAIEmbeddings from langchain_google_genai
 
 def llm_reformat(response: str, question: str, type: str = "number") -> str:
     """
@@ -478,12 +483,13 @@ class UnifiedMultimodalTool(Tool):
             'processing_method': 'Files API' if file_size > 20 * 1024 * 1024 else 'Inline'
         }
 
-class BM25RetrieverTool(Tool):
+class ChromaBM25HybridRetrieverTool(Tool):
     """
-    BM25 retriever tool for document search when text documents are available
+    Chroma + BM25 hybrid retriever tool.
+    Uses Chroma for dense vector similarity and BM25 for lexical matching.
     """
-    name = "bm25_retriever"
-    description = "Uses BM25 search to retrieve relevant parts of uploaded documents. Use this when the question references an attached file or document (except for images)."
+    name = "chroma_bm25_hybrid_retriever"
+    description = "Retrieves relevant document sections using Chroma (dense) and BM25 (lexical)."
     inputs = {
         "query": {
             "type": "string",
@@ -492,23 +498,124 @@ class BM25RetrieverTool(Tool):
     }
     output_type = "string"
 
-    def __init__(self, docs=None, **kwargs):
+    def __init__(self, chroma: Chroma = None, bm25 = None, top_k: int = 5, alpha: float = 0.5, **kwargs):
+        """alpha: weight for dense (Chroma) scores. Final score = alpha * dense + (1-alpha) * lexical"""
         super().__init__(**kwargs)
-        self.docs = docs or []
-        self.retriever = None
-        if self.docs:
-            self.retriever = BM25Retriever.from_documents(self.docs, k=5)
+        self.chroma = chroma
+        self.bm25 = bm25
+        self.top_k = top_k
+        self.alpha = float(alpha)
+
+    def _doc_uid(self, d: Document):
+        if d.metadata and isinstance(d.metadata, dict):
+            return (d.metadata.get('source'), d.page_content[:200])
+        return ('', d.page_content[:200])
 
     def forward(self, query: str) -> str:
-        if not self.retriever:
+        if not (self.chroma or self.bm25):
             return "No documents loaded for retrieval."
 
         assert isinstance(query, str), "Your search query must be a string"
 
-        docs = self.retriever.invoke(query)
+        dense_results = []  # list of (doc, score)
+        lexical_results = []  # list of (doc, score)
+
+        # Get dense scores from Chroma if available
+        if self.chroma:
+            try:
+                if hasattr(self.chroma, 'similarity_search_with_score'):
+                    dense_results = self.chroma.similarity_search_with_score(query, k=self.top_k)
+                else:
+                    docs = self.chroma.similarity_search(query, k=self.top_k)
+                    dense_results = [(d, 1.0) for d in docs]
+            except Exception:
+                dense_results = []
+
+        # Get lexical scores from BM25 if available
+        if self.bm25:
+            try:
+                # Some BM25 implementations expose a scoring API
+                if hasattr(self.bm25, 'get_relevant_documents_with_score'):
+                    lexical_results = self.bm25.get_relevant_documents_with_score(query)
+                elif hasattr(self.bm25, 'get_relevant_documents'):
+                    docs = self.bm25.get_relevant_documents(query)
+                    # assign decreasing scores based on rank
+                    lexical_results = [(d, float(max(0, self.top_k - i))) for i, d in enumerate(docs[: self.top_k])]
+                else:
+                    docs = self.bm25(query)
+                    lexical_results = [(d, float(max(0, self.top_k - i))) for i, d in enumerate(docs[: self.top_k])]
+            except Exception:
+                lexical_results = []
+
+        # Build maps doc_uid -> best dense score / lexical score
+        dense_map = {}
+        for d, s in dense_results:
+            uid = self._doc_uid(d)
+            dense_map[uid] = max(dense_map.get(uid, float('-inf')), float(s))
+
+        lexical_map = {}
+        for d, s in lexical_results:
+            uid = self._doc_uid(d)
+            lexical_map[uid] = max(lexical_map.get(uid, float('-inf')), float(s))
+
+        # Collect all unique uids and corresponding Document instances
+        docs_by_uid = {}
+        for d, _ in dense_results:
+            docs_by_uid[self._doc_uid(d)] = d
+        for d, _ in lexical_results:
+            docs_by_uid.setdefault(self._doc_uid(d), d)
+
+        if not docs_by_uid:
+            return "No relevant documents found."
+
+        # Normalize scores to 0..1
+        def normalize_map(m):
+            if not m:
+                return {}
+            vals = list(m.values())
+            mn = min(vals)
+            mx = max(vals)
+            if mx == mn:
+                # everything same score -> map to 1.0
+                return {k: 1.0 for k in m}
+            # If scores look like distances (larger is worse), invert by 1/(1+score)
+            # Heuristic: if average > 1.0 treat as distance and invert
+            avg = sum(vals) / len(vals)
+            if avg > 1.0:
+                inv = {k: 1.0 / (1.0 + v) for k, v in m.items()}
+                vmin = min(inv.values())
+                vmax = max(inv.values())
+                return {k: (val - vmin) / (vmax - vmin) if vmax != vmin else 1.0 for k, val in inv.items()}
+            else:
+                return {k: (v - mn) / (mx - mn) for k, v in m.items()}
+
+        norm_dense = normalize_map(dense_map)
+        norm_lex = normalize_map(lexical_map)
+
+        # Compute hybrid score
+        hybrid_scores = {}
+        for uid in docs_by_uid.keys():
+            dscore = norm_dense.get(uid, 0.0)
+            lscore = norm_lex.get(uid, 0.0)
+            # If one of the modalities is missing, rely on the other
+            if (dscore == 0.0) and (lscore == 0.0):
+                score = 0.0
+            elif (dscore == 0.0):
+                score = lscore
+            elif (lscore == 0.0):
+                score = dscore
+            else:
+                score = self.alpha * dscore + (1.0 - self.alpha) * lscore
+            hybrid_scores[uid] = score
+
+        # Sort by hybrid score desc
+        sorted_uids = sorted(hybrid_scores.items(), key=lambda kv: kv[1], reverse=True)
+
+        results = [docs_by_uid[uid] for uid, _ in sorted_uids[: self.top_k]]
+
         return "\nRetrieved documents:\n" + "".join([
             f"\n\n===== Document {str(i)} =====\n" + doc.page_content
-            for i, doc in enumerate(docs)
+            for i, doc in enumerate(results)
         ])
 
 class GAIAAgent:
@@ -551,8 +658,8 @@ class GAIAAgent:
                 - Finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
                 """
 
-        # Initialize retriever tool (will be updated when documents are loaded)
-        self.retriever_tool = BM25RetrieverTool()
+    # Initialize retriever tool (will be updated when documents are loaded)
+        self.retriever_tool = ChromaBM25HybridRetrieverTool()
 
         # Create the agent
         self.agent = None
@@ -563,10 +670,6 @@ class GAIAAgent:
 
         from langfuse import get_client
         self.langfuse = get_client()  # ✅ Use get_client() for v3
-        
-        # Store user and session IDs for tracking
-        self.user_id = user_id or "gaia-user"
-        self.session_id = session_id or "gaia-session"
 
     def _setup_langfuse_observability(self):
         """Set up Langfuse observability with OpenTelemetry"""
@@ -695,11 +798,23 @@ class GAIAAgent:
             docs = [Document(page_content=chunk, metadata={"source": file_path})
                     for chunk in chunks]
 
-            # BM25 + agent
-            self.retriever_tool = BM25RetrieverTool(docs)
+            # Use GoogleGenerativeAIEmbeddings from langchain_google_genai for dense vectors
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+
+            # Create Chroma vectorstore from documents
+            try:
+                chroma = Chroma.from_documents(documents=docs, embedding=embeddings)
+            except Exception as e:
+                print(f"Failed to create Chroma vectorstore: {e}")
+                chroma = None
+
+            # Create BM25 retriever if available
+            bm25 = BM25Retriever(documents=docs)
+            # Attach the hybrid retriever tool and recreate agent so tools list is updated
+            self.retriever_tool = ChromaBM25HybridRetrieverTool(chroma=chroma, bm25=bm25, top_k=5)
             self._create_agent()
 
-            print(f"Loaded {len(docs)} document chunks from {file_path}")
+            print(f"Loaded {len(docs)} document chunks from {file_path} into local Chroma store and BM25 retriever")
             return True
 
         except Exception as e:

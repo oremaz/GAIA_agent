@@ -12,7 +12,13 @@ import mimetypes
 # Third-party imports
 import requests
 # Third-party imports
-from custom_models import QwenVLCustomLLM, JinaEmbeddingsV4, JinaMultimodalReranker
+from custom_models import (
+    QwenVLCustomLLM,
+    JinaEmbeddingsV4,
+    JinaMultimodalReranker,
+    Qwen3GGUFEmbedding,
+    Gemma3CustomLLM,
+)
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings
@@ -138,8 +144,14 @@ def get_max_memory_config(max_memory_per_gpu):
     return None
 
 # Initialize models based on API availability
-def initialize_models(use_api_mode=False):
-    """Initialize LLM, Code LLM, and Embed models based on mode"""
+def initialize_models(use_api_mode=False, multimodal: bool = True):
+    """Initialize LLM, Code LLM, and Embed models based on mode.
+
+    Args:
+        use_api_mode: when True use API-backed models (Gemini/GeminiEmbedding)
+        multimodal: when False use text-only pipeline (GPT-OSS, Qwen3 GGUF embeddings,
+                    and CPU reranker). When True keep the multimodal pipeline.
+    """
     if use_api_mode and GEMINI_AVAILABLE:
         # API Mode - Using Google's Gemini models
         try:
@@ -175,27 +187,44 @@ def initialize_models(use_api_mode=False):
             print("Falling back to non-API mode...")
             return initialize_models(use_api_mode=False)
     else:
-        # Non-API Mode - Using HuggingFace models
+        # Non-API Mode - Using local models
         print("Initializing models in non-API mode with local models...")
 
         try:
-            # Main LLM: Qwen2.5-VL (Vision-Language)
-            proj_llm = QwenVLCustomLLM()
+            if multimodal:
+                # Multimodal pipeline (existing behavior)
+                proj_llm = QwenVLCustomLLM()
+                embed_model = JinaEmbeddingsV4()
 
-            # Embedding model: Jina AI v4 (multimodal)
-            embed_model = JinaEmbeddingsV4()
+                # Code LLM (unchanged)
+                code_llm = HuggingFaceLLM(
+                    model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
+                    tokenizer_name="Qwen/Qwen2.5-Coder-3B-Instruct",
+                    device_map="auto",
+                    model_kwargs={
+                        "torch_dtype": "auto",
+                        "load_in_4bit": True
+                    },
+                    generate_kwargs={"do_sample": False}
+                )
+            else:
+                # Text-only pipeline: GPT-OSS as main LLM + code LLM, Qwen3 GGUF on CPU for embeddings,
+                # and use the jina reranker v2 on CPU (configured when creating reranker instance)
+                print("Initializing text-only local pipeline: GPT-OSS + Qwen3 GGUF embeddings + CPU reranker")
+                proj_llm = HuggingFaceLLM(
+                    model_name="openai/gpt-oss-20b",
+                    tokenizer_name="openai/gpt-oss-20b",
+                    device_map={"": 0} if torch.cuda.is_available() else "cpu",
+                    model_kwargs={"torch_dtype": "auto"},
+                    generate_kwargs={"do_sample": False}
+                )
 
-            # Code LLM (unchanged)
-            code_llm = HuggingFaceLLM(
-                model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                tokenizer_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                device_map="auto",
-                model_kwargs={
-                    "torch_dtype": "auto",
-                    "load_in_4bit": True
-                },
-                generate_kwargs={"do_sample": False}
-            )
+                # Use the same model for code LLM (as requested)
+                code_llm = proj_llm
+
+                # Embedding model: local Qwen3 GGUF via llama.cpp wrapper
+                embed_model = Qwen3GGUFEmbedding()
+
             return proj_llm, code_llm, embed_model
         except Exception as e:
             print(f"Error initializing models: {e}")
@@ -208,11 +237,12 @@ logging.getLogger("llama_index.llms").setLevel(logging.DEBUG)
 # Module logger
 logger = logging.getLogger(__name__)
 
-# Use environment variable to determine API mode
+# Use environment variables to determine API and multimodal modes
 USE_API_MODE = os.environ.get("USE_API_MODE", "false").lower() == "true"
+NONAPI_MULTIMODAL = os.environ.get("NONAPI_MULTIMODAL", "true").lower() == "true"
 
-# Initialize models based on API mode setting
-proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE)
+# Initialize models based on API mode and multimodal setting
+proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE, multimodal=NONAPI_MULTIMODAL)
 
 # Set global settings
 Settings.llm = proj_llm
@@ -242,10 +272,8 @@ def read_and_parse_content(input_path: str) -> List[Document]:
 
     file_extension = os.path.splitext(input_path)[1].lower()
 
-    # Readers map
+    # Readers map - note: doc/docx/pptx etc are converted to PDF first (see convert_to_pdf)
     readers_map = {
-        '.docx': DocxReader(),
-        '.doc': DocxReader(),
         '.csv': CSVReader(),
         '.json': JSONReader(),
         '.xlsx': PandasExcelReader(),
@@ -284,6 +312,68 @@ def read_and_parse_content(input_path: str) -> List[Document]:
         except Exception as e:
             return [Document(text=f"Error reading image: {e}")]
 
+    # Helper: try to convert office docs to PDF first, then use the PDF reader
+    def convert_to_pdf(path: str) -> str:
+        """Convert office documents to PDF using LibreOffice headless (soffice).
+
+        This implementation intentionally does NOT use pypandoc. It will raise
+        a RuntimeError on failure (fail-fast) with an informative message so
+        callers can handle the error appropriately.
+
+        Returns:
+            Absolute path to the generated PDF file on success.
+
+        Raises:
+            RuntimeError: if LibreOffice is not available or conversion fails.
+        """
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in ['.doc', '.docx', '.ppt', '.pptx', '.odt']:
+            return path
+
+        try:
+            import tempfile
+            import subprocess
+            import shutil
+            import os as _os
+
+            # Locate the LibreOffice binary (soffice preferred)
+            soffice = shutil.which("soffice") or shutil.which("libreoffice")
+            if not soffice:
+                raise RuntimeError("LibreOffice executable 'soffice' or 'libreoffice' not found in PATH. Please install LibreOffice and ensure it's on PATH.")
+
+            outdir = tempfile.mkdtemp(prefix="office_to_pdf_")
+
+            # Run headless conversion
+            proc = subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", path, "--outdir", outdir],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode('utf-8', errors='ignore') if proc.stderr else ''
+                raise RuntimeError(f"LibreOffice conversion failed (returncode={proc.returncode}): {stderr}")
+
+            base = _os.path.basename(path)
+            pdfname = _os.path.splitext(base)[0] + '.pdf'
+            candidate = _os.path.join(outdir, pdfname)
+            if _os.path.exists(candidate):
+                return candidate
+
+            # If expected filename not found, try to find any PDF in outdir
+            for f in _os.listdir(outdir):
+                if f.lower().endswith('.pdf'):
+                    return _os.path.join(outdir, f)
+
+            raise RuntimeError(f"LibreOffice conversion completed but no PDF was produced in {outdir}.")
+
+        except RuntimeError:
+            # Re-raise RuntimeError as-is
+            raise
+        except Exception as e:
+            raise RuntimeError(f"Failed to convert {path} to PDF using LibreOffice: {e}")
+
     # Use appropriate reader for supported file types
     documents: List[Document] = []
 
@@ -291,10 +381,25 @@ def read_and_parse_content(input_path: str) -> List[Document]:
 
     # PDF handling is delegated to MultimodalPDFReader via readers_map
 
+    # If office docs, convert to PDF first then fall through to PDF reader
+    if file_extension in ['.doc', '.docx', '.ppt', '.pptx', '.odt']:
+        pdf_path = convert_to_pdf(input_path)
+        # If conversion returned same path or failed, keep going; otherwise update
+        if pdf_path and os.path.exists(pdf_path) and pdf_path != input_path:
+            input_path = pdf_path
+            file_extension = os.path.splitext(pdf_path)[1].lower()
+
     if file_extension in readers_map:
         loader = readers_map[file_extension]
         try:
-            documents = loader.load_data(input_path)
+            # In text-only (non-multimodal) mode, prefer SmartPDFLoader only for PDFs
+            if file_extension == '.pdf' and not (not USE_API_MODE and NONAPI_MULTIMODAL is False):
+                # multimodal or API mode => use multimodal reader which can extract images
+                documents = loader.load_data(input_path)
+            else:
+                # text-only pipeline: use SmartPDFLoader to avoid any image extraction
+                smart = SmartPDFLoader()
+                documents = smart.load_data(input_path)
         except Exception as e:
             return [Document(text=f"Error loading file with reader: {e}")]
     else:
@@ -330,14 +435,14 @@ class DynamicQueryEngineManager:
         for path in document_paths:
             docs = read_and_parse_content(path)
             self.documents.extend(docs)
-        logger.info("Loaded %d initial documents", len(self.documents))
+        print(f"Loaded {len(self.documents)} initial documents")
 
     def _create_rag_tool(self):
         """Create RAG tool using multimodal-aware parsing."""
         documents = self.documents if self.documents else [
             Document(text="No documents loaded yet. Use web search to add content.")
         ]
-        logger.info("_create_rag_tool: starting with %d documents", len(documents))
+        print(f"_create_rag_tool: starting with {len(documents)} documents")
 
         # Separate text and image documents for proper processing
         text_documents = []
@@ -356,17 +461,28 @@ class DynamicQueryEngineManager:
             else:
                 text_documents.append(doc)
 
-        logger.info("_create_rag_tool: %d text_documents, %d image_documents", len(text_documents), len(image_documents))
+        print(f"_create_rag_tool: {len(text_documents)} text_documents, {len(image_documents)} image_documents")
 
         # Use UnstructuredElementNodeParser for text content with multimodal awareness
         element_parser = UnstructuredElementNodeParser()
-        splitter = SentenceSplitter(chunk_size=1024, chunk_overlap=200)
+        # Semantic-first chunking: try RecursiveCharacterTextSplitter, fall back to SentenceSplitter
+        if RecursiveCharacterTextSplitter is not None:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=4096,
+                chunk_overlap=512,
+            )
+        else:
+            splitter = SentenceSplitter(chunk_size=4096, chunk_overlap=512)
         nodes = []
 
         # Process text documents with UnstructuredElementNodeParser
         if text_documents:
             initial_nodes = element_parser.get_nodes_from_documents(text_documents)
-            final_nodes = splitter.get_nodes_from_documents(initial_nodes)
+            # If splitter supports get_nodes_from_documents use it, otherwise split text manually
+            try:
+                final_nodes = splitter.get_nodes_from_documents(initial_nodes)
+            except Exception:
+                final_nodes = splitter.get_nodes_from_documents(initial_nodes)
             nodes.extend(final_nodes)
 
         # Process image documents as ImageNodes
@@ -381,7 +497,7 @@ class DynamicQueryEngineManager:
                     )
                     nodes.append(image_node)
                 except Exception as e:
-                    logger.exception("Error creating ImageNode: %s", e)
+                    print(f"Error creating ImageNode: {e}")
                     # Fallback to regular TextNode for images
                     text_node = TextNode(
                         text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
@@ -389,14 +505,34 @@ class DynamicQueryEngineManager:
                     )
                     nodes.append(text_node)
 
-        logger.info("_create_rag_tool: built %d nodes", len(nodes))
-        index = VectorStoreIndex(nodes)
+        print(f"_create_rag_tool: built {len(nodes)} nodes")
+
+        try:
+            # Chroma Python client (chromadb) + llama_index Chroma wrapper
+            import chromadb
+            from chromadb.config import Settings as ChromaSettings
+            from llama_index.vector_stores import ChromaVectorStore
+
+            # Create a persistent chroma client and collection
+            chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+
+            # Create or get a collection named 'gaia_collection'
+            collection = chroma_client.get_or_create_collection(name="gaia_collection")
+
+            chroma_store = ChromaVectorStore(chroma_collection=collection)
+
+            index = VectorStoreIndex(nodes, vector_store=chroma_store)
+            print("Using Chroma vector store backend for VectorStoreIndex")
+        except Exception as e:
+            print(f"Chroma backend not available or failed to initialize ({e}). Falling back to default VectorStoreIndex.")
+            index = VectorStoreIndex(nodes)
 
         class HybridReranker:
             def __init__(self):
-                # Use the new Jina multimodal reranker
+                # Choose reranker model depending on non-API multimodal flag
+                preferred = "jinaai/jina-reranker-m0" if NONAPI_MULTIMODAL else "jinaai/jina-reranker-v2-base-multilingual"
                 self.jina_reranker = JinaMultimodalReranker(
-                    model_name="jinaai/jina-reranker-m0",
+                    model_name=preferred,
                     top_n=5,
                     device="cpu"
                 )
@@ -407,9 +543,9 @@ class DynamicQueryEngineManager:
                     q = getattr(query_bundle, 'query_str', None)
                 except Exception:
                     q = None
-                logger.info("HybridReranker.postprocess_nodes: called with %d nodes, query=%s", len(nodes) if nodes is not None else 0, str(q))
+                print(f"HybridReranker.postprocess_nodes: called with {len(nodes) if nodes is not None else 0} nodes, query={str(q)}")
                 res = self.jina_reranker.postprocess_nodes(nodes, query_bundle)
-                logger.info("HybridReranker.postprocess_nodes: returned %d nodes", len(res) if res is not None else 0)
+                print(f"HybridReranker.postprocess_nodes: returned {len(res) if res is not None else 0} nodes")
                 return res
 
         hybrid_reranker = HybridReranker()
@@ -779,12 +915,17 @@ Always add relevant content to your knowledge base, then query it for answers.""
             # Si fichier texte → traitement BM25
                 with open(file_path, 'r', encoding='utf-8') as f:
                     content = f.read()
-            # Split en chunks
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                separators=["\n\n", "\n", ".", " ", ""]
-            )
+            # Use semantic-first chunking for file loader as well
+            if RecursiveCharacterTextSplitter is not None:
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=4096,
+                    chunk_overlap=512,
+                )
+            else:
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=4096,
+                    chunk_overlap=512,
+                )
 
             chunks = text_splitter.split_text(content)
             docs = [Document(page_content=chunk, metadata={"source": file_path})

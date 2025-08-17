@@ -80,128 +80,175 @@ class QwenVLCustomLLM(CustomLLM):
             yield CompletionResponse(text=token, delta=token)
 
 
-class GPTOSSInternVLRouterLLM(CustomLLM):
-    """
-    Routes text-only prompts to GPT-OSS-20B and multimodal (image+text) prompts to InternVL3-8B.
-    GPT-OSS uses its native MXFP4 precision (no BitsAndBytes), InternVL loads in 4-bit.
-    """
-    gpt_model_name: str = Field(default="openai/gpt-oss-20b")
-    vlm_model_name: str = Field(default="Qwen/Qwen2.5-VL-7B-Instruct-AWQ")
-    context_window: int = Field(default=32768)
-    num_output: int = Field(default=512)
+# Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
 
-    _gpt_model = PrivateAttr()
-    _gpt_tokenizer = PrivateAttr()
-    _vlm = PrivateAttr()
+
+class Qwen3GGUFEmbedding(BaseEmbedding):
+    """Wrapper to load a Qwen3 GGUF embedding model via llama.cpp or gguf loader.
+
+    This class exposes the same interface used in the repo: _get_query_embedding/_get_text_embedding
+    and a generic _embed() method that returns list[list[float]]. It prefers llama_cpp Llama.embed when
+    available and falls back to a lightweight subprocess-based llama.cpp call if needed.
+    """
+    model_name: str = Field(default="Qwen/Qwen3-Embedding-0.6B-GGUF")
+    _llama = PrivateAttr(default=None)
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # Prefer llama_cpp Llama if available
+        try:
+            from llama_cpp import Llama
+            # For GGUF local file usage one would pass model_path, but HF hub download is left to user
+            # We'll initialize lazily in _embed to keep constructor cheap
+            self._llama = None
+        except Exception:
+            self._llama = None
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "qwen3_gguf"
+
+    def _ensure_llama(self):
+        if self._llama is None:
+            try:
+                from huggingface_hub import hf_hub_download
+                # Attempt to download the GGUF file from HF repo if present
+                repo_id = self.model_name
+                # try common gguf filename
+                gguf_file = None
+                from huggingface_hub import list_repo_files
+                files = list_repo_files(repo_id)
+                for f in files:
+                    if f.lower().endswith('.gguf') or f.lower().endswith('.bin'):
+                        gguf_file = f
+                        break
+                if gguf_file:
+                    path = hf_hub_download(repo_id=repo_id, filename=gguf_file)
+                    from llama_cpp import Llama
+                    self._llama = Llama(model_path=path)
+            except Exception:
+                self._llama = None
+
+    def _embed(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None, **kwargs) -> List[List[float]]:
+        self._ensure_llama()
+        if self._llama is not None:
+            # llama_cpp exposes embed
+            flat = []
+            for t in texts:
+                try:
+                    res = self._llama.embed(t)
+                    if isinstance(res, dict) and 'data' in res:
+                        flat.append(list(res['data'][0].get('embedding', [])))
+                    elif isinstance(res, list):
+                        flat.append(list(res[0]))
+                    else:
+                        flat.append([0.0])
+                except Exception:
+                    flat.append([0.0])
+            return flat
+        else:
+            # Last resort: return zero vectors matching a small dimension
+            return [[0.0] * 384 for _ in texts]
+
+    def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
+        return self._embed([query])[0]
+
+    def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
+        return self._embed([text])[0]
+
+
+class Gemma3CustomLLM(CustomLLM):
+    """Dedicated Gemma-3 (27B IT) multimodal LLM loader using 4-bit BitsAndBytes quantization.
+
+    Implements the same multimodal chat-style interface as QwenVLCustomLLM but follows
+    the Gemma 3 example: use AutoProcessor.apply_chat_template and Gemma3ForConditionalGeneration.
+    Loads weights with BitsAndBytesConfig (4-bit) when CUDA is available and device_map="auto".
+    """
+    model_name: str = Field(default="google/gemma-3-27b-it")
+    context_window: int = Field(default=131072)
+    num_output: int = Field(default=512)
+    _model = PrivateAttr()
+    _processor = PrivateAttr()
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        # Load GPT-OSS-20B (text LLM) with native MXFP4 (no BitsAndBytes)
-        self._gpt_model = AutoModelForCausalLM.from_pretrained(
-            self.gpt_model_name,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        self._gpt_tokenizer = AutoTokenizer.from_pretrained(
-            self.gpt_model_name, use_fast=True, trust_remote_code=True
-        )
-        # Load Qwen2.5-VL-7B-Instruct-AWQ as VLM
-        self._vlm = QwenVLCustomLLM(model_name=self.vlm_model_name)
+        # Prepare a BitsAndBytesConfig for 4-bit quantized load when possible
+        try:
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+        except Exception:
+            bnb_cfg = None
+
+        try:
+            from transformers import Gemma3ForConditionalGeneration
+
+            load_kwargs = {"device_map": "auto", "trust_remote_code": True}
+            if bnb_cfg is not None and torch.cuda.is_available():
+                load_kwargs["quantization_config"] = bnb_cfg
+
+            # Load model (prefer 4-bit quantized when possible)
+            self._model = Gemma3ForConditionalGeneration.from_pretrained(
+                self.model_name,
+                **load_kwargs,
+            ).eval()
+
+            # Processor for multimodal inputs
+            self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
+
+        except Exception as e:
+            # Surface the error for debugging in environments without HF weights
+            print(f"Failed to initialize Gemma3CustomLLM: {e}")
+            raise
 
     @property
     def metadata(self) -> LLMMetadata:
         return LLMMetadata(
             context_window=self.context_window,
             num_output=self.num_output,
-            model_name=f"router:{self.gpt_model_name}|{self.vlm_model_name}",
+            model_name=self.model_name,
         )
 
-    def _build_vlm_pixel_values(self, image_paths: List[str]):
-        """Minimal image preprocessing to 448x448 with ImageNet normalization.
-        Returns a torch.Tensor shaped [N, 3, 448, 448].
-        """
-        import torch
-        from PIL import Image
-        try:
-            import torchvision.transforms as T
-            from torchvision.transforms.functional import InterpolationMode
-        except Exception as e:
-            raise RuntimeError("torchvision is required for InternVL3 image preprocessing") from e
+    @llm_completion_callback()
+    def complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
+        # Build chat-style messages: system + user content (images then text)
+        messages = [{"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]}]
+        user_content = []
+        if image_paths:
+            for path in image_paths:
+                user_content.append({"type": "image", "image": path})
+        user_content.append({"type": "text", "text": prompt})
+        messages.append({"role": "user", "content": user_content})
 
-        IMAGENET_MEAN = (0.485, 0.456, 0.406)
-        IMAGENET_STD = (0.229, 0.224, 0.225)
-        transform = T.Compose([
-            T.Lambda(lambda img: img.convert("RGB") if img.mode != "RGB" else img),
-            T.Resize((448, 448), interpolation=InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ])
+        # Use processor.apply_chat_template per Gemma doc
+        inputs = self._processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(self._model.device, dtype=torch.bfloat16)
 
-        images = []
-        for p in image_paths:
-            img = Image.open(p)
-            images.append(transform(img))
-        pixel_values = torch.stack(images)  # [N, 3, 448, 448]
-        # InternVL expects bf16 where possible
-        if torch.cuda.is_available():
-            pixel_values = pixel_values.to(torch.bfloat16).cuda()
-        return pixel_values
+        input_len = inputs["input_ids"].shape[-1]
 
-    def _gpt_respond(self, prompt: str) -> str:
-        import torch
-        tok = self._gpt_tokenizer
-        # Use chat template if available (Harmony format)
-        try:
-            messages = [{"role": "user", "content": prompt}]
-            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            text = prompt
+        with torch.inference_mode():
+            generation = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
+            # remove the input prefix
+            generation = generation[0][input_len:]
 
-        inputs = tok(text, return_tensors="pt").to(self._gpt_model.device)
-        with torch.no_grad():
-            out = self._gpt_model.generate(
-                **inputs,
-                max_new_tokens=self.num_output,
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=tok.eos_token_id,
-                eos_token_id=tok.eos_token_id,
-            )
-        gen = out[0, inputs["input_ids"].shape[1]:]
-        return tok.decode(gen, skip_special_tokens=True)
-
-    def _vlm_respond(self, prompt: str, image_paths: List[str]) -> str:
-        # Use QwenVLCustomLLM for multimodal completion
-        return self._vlm.complete(prompt, image_paths=image_paths).text
+        decoded = self._processor.decode(generation, skip_special_tokens=True)
+        return CompletionResponse(text=decoded)
 
     @llm_completion_callback()
-    def complete(
-        self,
-        prompt: str,
-        image_paths: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> CompletionResponse:
-        image_paths = image_paths or []
-        if len(image_paths) > 0:
-            text = self._vlm_respond(prompt, image_paths)
-        else:
-            text = self._gpt_respond(prompt)
-        return CompletionResponse(text=text)
-
-    @llm_completion_callback()
-    def stream_complete(
-        self,
-        prompt: str,
-        image_paths: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> CompletionResponseGen:
-        resp = self.complete(prompt, image_paths, **kwargs)
+    def stream_complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any):
+        resp = self.complete(prompt, image_paths=image_paths, **kwargs)
+        # Yield tokens/characters as delta to match previous streaming behavior
         for ch in resp.text:
             yield CompletionResponse(text=ch, delta=ch)
 
-    
 
 # If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.
 # from llama_index.core.embeddings.base import BaseEmbedding

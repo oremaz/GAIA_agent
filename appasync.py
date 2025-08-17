@@ -10,7 +10,7 @@ import pandas as pd
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
 # Import your custom agent from agent.py
-from agent2 import GAIAAgent
+from agent import EnhancedGAIAAgentGAIAAgent
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
@@ -18,7 +18,7 @@ class BasicAgent:
     def __init__(self):
         print("BasicAgent initialized.")
         # Initialize your enhanced GAIA agent
-        self.gaia_agent = GAIAAgent()
+        self.gaia_agent = EnhancedGAIAAgentGAIAAgent()
     
     async def __call__(self, question: str) -> str:
         try:

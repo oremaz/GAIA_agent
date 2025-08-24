@@ -1106,19 +1106,54 @@ If you are asked for a comma separated list, apply the above rules depending of 
         }
 
 async def main():
+    # Targeted test sequence requested by user:
+    # 1) search_and_extract_content_from_url
+    # 2) enhanced_web_search_tool (invoke the underlying function)
+    # 3) EnhancedGAIAAgent.solve_gaia_question (async)
 
-    agent = EnhancedGAIAAgent()
+    query = "Mercedes Sosa studio albums 2000-2009"
 
-    question_data = {
-        "Question": "How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? List them !",
-        "task_id": ""
-    }
+    logger.info("Starting targeted tests for query: %s", query)
 
-    logger.info(question_data)
+    # 1) Direct web search extraction
+    try:
+        docs = search_and_extract_content_from_url(query)
+        logger.info("search_and_extract_content_from_url -> returned %d documents", len(docs) if docs is not None else 0)
+        for i, d in enumerate(docs[:3]):
+            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
+            logger.info(" doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
+    except Exception as e:
+        docs = []
+        logger.exception("search_and_extract_content_from_url failed: %s", e)
 
-   
-    answer = await agent.solve_gaia_question(question_data)   
-    logger.info(f"Answer: {answer}")
+    # 2) Invoke the enhanced web search tool (prefer the FunctionTool's fn if present)
+    try:
+        if hasattr(enhanced_web_search_tool, 'fn') and callable(getattr(enhanced_web_search_tool, 'fn')):
+            tool_result = enhanced_web_search_tool.fn(query)
+        else:
+            # Fallback to calling the underlying function directly
+            tool_result = enhanced_web_search_and_update(query)
+        logger.info("enhanced_web_search_tool -> result (truncated): %s", str(tool_result)[:400])
+    except Exception as e:
+        tool_result = f"Tool invocation failed: {e}"
+        logger.exception("enhanced_web_search_tool invocation failed: %s", e)
+
+    # 3) Run the agent's solve_gaia_question
+    try:
+        agent = EnhancedGAIAAgent()
+        question_data = {"Question": query, "task_id": ""}
+        answer = await agent.solve_gaia_question(question_data)
+        logger.info("solve_gaia_question -> %s", str(answer)[:500])
+    except Exception as e:
+        answer = f"solve_gaia_question failed: {e}"
+        logger.exception("solve_gaia_question failed: %s", e)
+
+    # Print concise summary for quick inspection
+    print("=== TARGETED TEST SUMMARY ===")
+    print("query:", query)
+    print("search_and_extract_content_from_url -> documents:", len(docs))
+    print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
+    print("solve_gaia_question -> answer:", str(answer))
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -730,9 +730,9 @@ def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager) -> Functio
     """Factory returning a FunctionTool bound to the provided manager."""
     # Wrap the tool function so it tolerates different Action Input shapes emitted by
     # various ReAct parsers / LlamaIndex versions. Delegate normalization to gaia_tools.normalize_query_payload
-    def _enhanced_web_search_wrapper(payload):
+    def _enhanced_web_search_wrapper(input: str) -> str:
         try:
-            query = normalize_query_payload(payload)
+            query = normalize_query_payload(input)
             return enhanced_web_search_and_update(query, manager=manager)
         except Exception as e:
             logger.exception("enhanced_web_search_wrapper error: %s", e)
@@ -1113,27 +1113,20 @@ If you are asked for a comma separated list, apply the above rules depending of 
             logger.info("=== AGENT REASONING STEPS ===")
             logger.info(f"Dynamic knowledge base contains {len(self.dynamic_qe_manager.documents)} documents")
 
-            handler = self.coordinator.run(ctx=ctx, user_msg=context_prompt)
-            full_response = ""
 
+            handler = self.coordinator.run(ctx=ctx, user_msg=context_prompt)
+
+            # Optional: stream to console (but don't use it as the return value)
             async for event in handler.stream_events():
                 if isinstance(event, AgentStream):
-                    # preserve streaming behavior (no newline, immediate flush)
-                    sys.stdout.write(event.delta)
-                    sys.stdout.flush()
-                    full_response += event.delta
+                    # if you really want to print, prefer stderr to avoid interleaving with logs
+                    sys.stderr.write(event.delta)
+                    sys.stderr.flush()
 
+            # Await the final result and return it
             final_response = await handler
             logger.info("\n=== END REASONING ===")
-
-            # Use the streamed content collected above as the human-readable response.
-            # If no streamed events were captured, fall back to the stringified final_response.
-            human_response = full_response if full_response else str(final_response)
-
-            # Optionally, format/finalize the answer using final_answer_tool:
-            # final_answer = final_answer_tool(human_response, question)
-
-            return human_response
+            return str(final_response)
         except Exception as e:
             error_msg = f"Error processing question: {str(e)}"
             logger.exception(error_msg)
@@ -1159,36 +1152,6 @@ async def main():
     # 2) Test the full agent pipeline: create an agent and ask it to solve the GAIA question
     try:
         agent_for_tool = EnhancedGAIAAgent()
-        # --- New: test make_enhanced_web_search_tool creation and safe invocation ---
-        manager = agent_for_tool.dynamic_qe_manager
-        test_tool = make_enhanced_web_search_tool(manager)
-
-        # Discover the callable stored on the FunctionTool (different llama_index versions use
-        # different attribute names). Try common names and pick the first available.
-        callable_names = ['fn', 'func', '_func', 'callable']
-        tool_callable = None
-        for n in callable_names:
-            tool_callable = getattr(test_tool, n, None)
-            if callable(tool_callable):
-                break
-            tool_callable = None
-
-        tool_call_result = None
-        if tool_callable is None:
-            tool_call_result = f"Tool created but no callable found on attributes {callable_names}; tool repr: {repr(test_tool)}"
-        else:
-            try:
-                # Run the (potentially blocking) tool call in a thread with a timeout so the test doesn't hang.
-                # We're already inside an asyncio event loop, so use await instead of asyncio.run.
-                tool_call_result = await asyncio.wait_for(asyncio.to_thread(tool_callable, query), timeout=30)
-            except Exception as e:
-                tool_call_result = f"Tool invocation failed or timed out: {e}"
-
-        # Expose the result to the outer scope for printing below
-        tool_result = tool_call_result
-
-        logger.info("make_enhanced_web_search_tool -> creation ok, invocation sample: %s", str(tool_call_result)[:400])
-        # --- end new test ---
         question_data = {"Question": query, "task_id": ""}
         # solve_gaia_question is async; await it inside this async main with a timeout
         try:

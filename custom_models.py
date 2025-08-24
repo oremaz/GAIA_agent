@@ -479,16 +479,16 @@ class QwenVLCustomLLM(CustomLLM):
         top_k: Optional[int] = None,
         **kwargs: Any,
     ) -> CompletionResponseGen:
-        """
-        Character-streamed completion (client-side streaming):
-        generate once and yield characters progressively.
+        """Stream completion with cumulative text and final return.
+
+        Many LlamaIndex callbacks expect the generator to either:
+        1) yield CompletionResponse objects (with cumulative text) and
+        2) finish with a final returned CompletionResponse (captured via StopIteration.value)
+        Providing only deltas and no final return can cause the end event to
+        have response=None, triggering the pydantic validation error observed.
         """
         self._ensure_model()
-
-        # Build inputs
         inputs = self._build_inputs(prompt, image_paths=image_paths)
-
-        # Generate once for determinism, then stream the decoded text
         out_ids = self._generate(
             inputs,
             max_new_tokens=self.num_output,
@@ -498,15 +498,18 @@ class QwenVLCustomLLM(CustomLLM):
             top_p=top_p,
             top_k=top_k,
         )
-
         stops_final = stops if stops is not None else self._default_stops
-        text = self._decode_and_trim(inputs, out_ids, stops=stops_final)
+        full_text = self._decode_and_trim(inputs, out_ids, stops=stops_final)
 
-        # Stream characters (or tokens; characters is simplest and robust)
-        for ch in text:
-            yield CompletionResponse(text=ch, delta=ch)
+        cumulative = ""
+        # Simple whitespace tokenization for streaming; can switch to more granular if needed
+        for token in full_text.split():
+            cumulative = (cumulative + token + " ").rstrip()
+            yield CompletionResponse(text=cumulative, delta=token + " ")
 
         self._cuda_hygiene()
+        # Final return value (StopIteration.value) captured by callback wrapper
+        return CompletionResponse(text=full_text)
 
 # Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
 

@@ -5,6 +5,7 @@ import sys
 import re
 from typing import Dict, Any, List
 from urllib.parse import urlparse
+from gaia_tools import normalize_query_payload
 import torch
 import asyncio
 import mimetypes
@@ -727,8 +728,18 @@ def enhanced_web_search_and_update(query: str, manager: DynamicQueryEngineManage
 
 def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager) -> FunctionTool:
     """Factory returning a FunctionTool bound to the provided manager."""
+    # Wrap the tool function so it tolerates different Action Input shapes emitted by
+    # various ReAct parsers / LlamaIndex versions. Delegate normalization to gaia_tools.normalize_query_payload
+    def _enhanced_web_search_wrapper(payload):
+        try:
+            query = normalize_query_payload(payload)
+            return enhanced_web_search_and_update(query, manager=manager)
+        except Exception as e:
+            logger.exception("enhanced_web_search_wrapper error: %s", e)
+            return f"enhanced_web_search failed: {e}"
+
     return FunctionTool.from_defaults(
-        fn=lambda q: enhanced_web_search_and_update(q, manager=manager),
+        fn=_enhanced_web_search_wrapper,
         name="enhanced_web_search",
         description="Search the web, extract content and images, and add them to the knowledge base for future queries."
     )

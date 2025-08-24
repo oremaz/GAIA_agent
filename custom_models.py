@@ -268,6 +268,88 @@ class Gemma3CustomLLM(CustomLLM):
 
 # If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.
 # from llama_index.core.embeddings.base import BaseEmbedding
+ 
+# Lightweight GGUF / llama.cpp wrapper for Qwen2.5 Coder 3B (GGUF)
+class QwenCoderGGUFLLM(CustomLLM):
+    """Wrapper that loads a Qwen2.5-Coder-3B Instruct GGUF via llama_cpp.
+
+    It downloads the HF model snapshot, finds the first .gguf file, and instantiates
+    llama_cpp.Llama. This avoids a large torch-based HF load and runs via the
+    local GGUF runtime (llama.cpp or llama_cpp bindings).
+    """
+    model_name: str = Field(default="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
+    context_window: int = Field(default=8192)
+    num_output: int = Field(default=256)
+    _llm = PrivateAttr(default=None)
+
+    def __init__(self, model_name: Optional[str] = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        if model_name:
+            self.model_name = model_name
+
+        try:
+            # Local imports to avoid import-time dependency on llama_cpp when not used.
+            import gc
+            import glob
+            from huggingface_hub import snapshot_download
+
+            # Keep housekeeping to reduce fragmentation
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+            # Download model repo snapshot and locate GGUF file
+            repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
+            gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
+            if not gguf_candidates:
+                gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
+            if not gguf_candidates:
+                raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
+
+            model_path = gguf_candidates[0]
+
+            # Instantiate llama_cpp Llama
+            from llama_cpp import Llama
+            self._llm = Llama(model_path=model_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize QwenCoderGGUFLLM: {e}")
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            context_window=self.context_window,
+            num_output=self.num_output,
+            model_name=self.model_name,
+        )
+
+    @llm_completion_callback()
+    def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
+        if self._llm is None:
+            raise RuntimeError("llama_cpp model not initialized")
+        try:
+            resp = self._llm.create(prompt=prompt, max_tokens=self.num_output)
+            text = ""
+            if isinstance(resp, dict) and resp.get("choices"):
+                choice = resp["choices"][0]
+                text = choice.get("text") or choice.get("message", {}).get("content", "")
+            else:
+                # fallback attribute access
+                choices = getattr(resp, "choices", None)
+                if choices and isinstance(choices, list):
+                    text = choices[0].get("text", "") if isinstance(choices[0], dict) else str(choices[0])
+            return CompletionResponse(text=text or "")
+        except Exception as e:
+            raise
+
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, **kwargs: Any) -> CompletionResponseGen:
+        resp = self.complete(prompt, **kwargs)
+        for token in resp.text:
+            yield CompletionResponse(text=token, delta=token)
 
 class JinaEmbeddingsV4(BaseEmbedding):
     """

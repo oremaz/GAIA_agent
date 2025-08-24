@@ -19,6 +19,7 @@ from custom_models import (
     JinaMultimodalReranker,
     Qwen3GGUFEmbedding,
     Gemma3CustomLLM,
+    QwenCoderGGUFLLM,
 )
 
 # LlamaIndex core imports
@@ -198,16 +199,8 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                 embed_model = JinaEmbeddingsV4()
 
                 # Code LLM (unchanged)
-                code_llm = HuggingFaceLLM(
-                    model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                    tokenizer_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                    device_map="auto",
-                    model_kwargs={
-                        "torch_dtype": "auto",
-                        "load_in_4bit": True
-                    },
-                    generate_kwargs={"do_sample": False}
-                )
+                # Use local GGUF via llama.cpp for the code model to avoid heavy HF torch loads
+                code_llm = QwenCoderGGUFLLM(model_name="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
             else:
                 # Text-only pipeline: GPT-OSS as main LLM + code LLM, Qwen3 GGUF on CPU for embeddings,
                 # and use the jina reranker v2 on CPU (configured when creating reranker instance)

@@ -1170,11 +1170,11 @@ async def main():
 
         logger.info("make_enhanced_web_search_tool -> creation ok, invocation sample: %s", str(tool_call_result)[:400])
         # --- end new test ---
-        question_data = {"Question": query, "task_id": ""}
+        #question_data = {"Question": query, "task_id": ""}
         # solve_gaia_question is async; await it inside this async main
-        final_response = await agent_for_tool.solve_gaia_question(question_data)
-        tool_result = final_response
-        logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
+        #final_response = await agent_for_tool.solve_gaia_question(question_data)
+        #tool_result = final_response
+        #logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
     except Exception as e:
         tool_result = f"Tool invocation failed: {e}"
         logger.exception("solve_gaia_question invocation failed: %s", e)

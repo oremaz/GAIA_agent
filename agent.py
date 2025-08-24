@@ -1115,10 +1115,14 @@ If you are asked for a comma separated list, apply the above rules depending of 
             final_response = await handler
             logger.info("\n=== END REASONING ===")
 
-            # Extract the final formatted answer
-            #final_answer = final_answer_tool(str(final_response), question)
+            # Use the streamed content collected above as the human-readable response.
+            # If no streamed events were captured, fall back to the stringified final_response.
+            human_response = full_response if full_response else str(final_response)
 
-            return final_response
+            # Optionally, format/finalize the answer using final_answer_tool:
+            # final_answer = final_answer_tool(human_response, question)
+
+            return human_response
         except Exception as e:
             error_msg = f"Error processing question: {str(e)}"
             logger.exception(error_msg)
@@ -1174,11 +1178,15 @@ async def main():
 
         logger.info("make_enhanced_web_search_tool -> creation ok, invocation sample: %s", str(tool_call_result)[:400])
         # --- end new test ---
-        #question_data = {"Question": query, "task_id": ""}
-        # solve_gaia_question is async; await it inside this async main
-        #final_response = await agent_for_tool.solve_gaia_question(question_data)
-        #tool_result = final_response
-        #logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
+        question_data = {"Question": query, "task_id": ""}
+        # solve_gaia_question is async; await it inside this async main with a timeout
+        try:
+            final_response = await asyncio.wait_for(agent_for_tool.solve_gaia_question(question_data), timeout=120)
+            tool_result = final_response
+            logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
+        except Exception as e:
+            tool_result = f"solve_gaia_question failed or timed out: {e}"
+            logger.exception("solve_gaia_question invocation failed: %s", e)
     except Exception as e:
         tool_result = f"Tool invocation failed: {e}"
         logger.exception("solve_gaia_question invocation failed: %s", e)

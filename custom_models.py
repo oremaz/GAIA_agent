@@ -724,6 +724,9 @@ class JinaEmbeddingsV4(BaseEmbedding):
             else:
                 load_kwargs["device_map"] = device_map
 
+            # Log whether quantization will be used (helpful to debug GPU memory usage)
+            _logger.info("JinaEmbeddingsV4: quantization_enabled=%s device_map=%s", bool(self._bnb_config and torch.cuda.is_available()), device_map)
+
             try:
                 self._model = AutoModel.from_pretrained(self.model_name, **load_kwargs).eval()
             except Exception as e:

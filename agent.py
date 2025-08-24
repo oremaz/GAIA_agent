@@ -511,7 +511,8 @@ class DynamicQueryEngineManager:
             # Chroma Python client (chromadb) + llama_index Chroma wrapper
             import chromadb
             from chromadb.config import Settings as ChromaSettings
-            from llama_index.vector_stores import ChromaVectorStore
+            from llama_index.vector_stores.chroma import ChromaVectorStore
+
 
             # Create a persistent chroma client and collection
             chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))

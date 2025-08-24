@@ -25,6 +25,14 @@ from requests.exceptions import RequestException
 from smolagents import tool
 import re
 import mimetypes
+import tempfile
+import subprocess
+import shutil
+
+import pandas as pd
+from docx import Document as DocxDocument
+from pptx import Presentation
+import pypdf
 
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -439,7 +447,7 @@ class UnifiedMultimodalTool(Tool):
         uploaded_file = self.client.files.upload(file=file_path)
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-pro",
+            model="gemini-2.5-flash",
             contents=[prompt, uploaded_file]
         )
         
@@ -462,7 +470,7 @@ class UnifiedMultimodalTool(Tool):
         ]
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-pro",
+            model="gemini-2.5-flash",
             contents=contents
         )
         
@@ -636,7 +644,7 @@ class GAIAAgent:
 
         # Initialize Gemini 2.5 model
         self.model = OpenAIServerModel(
-            model_id="gemini-2.5-pro",
+            model_id="gemini-2.5-flash",
             api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=gemini_api_key,
             temperature=0.0, 
@@ -770,35 +778,106 @@ class GAIAAgent:
 
 
     def load_documents_from_file(self, file_path: str):
-        """Load and process text documents for BM25, or return raw content for media files."""
+        """Load and process text documents for BM25+Chroma retrieval, or return raw content for media files.
+
+        Handles common office formats (xlsx, xls, csv, docx, doc, pptx, ppt, pdf) and falls back to LibreOffice
+        conversion for legacy binaries. Extracted text is chunked, embedded with Google embeddings, stored in
+        Chroma (if available) and a BM25 retriever is created for lexical matches. The hybrid retriever is
+        attached to the agent (`ChromaBM25HybridRetrieverTool`) and the agent is recreated so tools are updated.
+        """
         try:
-            # Devine le type MIME du fichier
+            # Lazy optional imports
+
             mime_type, _ = mimetypes.guess_type(file_path)
             if mime_type is None:
                 mime_type = ""
             print(f"Detected MIME type: {mime_type} for file {file_path}")
-            # Traitement selon le type de fichier
+
+            # Binary media -> return bytes
             if mime_type.startswith("image") or mime_type.startswith("video") or mime_type.startswith("audio"):
                 with open(file_path, "rb") as f:
-                    binary_content = f.read()
-                print(f"Loaded {mime_type} file: {file_path}")
-                return binary_content
-            else : 
-            # Si fichier texte → traitement BM25
+                    return f.read()
+
+            ext = os.path.splitext(file_path)[1].lower()
+            text = None
+
+            # Spreadsheets
+            if ext in {".csv", ".xls", ".xlsx"}:
+                if pd is None:
+                    raise RuntimeError("pandas is required to parse spreadsheets. Install with `pip install pandas openpyxl xlrd`.")
+                if ext == ".csv":
+                    df = pd.read_csv(file_path)
+                    text = df.to_csv(index=False)
+                else:
+                    sheets = pd.read_excel(file_path, sheet_name=None)
+                    parts = []
+                    for sheet_name, df in sheets.items():
+                        parts.append(f"--- Sheet: {sheet_name} ---")
+                        parts.append(df.to_csv(index=False))
+                    text = "\n".join(parts)
+                    print(text)
+
+            # Word documents
+            elif ext in {".docx"}:
+                doc = DocxDocument(file_path)
+                paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+                text = "\n\n".join(paragraphs)
+
+            # PowerPoint
+            elif ext in {".pptx"}:
+                pres = Presentation(file_path)
+                slides_text = []
+                for i, slide in enumerate(pres.slides):
+                    slide_text_parts = []
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text") and shape.text:
+                            slide_text_parts.append(shape.text)
+                    slides_text.append(f"--- Slide {i+1} ---\n" + "\n".join(slide_text_parts))
+                text = "\n\n".join(slides_text)
+
+            # Legacy Office binary (.doc, .ppt) or when above parsers unavailable: convert to PDF using LibreOffice
+            elif ext in {".doc", ".ppt"}:
+                soffice = shutil.which("soffice") or shutil.which("libreoffice")
+                if not soffice:
+                    raise RuntimeError("LibreOffice (`soffice`) is required to convert legacy Office files. Install LibreOffice or convert to PDF manually.")
+                outdir = tempfile.mkdtemp()
+                subprocess.run([soffice, "--headless", "--convert-to", "pdf", file_path, "--outdir", outdir],
+                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                base = os.path.basename(file_path)
+                pdfname = os.path.splitext(base)[0] + ".pdf"
+                candidate = os.path.join(outdir, pdfname)
+                if not os.path.exists(candidate):
+                    raise RuntimeError("LibreOffice conversion produced no PDF. Check the input file and LibreOffice installation.")
+                if pypdf is None:
+                    raise RuntimeError("pypdf is required to extract text from converted PDF. Install with `pip install pypdf`.")
+                reader = pypdf.PdfReader(candidate)
+                pages = [p.extract_text() or "" for p in reader.pages]
+                text = "\n".join(pages)
+
+            # PDF
+            elif ext == ".pdf":
+                reader = pypdf.PdfReader(file_path)
+                pages = [p.extract_text() or "" for p in reader.pages]
+                text = "\n".join(pages)
+
+            # Plain text fallback
+            else:
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            # Split en chunks
+                    text = f.read()
+
+            if text is None:
+                raise RuntimeError("No text could be extracted from the provided file.")
+
+            # Chunking: semantic-first strategy
             text_splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000,
                 chunk_overlap=200,
                 separators=["\n\n", "\n", ".", " ", ""]
             )
+            chunks = text_splitter.split_text(text)
+            docs = [Document(page_content=chunk, metadata={"source": file_path}) for chunk in chunks]
 
-            chunks = text_splitter.split_text(content)
-            docs = [Document(page_content=chunk, metadata={"source": file_path})
-                    for chunk in chunks]
-
-            # Use GoogleGenerativeAIEmbeddings from langchain_google_genai for dense vectors
+            # Embeddings (GoogleGenerativeAIEmbeddings)
             embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
             # Create Chroma vectorstore from documents
@@ -808,10 +887,15 @@ class GAIAAgent:
                 print(f"Failed to create Chroma vectorstore: {e}")
                 chroma = None
 
-            # Create BM25 retriever if available
-            bm25 = BM25Retriever(documents=docs)
+            # Create BM25 retriever
+            try:
+                bm25 = BM25Retriever(documents=docs)
+            except Exception as e:
+                print(f"Failed to create BM25 retriever: {e}")
+                bm25 = None
+
             # Attach the hybrid retriever tool and recreate agent so tools list is updated
-            self.retriever_tool = ChromaBM25HybridRetrieverTool(chroma=chroma, bm25=bm25, top_k=5)
+            self.retriever_tool = ChromaBM25HybridRetrieverTool(chroma=chroma, bm25=bm25, top_k=5, alpha=0.5)
             self._create_agent()
 
             print(f"Loaded {len(docs)} document chunks from {file_path} into local Chroma store and BM25 retriever")
@@ -995,14 +1079,12 @@ if __name__ == "__main__":
 
     #Example question
     question_data = {
-        "Question": "Hi, I'm making a pie but I could use some help with my shopping list. I have everything I need for the crust, but I'm not sure about the filling. I got the recipe from my friend Aditi, but she left it as a voice memo and the speaker on my phone is buzzing so I can't quite make out what she's saying. Could you please listen to the recipe and list all of the ingredients that my friend described? I only want the ingredients for the filling, as I have everything I need to make my favorite pie crust. I've attached the recipe as Strawberry pie.mp3.  In your response, please only list the ingredients, not any measurements. So if the recipe calls for ""a pinch of salt"" or ""two cups of ripe strawberries"" the ingredients on the list would be ""salt"" and ""ripe strawberries"". Please format your response as a comma separated list of ingredients. Also, please alphabetize the ingredients.",
-        "task_id": "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3"
+        "Question": "The attached Excel file contains the sales of menu items for a local fast-food chain. What were the total sales that the chain made from food (not including drinks)? Express your answer in USD with two decimal places.",
+        "task_id": "7bd855d8-463d-4ed5-93ca-5fe35145f733"
     }
 
-
-    # Solve with full observability
-    answer = agent.solve_gaia_question(
-        question_data, 
-    )
+    file = agent.download_gaia_file(question_data["task_id"], api_url="https://agents-course-unit4-scoring.hf.space"
+                                    )
+    answer = agent.solve_gaia_question(question_data)
     print(f"Answer: {answer}")
 

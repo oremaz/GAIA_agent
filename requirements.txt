@@ -84,5 +84,5 @@ tqdm==4.66.4
 sympy==1.14.0
 ddgs==9.5.2
 
-chromadb==0.4.0
+chromadb
 llama-cpp-python

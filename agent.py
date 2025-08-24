@@ -909,7 +909,19 @@ class EnhancedGAIAAgent:
         # Initialize the dynamic query engine manager
         self.dynamic_qe_manager = DynamicQueryEngineManager()
 
+        # Raw callable web search function
         self.web_tool = make_enhanced_web_search_tool(self.dynamic_qe_manager)
+        # Wrap web search in FunctionTool for consistent tool interface
+        self.web_function_tool = FunctionTool.from_defaults(
+            fn=self.web_tool,
+            name="enhanced_web_search"
+        )
+
+        # Wrap execute_python_code in FunctionTool
+        self.exec_function_tool = FunctionTool.from_defaults(
+            fn=execute_python_code,
+            name="execute_python_code",
+        )
 
         # Create enhanced agents with dynamic tools
         self.external_knowledge_agent = ReActAgent(
@@ -946,9 +958,9 @@ Do NOT wrap Action Input in JSON. Do NOT add quotes or braces.
 After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer from the updated knowledge base.
 """,
             tools=[
-                self.web_tool,  # Enhanced web search tool
-                self.dynamic_qe_manager.get_tool(),                      
-                execute_python_code                                    
+                self.web_function_tool,              # Wrapped web search
+                self.dynamic_qe_manager.get_tool(),  # QueryEngineTool (already specialized)
+                self.exec_function_tool              # Wrapped python execution
             ],
             llm=proj_llm,
             max_steps=8,
@@ -959,7 +971,7 @@ After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer fro
             name="code_agent",
             description="Handles Python code for calculations and data processing",
             system_prompt="You are a Python programming specialist. You work with Python code to perform calculations, data analysis, and mathematical operations.",
-            tools=[execute_python_code],
+            tools=[self.exec_function_tool],
             llm=code_llm,
             max_steps=6,
             verbose=True
@@ -1181,8 +1193,16 @@ async def main():
     )
 
     dummy_question = "If I have 7 apples and get 5 more, what is the total? Use the tool."
-    dummy_response = dummy_agent.chat(dummy_question)
-    print("\n=== DUMMY ReActAgent DEMO ===")
+
+    # Run dummy agent using the streaming handler/await pattern
+    dummy_handler = dummy_agent.run(user_msg=dummy_question)
+    async for event in dummy_handler.stream_events():
+        if isinstance(event, AgentStream):
+            sys.stderr.write(event.delta)
+            sys.stderr.flush()
+    dummy_response = await dummy_handler
+
+    print("\n=== DUMMY ReActAgent DEMO (async) ===")
     print("Question:", dummy_question)
     print("Agent Response:", str(dummy_response))
 

@@ -1,6 +1,7 @@
 # Standard library imports
 import logging
 import os
+import sys
 import re
 from typing import Dict, Any, List
 from urllib.parse import urlparse
@@ -155,10 +156,10 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
     if use_api_mode and GEMINI_AVAILABLE:
         # API Mode - Using Google's Gemini models
         try:
-            print("Initializing models in API mode with Gemini...")
+            logger.info("Initializing models in API mode with Gemini...")
             google_api_key = os.environ.get("GOOGLE_API_KEY")
             if not google_api_key:
-                print("WARNING: GOOGLE_API_KEY not found. Falling back to non-API mode.")
+                logger.warning("WARNING: GOOGLE_API_KEY not found. Falling back to non-API mode.")
                 return initialize_models(use_api_mode=False)
 
             # Main LLM - Gemini 2.0 Flash
@@ -183,12 +184,12 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
 
             return proj_llm, code_llm, embed_model
         except Exception as e:
-            print(f"Error initializing API mode: {e}")
-            print("Falling back to non-API mode...")
+            logger.exception("Error initializing API mode: %s", e)
+            logger.info("Falling back to non-API mode...")
             return initialize_models(use_api_mode=False)
     else:
         # Non-API Mode - Using local models
-        print("Initializing models in non-API mode with local models...")
+        logger.info("Initializing models in non-API mode with local models...")
 
         try:
             if multimodal:
@@ -210,7 +211,7 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
             else:
                 # Text-only pipeline: GPT-OSS as main LLM + code LLM, Qwen3 GGUF on CPU for embeddings,
                 # and use the jina reranker v2 on CPU (configured when creating reranker instance)
-                print("Initializing text-only local pipeline: GPT-OSS + Qwen3 GGUF embeddings + CPU reranker")
+                logger.info("Initializing text-only local pipeline: GPT-OSS + Qwen3 GGUF embeddings + CPU reranker")
                 proj_llm = HuggingFaceLLM(
                     model_name="openai/gpt-oss-20b",
                     tokenizer_name="openai/gpt-oss-20b",
@@ -227,7 +228,7 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
 
             return proj_llm, code_llm, embed_model
         except Exception as e:
-            print(f"Error initializing models: {e}")
+            logger.exception("Error initializing models: %s", e)
             raise
 
 # Setup logging
@@ -236,6 +237,13 @@ logging.getLogger("llama_index.core.agent").setLevel(logging.DEBUG)
 logging.getLogger("llama_index.llms").setLevel(logging.DEBUG)
 # Module logger
 logger = logging.getLogger(__name__)
+# Ensure logger writes INFO to stdout (useful in environments like Kaggle)
+if not logger.handlers:
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(sh)
+logger.setLevel(logging.INFO)
+
 
 # Use environment variables to determine API and multimodal modes
 USE_API_MODE = os.environ.get("USE_API_MODE", "false").lower() == "true"
@@ -259,12 +267,12 @@ def read_and_parse_content(input_path: str) -> List[Document]:
             llamacloud_api_key = os.environ.get("LLAMA_CLOUD_API_KEY")
             if llamacloud_api_key:
                 # Use LlamaParse for enhanced document parsing
-                print(f"Using LlamaParse to extract content from {input_path}")
+                logger.info(f"Using LlamaParse to extract content from {input_path}")
                 parser = LlamaParse(api_key=llamacloud_api_key)
                 return parser.load_data(input_path)
         except Exception as e:
-            print(f"Error using LlamaParse: {e}")
-            print("Falling back to standard document parsing...")
+            logger.exception("Error using LlamaParse: %s", e)
+            logger.info("Falling back to standard document parsing...")
 
     # Standard document parsing (fallback)
     if not os.path.exists(input_path):
@@ -435,14 +443,14 @@ class DynamicQueryEngineManager:
         for path in document_paths:
             docs = read_and_parse_content(path)
             self.documents.extend(docs)
-        print(f"Loaded {len(self.documents)} initial documents")
+        logger.info(f"Loaded {len(self.documents)} initial documents")
 
     def _create_rag_tool(self):
         """Create RAG tool using multimodal-aware parsing."""
         documents = self.documents if self.documents else [
             Document(text="No documents loaded yet. Use web search to add content.")
         ]
-        print(f"_create_rag_tool: starting with {len(documents)} documents")
+        logger.info(f"_create_rag_tool: starting with {len(documents)} documents")
 
         # Separate text and image documents for proper processing
         text_documents = []
@@ -461,7 +469,7 @@ class DynamicQueryEngineManager:
             else:
                 text_documents.append(doc)
 
-        print(f"_create_rag_tool: {len(text_documents)} text_documents, {len(image_documents)} image_documents")
+        logger.info(f"_create_rag_tool: {len(text_documents)} text_documents, {len(image_documents)} image_documents")
 
         # Use UnstructuredElementNodeParser for text content with multimodal awareness
         element_parser = UnstructuredElementNodeParser()
@@ -497,7 +505,7 @@ class DynamicQueryEngineManager:
                     )
                     nodes.append(image_node)
                 except Exception as e:
-                    print(f"Error creating ImageNode: {e}")
+                    logger.exception("Error creating ImageNode: %s", e)
                     # Fallback to regular TextNode for images
                     text_node = TextNode(
                         text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
@@ -505,7 +513,7 @@ class DynamicQueryEngineManager:
                     )
                     nodes.append(text_node)
 
-        print(f"_create_rag_tool: built {len(nodes)} nodes")
+        logger.info(f"_create_rag_tool: built {len(nodes)} nodes")
 
         try:
             # Chroma Python client (chromadb) + llama_index Chroma wrapper
@@ -544,9 +552,9 @@ class DynamicQueryEngineManager:
             chroma_store = ChromaVectorStore(chroma_collection=collection)
 
             index = VectorStoreIndex(nodes, vector_store=chroma_store)
-            print("Using Chroma vector store backend for VectorStoreIndex")
+            logger.info("Using Chroma vector store backend for VectorStoreIndex")
         except Exception as e:
-            print(f"Chroma backend not available or failed to initialize ({e}). Falling back to default VectorStoreIndex.")
+            logger.exception("Chroma backend not available or failed to initialize (%s). Falling back to default VectorStoreIndex.", e)
             index = VectorStoreIndex(nodes)
 
         class HybridReranker:
@@ -565,9 +573,9 @@ class DynamicQueryEngineManager:
                     q = getattr(query_bundle, 'query_str', None)
                 except Exception:
                     q = None
-                print(f"HybridReranker.postprocess_nodes: called with {len(nodes) if nodes is not None else 0} nodes, query={str(q)}")
+                logger.debug(f"HybridReranker.postprocess_nodes: called with {len(nodes) if nodes is not None else 0} nodes, query={str(q)}")
                 res = self.jina_reranker.postprocess_nodes(nodes, query_bundle)
-                print(f"HybridReranker.postprocess_nodes: returned {len(res) if res is not None else 0} nodes")
+                logger.debug(f"HybridReranker.postprocess_nodes: returned {len(res) if res is not None else 0} nodes")
                 return res
 
         hybrid_reranker = HybridReranker()
@@ -594,7 +602,12 @@ class DynamicQueryEngineManager:
 
     def add_documents(self, new_documents: List[Document]):
         """Add documents from web search and recreate tool."""
+        # Append and log a brief summary for debugging
         self.documents.extend(new_documents)
+        logger.info("DynamicQueryEngineManager.add_documents: adding %d documents", len(new_documents))
+        for i, d in enumerate(new_documents[:3]):
+            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
+            logger.debug(" new_doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
         self._create_rag_tool()  # Recreate with ALL documents
         logger.info("Added %d documents. Total: %d", len(new_documents), len(self.documents))
 
@@ -629,6 +642,9 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
     except Exception as e:
         url = None
 
+    # Log the URL found (or lack thereof)
+    logger.info("search_and_extract_content_from_url: search query='%s' -> url=%s", query, str(url))
+
     if not url:
         return [Document(text="No URL could be extracted from the search results.")]
 
@@ -651,6 +667,12 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
             doc.metadata["source"] = url
             doc.metadata["type"] = "web_text"
 
+        # Log a brief summary of extracted documents
+        logger.info("search_and_extract_content_from_url: extracted %d documents from %s", len(documents), url)
+        for i, d in enumerate(documents[:3]):
+            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
+            logger.debug(" doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
+
         return documents
     except Exception as e:
         return [Document(text=f"Error extracting content from URL: {str(e)}")]
@@ -664,6 +686,9 @@ def enhanced_web_search_and_update(query: str) -> str:
 
     # Add documents to the dynamic query engine
     if documents and not any("Error" in doc.text for doc in documents):
+        # Log before adding
+        logger.info("enhanced_web_search_and_update: adding %d documents from search '%s'", len(documents), query)
+
         dynamic_qe_manager.add_documents(documents)
 
         # Return summary of what was added
@@ -837,7 +862,7 @@ Answer:"""
 
         return answer
     except Exception as e:
-        print(f"LLM reformatting failed: {e}")
+        logger.exception("LLM reformatting failed: %s", e)
         return response
 
 def final_answer_tool(agent_response: str, question: str) -> str:
@@ -855,19 +880,19 @@ def final_answer_tool(agent_response: str, question: str) -> str:
     # Step 2: Use LLM reformatting
     formatted_answer = llm_reformat(cleaned_response, question)
 
-    print(f"Original response cleaned: {cleaned_response[:100]}...")
-    print(f"LLM formatted answer: {formatted_answer}")
+    logger.info(f"Original response cleaned: {cleaned_response[:100]}...")
+    logger.info(f"LLM formatted answer: {formatted_answer}")
 
     return formatted_answer
 
 class EnhancedGAIAAgent:
     def __init__(self):
-        print("Initializing Enhanced GAIA Agent...")
+        logger.info("Initializing Enhanced GAIA Agent...")
 
         # Vérification du token HuggingFace
         hf_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
         if not hf_token:
-            print("Warning: HUGGINGFACEHUB_API_TOKEN not found, some features may not work")
+            logger.warning("Warning: HUGGINGFACEHUB_API_TOKEN not found, some features may not work")
 
         # Initialize the dynamic query engine manager
         self.dynamic_qe_manager = DynamicQueryEngineManager()
@@ -926,12 +951,12 @@ Always add relevant content to your knowledge base, then query it for answers.""
             mime_type, _ = mimetypes.guess_type(file_path)
             if mime_type is None:
                 mime_type = ""
-            print(f"Detected MIME type: {mime_type} for file {file_path}")
+            logger.info(f"Detected MIME type: {mime_type} for file {file_path}")
             # Traitement selon le type de fichier
             if mime_type.startswith("image") or mime_type.startswith("video") or mime_type.startswith("audio"):
                 with open(file_path, "rb") as f:
                     binary_content = f.read()
-                print(f"Loaded {mime_type} file: {file_path}")
+                logger.info(f"Loaded {mime_type} file: {file_path}")
                 return binary_content
             else : 
             # Si fichier texte → traitement BM25
@@ -957,11 +982,11 @@ Always add relevant content to your knowledge base, then query it for answers.""
             self.retriever_tool = BM25RetrieverTool(docs)
             self._create_agent()
 
-            print(f"Loaded {len(docs)} document chunks from {file_path}")
+            logger.info(f"Loaded {len(docs)} document chunks from {file_path}")
             return True
 
         except Exception as e:
-            print(f"Error loading documents from {file_path}: {e}")
+            logger.exception("Error loading documents from %s: %s", file_path, e)
             return False
 
 
@@ -972,7 +997,7 @@ Always add relevant content to your knowledge base, then query it for answers.""
             response.raise_for_status()
 
             # Try to get filename from headers
-            print(f"Response headers: {response.headers}")
+            logger.debug(f"Response headers: {response.headers}")
             content_disp = response.headers.get("content-disposition", "")
             match = re.search(r'filename="(.+)"', content_disp)
             if match:
@@ -985,11 +1010,11 @@ Always add relevant content to your knowledge base, then query it for answers.""
             with open(filename, 'wb') as f:
                 f.write(response.content)
 
-            print(f"Downloaded file saved as {filename}")
+            logger.info(f"Downloaded file saved as {filename}")
             return os.path.abspath(filename)  # Or just return `filename` for relative path
 
         except Exception as e:
-            print(f"Failed to download file for task {task_id}: {e}")
+            logger.exception("Failed to download file for task %s: %s", task_id, e)
             return None
 
     def add_documents_to_knowledge_base(self, file_path: str):
@@ -998,7 +1023,7 @@ Always add relevant content to your knowledge base, then query it for answers.""
             documents = read_and_parse_content(file_path)
             if documents:
                 self.dynamic_qe_manager.add_documents(documents)
-                print(f"Added {len(documents)} documents from {file_path} to dynamic knowledge base")
+                logger.info(f"Added {len(documents)} documents from {file_path} to dynamic knowledge base")
 
                 # Update the agent's tools with the refreshed query engine
                 self.external_knowledge_agent.tools = [
@@ -1009,7 +1034,7 @@ Always add relevant content to your knowledge base, then query it for answers.""
 
                 return True
         except Exception as e:
-            print(f"Failed to add documents from {file_path}: {e}")
+            logger.exception("Failed to add documents from %s: %s", file_path, e)
             return False
 
     async def solve_gaia_question(self, question_data: Dict[str, Any]) -> str:
@@ -1027,9 +1052,9 @@ Always add relevant content to your knowledge base, then query it for answers.""
                 if file_path:
                     # Add documents to dynamic knowledge base
                     self.add_documents_to_knowledge_base(file_path)
-                    print(f"Successfully integrated GAIA file into dynamic knowledge base")
+                    logger.info(f"Successfully integrated GAIA file into dynamic knowledge base")
             except Exception as e:
-                print(f"Failed to download/process file for task {task_id}: {e}")
+                logger.exception("Failed to download/process file for task %s: %s", task_id, e)
 
         # Enhanced context prompt with dynamic knowledge base awareness and step-by-step reasoning
         context_prompt = f"""
@@ -1053,29 +1078,27 @@ If you are asked for a comma separated list, apply the above rules depending of 
 
         try:
             ctx = Context(self.coordinator)
-            print("=== AGENT REASONING STEPS ===")
-            print(f"Dynamic knowledge base contains {len(self.dynamic_qe_manager.documents)} documents")
+            logger.info("=== AGENT REASONING STEPS ===")
+            logger.info(f"Dynamic knowledge base contains {len(self.dynamic_qe_manager.documents)} documents")
 
             handler = self.coordinator.run(ctx=ctx, user_msg=context_prompt)
             full_response = ""
 
             async for event in handler.stream_events():
                 if isinstance(event, AgentStream):
-                    print(event.delta, end="", flush=True)
+                    logger.info(event.delta)
                     full_response += event.delta
 
             final_response = await handler
-            print("\n=== END REASONING ===")
+            logger.info("\n=== END REASONING ===")
 
             # Extract the final formatted answer
             #final_answer = final_answer_tool(str(final_response), question)
-            #print(f"Final GAIA formatted answer: {final_answer}")
-            #print(f"Knowledge base now contains {len(self.dynamic_qe_manager.documents)} documents")
 
             return final_response
         except Exception as e:
             error_msg = f"Error processing question: {str(e)}"
-            print(error_msg)
+            logger.exception(error_msg)
             return error_msg
 
     def get_knowledge_base_stats(self):
@@ -1094,11 +1117,11 @@ async def main():
         "task_id": ""
     }
 
-    print(question_data)
+    logger.info(question_data)
 
    
     answer = await agent.solve_gaia_question(question_data)   
-    print(f"Answer: {answer}")
+    logger.info(f"Answer: {answer}")
 
 if __name__ == '__main__':
     asyncio.run(main())

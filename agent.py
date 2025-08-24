@@ -730,13 +730,8 @@ def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager) -> Functio
     """Factory returning a FunctionTool bound to the provided manager."""
     # Wrap the tool function so it tolerates different Action Input shapes emitted by
     # various ReAct parsers / LlamaIndex versions. Delegate normalization to gaia_tools.normalize_query_payload
-    def _enhanced_web_search_wrapper(input: str) -> str:
-        try:
-            query = normalize_query_payload(input)
-            return enhanced_web_search_and_update(query, manager=manager)
-        except Exception as e:
-            logger.exception("enhanced_web_search_wrapper error: %s", e)
-            return f"enhanced_web_search failed: {e}"
+    def _enhanced_web_search_wrapper(query: str) -> str:
+        return enhanced_web_search_and_update(query, manager=manager)
 
     return FunctionTool.from_defaults(
         fn=_enhanced_web_search_wrapper,
@@ -949,7 +944,20 @@ For example:
 - If asked about "Fortune 500 companies headquartered in California", don't just search for 
   "Fortune 500 companies" - include the location qualifier.
 
-Always add relevant content to your knowledge base, then query it for answers.""",
+Always add relevant content to your knowledge base, then query it for answers.
+
+When using tools, use exactly this format:
+Thought: <your reasoning>
+Action: <tool_name>
+Action Input: <plain string with no JSON, braces, or quotes>
+
+Example:
+Action: enhanced_web_search
+Action Input: Mercedes Sosa studio albums 2000-2009
+
+Do NOT wrap Action Input in JSON. Do NOT add quotes or braces.
+After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer from the updated knowledge base.
+""",
             tools=[
                 make_enhanced_web_search_tool(self.dynamic_qe_manager),
                 self.dynamic_qe_manager.get_tool(),

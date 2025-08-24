@@ -21,6 +21,14 @@ _EMBEDDER_CACHE = {}
 _RERANKER_CACHE = {}
 _LLM_CACHE = {}
 
+def _truncate_on_stop(text: str, stop: Optional[List[str]]) -> str:
+    if not stop:
+        return text
+    idxs = [text.find(s) for s in stop if s and s in text]
+    if not idxs:
+        return text
+    cut = min(i for i in idxs if i >= 0)
+    return text[:cut]
 
 def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return a cached JinaEmbeddingsV4 instance or create one.
@@ -257,95 +265,69 @@ class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
     context_window: int = Field(default=32768)
     num_output: int = Field(default=256)
+
     _model = PrivateAttr()
     _processor = PrivateAttr()
+    _loaded = PrivateAttr(default=False)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Defer heavy HF model loads until first use (lazy init)
         self._model = None
         self._processor = None
-        self._loaded = False
-
+    
     def _ensure_model(self):
-        """Lazy-load the Qwen VL HF model and processor on first use."""
-        if getattr(self, "_loaded", False):
+        if self._loaded:
             return
         import gc, os
         gc.collect()
         if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            torch.cuda.empty_cache()
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
-        load_kwargs = {"device_map": "auto", "trust_remote_code": True, "low_cpu_mem_usage": True}
-
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_name,
-            **load_kwargs,
+            self.model_name, device_map="auto", trust_remote_code=True, low_cpu_mem_usage=True
         )
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
         self._loaded = True
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(
-            context_window=self.context_window,
-            num_output=self.num_output,
-            model_name=self.model_name,
-        )
+        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
 
     @llm_completion_callback()
     def complete(
-        self,
-        prompt: str,
-        image_paths: Optional[List[str]] = None,
-        **kwargs: Any
+        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
     ) -> CompletionResponse:
-        # Ensure model is loaded lazily
         self._ensure_model()
-
-        # Prepare multimodal input
         messages = [{"role": "user", "content": []}]
         if image_paths:
             for path in image_paths:
                 messages[0]["content"].append({"type": "image", "image": path})
         messages[0]["content"].append({"type": "text", "text": prompt})
 
-        # Tokenize and process
         text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self._processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self._model.device)
 
-        # Generate output
-        generated_ids = self._model.generate(**inputs, max_new_tokens=self.num_output)
+        inputs = self._processor(
+            text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        ).to(self._model.device)
+
+        generated_ids = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = self._processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+
+        output_text = _truncate_on_stop(output_text, stop)
         return CompletionResponse(text=output_text)
 
     @llm_completion_callback()
     def stream_complete(
-        self,
-        prompt: str,
-        image_paths: Optional[List[str]] = None,
-        **kwargs: Any
+        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
     ) -> CompletionResponseGen:
-        # Ensure model is loaded lazily
-        self._ensure_model()
-        response = self.complete(prompt, image_paths)
-        for token in response.text:
-            yield CompletionResponse(text=token, delta=token)
+        resp = self.complete(prompt, image_paths=image_paths, stop=stop, **kwargs)
+        for ch in resp.text:
+            yield CompletionResponse(text=ch, delta=ch)
 
 
 # Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
@@ -435,79 +417,49 @@ class Qwen3GGUFEmbedding(BaseEmbedding):
 
 
 class Gemma3CustomLLM(CustomLLM):
-    """Dedicated Gemma-3 (27B IT) multimodal LLM loader using 4-bit BitsAndBytes quantization.
-
-    Implements the same multimodal chat-style interface as QwenVLCustomLLM but follows
-    the Gemma 3 example: use AutoProcessor.apply_chat_template and Gemma3ForConditionalGeneration.
-    Loads weights with BitsAndBytesConfig (4-bit) when CUDA is available and device_map="auto".
-    """
     model_name: str = Field(default="google/gemma-3-27b-it")
     context_window: int = Field(default=131072)
     num_output: int = Field(default=512)
+
     _model = PrivateAttr()
     _processor = PrivateAttr()
+    _loaded = PrivateAttr(default=False)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Prepare BitsAndBytes config placeholder; actual loading deferred to _ensure_model
-        try:
-            self._bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-        except Exception:
-            self._bnb_config = None
-
-        # Defer heavy HF model and processor loading until first completion call
-        self._model = None
-        self._processor = None
-        self._loaded = False
+        from transformers import BitsAndBytesConfig
+        self._bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16
+        ) if torch.cuda.is_available() else None
 
     def _ensure_model(self):
-        if getattr(self, "_loaded", False):
+        if self._loaded:
             return
         import gc, os
         gc.collect()
         if torch.cuda.is_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            torch.cuda.empty_cache()
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
         from transformers import Gemma3ForConditionalGeneration
-
         load_kwargs = {"device_map": "auto", "trust_remote_code": True}
-        if self._bnb_config is not None and torch.cuda.is_available():
+        if self._bnb_config is not None:
             load_kwargs["quantization_config"] = self._bnb_config
 
-        # Load model (prefer 4-bit quantized when possible)
         self._model = Gemma3ForConditionalGeneration.from_pretrained(
-            self.model_name,
-            **load_kwargs,
-            low_cpu_mem_usage=True,
+            self.model_name, **load_kwargs, low_cpu_mem_usage=True
         ).eval()
-
-        # Processor for multimodal inputs
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
         self._loaded = True
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(
-            context_window=self.context_window,
-            num_output=self.num_output,
-            model_name=self.model_name,
-        )
+        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
 
     @llm_completion_callback()
-    def complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
-        # Ensure model is loaded lazily
+    def complete(self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
         self._ensure_model()
-
-        # Build chat-style messages: system + user content (images then text)
         messages = [{"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]}]
         user_content = []
         if image_paths:
@@ -516,31 +468,21 @@ class Gemma3CustomLLM(CustomLLM):
         user_content.append({"type": "text", "text": prompt})
         messages.append({"role": "user", "content": user_content})
 
-        # Use processor.apply_chat_template per Gemma doc
-        inputs = self._processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        ).to(self._model.device, dtype=torch.bfloat16)
-
+        inputs = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
+                                                     return_dict=True, return_tensors="pt").to(self._model.device, dtype=torch.bfloat16)
         input_len = inputs["input_ids"].shape[-1]
 
         with torch.inference_mode():
             generation = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
-            # remove the input prefix
-            generation = generation[0][input_len:]
-
+        generation = generation[0][input_len:]
         decoded = self._processor.decode(generation, skip_special_tokens=True)
+
+        decoded = _truncate_on_stop(decoded, stop)
         return CompletionResponse(text=decoded)
 
     @llm_completion_callback()
-    def stream_complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any):
-        # Ensure model loaded
-        self._ensure_model()
-        resp = self.complete(prompt, image_paths=image_paths, **kwargs)
-        # Yield tokens/characters as delta to match previous streaming behavior
+    def stream_complete(self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any):
+        resp = self.complete(prompt, image_paths=image_paths, stop=stop, **kwargs)
         for ch in resp.text:
             yield CompletionResponse(text=ch, delta=ch)
 
@@ -550,99 +492,68 @@ class Gemma3CustomLLM(CustomLLM):
  
 # Lightweight GGUF / llama.cpp wrapper for Qwen2.5 Coder 3B (GGUF)
 class QwenCoderGGUFLLM(CustomLLM):
-    """Wrapper that loads a Qwen2.5-Coder-3B Instruct GGUF via llama_cpp.
-
-    It downloads the HF model snapshot, finds the first .gguf file, and instantiates
-    llama_cpp.Llama. This avoids a large torch-based HF load and runs via the
-    local GGUF runtime (llama.cpp or llama_cpp bindings).
-    """
     model_name: str = Field(default="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
     context_window: int = Field(default=8192)
     num_output: int = Field(default=256)
+
     _llm = PrivateAttr(default=None)
 
-    def __init__(self, model_name: Optional[str] = None, **kwargs: Any) -> None:
+    def __init__(self, model_name: Optional[str] = None, **kwargs):
         super().__init__(**kwargs)
         if model_name:
             self.model_name = model_name
-        # Defer heavy GGUF download / llama_cpp instantiation until first use
-        self._llm = None
         self._gguf_path = None
 
     def _ensure_llm(self):
         if self._llm is not None:
             return
-        import gc
-        import glob
-        try:
-            from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
-            gc.collect()
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+        from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
+        import glob, gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-            files = list_repo_files(self.model_name)
-            candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
-            fav = None
-            for p in ["q4_k_m", "q4_k", "q4_0", "q4"]:
-                for f in candidates:
-                    if p in f.lower():
-                        fav = f
-                        break
-                if fav:
-                    break
-            if fav:
-                model_path = hf_hub_download(repo_id=self.model_name, filename=fav)
-            else:
-                repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
-                gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
-                if not gguf_candidates:
-                    gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
-                if not gguf_candidates:
-                    raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
-                model_path = gguf_candidates[0]
+        files = list_repo_files(self.model_name)
+        candidates = [f for f in files if f.lower().endswith(('.gguf', '.bin'))]
+        fav = next((f for p in ["q4_k_m", "q4_k", "q4_0", "q4"] for f in candidates if p in f.lower()), None)
+        model_path = hf_hub_download(repo_id=self.model_name, filename=fav) if fav else None
 
-            from llama_cpp import Llama
-            self._llm = Llama(model_path=model_path)
-            self._gguf_path = model_path
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize QwenCoderGGUFLLM: {e}")
+        if not model_path:
+            repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
+            gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
+            if not gguf_candidates:
+                raise RuntimeError(f"No .gguf file found for {self.model_name}")
+            model_path = gguf_candidates[0]
+
+        from llama_cpp import Llama
+        self._llm = Llama(model_path=model_path)
+        self._gguf_path = model_path
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(
-            context_window=self.context_window,
-            num_output=self.num_output,
-            model_name=self.model_name,
-        )
+        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
 
     @llm_completion_callback()
-    def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
-        # Ensure GGUF/llama is initialized lazily
+    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
         if self._llm is None:
             self._ensure_llm()
-        try:
-            resp = self._llm.create(prompt=prompt, max_tokens=self.num_output)
-            text = ""
-            if isinstance(resp, dict) and resp.get("choices"):
-                choice = resp["choices"][0]
-                text = choice.get("text") or choice.get("message", {}).get("content", "")
-            else:
-                # fallback attribute access
-                choices = getattr(resp, "choices", None)
-                if choices and isinstance(choices, list):
-                    text = choices[0].get("text", "") if isinstance(choices[0], dict) else str(choices[0])
-            return CompletionResponse(text=text or "")
-        except Exception as e:
-            raise
+        resp = self._llm.create(prompt=prompt, max_tokens=self.num_output)
+        text = ""
+        if isinstance(resp, dict) and resp.get("choices"):
+            choice = resp["choices"][0]
+            text = choice.get("text") or choice.get("message", {}).get("content", "")
+        elif hasattr(resp, "choices"):
+            choices = getattr(resp, "choices", None)
+            if choices and isinstance(choices, list):
+                text = str(choices[0])
+        text = _truncate_on_stop(text or "", stop)
+        return CompletionResponse(text=text)
 
     @llm_completion_callback()
-    def stream_complete(self, prompt: str, **kwargs: Any) -> CompletionResponseGen:
-        resp = self.complete(prompt, **kwargs)
-        for token in resp.text:
-            yield CompletionResponse(text=token, delta=token)
+    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:
+        resp = self.complete(prompt, stop=stop, **kwargs)
+        for ch in resp.text:
+            yield CompletionResponse(text=ch, delta=ch)
 
 
 class JinaEmbeddingsV4(BaseEmbedding):

@@ -1178,9 +1178,7 @@ async def main():
 
     add_tool = FunctionTool.from_defaults(
         fn=add_numbers,
-        name="add_numbers",
-        description="Add two integers. Use this to perform simple addition."
-    )
+        name="add_numbers"    )
 
     dummy_agent = ReActAgent(
         name="dummy_react_agent",

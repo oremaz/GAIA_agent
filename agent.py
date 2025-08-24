@@ -514,8 +514,8 @@ class DynamicQueryEngineManager:
             from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
-            # Create a persistent chroma client and collection
-            chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+            # Create a persistent chroma client and collection using ChromaSettings
+            chroma_client = chromadb.Client(ChromaSettings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
 
             # Create or get a collection named 'gaia_collection'
             collection = chroma_client.get_or_create_collection(name="gaia_collection")

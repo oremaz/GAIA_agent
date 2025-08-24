@@ -26,11 +26,24 @@ class QwenVLCustomLLM(CustomLLM):
             torch.cuda.empty_cache()
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
+        # Prepare a BitsAndBytesConfig for 4-bit quantized load when possible
+        try:
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+        except Exception:
+            bnb_cfg = None
+
+        load_kwargs = {"device_map": "auto", "trust_remote_code": True, "low_cpu_mem_usage": True}
+        if bnb_cfg is not None and torch.cuda.is_available():
+            load_kwargs["quantization_config"] = bnb_cfg
+
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_name,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+            **load_kwargs,
         )
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
 

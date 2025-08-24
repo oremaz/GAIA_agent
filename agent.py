@@ -205,11 +205,33 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                 # Text-only pipeline: GPT-OSS as main LLM + code LLM, Qwen3 GGUF on CPU for embeddings,
                 # and use the jina reranker v2 on CPU (configured when creating reranker instance)
                 logger.info("Initializing text-only local pipeline: GPT-OSS + Qwen3 GGUF embeddings + CPU reranker")
+                # Prepare BitsAndBytes 4-bit quantization config if available and CUDA is enabled
+                bnb_cfg = None
+                try:
+                    from bitsandbytes import BitsAndBytesConfig
+                    if torch.cuda.is_available():
+                        bnb_cfg = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_use_double_quant=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_compute_dtype="auto",
+                        )
+                except Exception:
+                    bnb_cfg = None
+
+                # Build model kwargs and include quantization_config when available
+                model_kwargs = {
+                    "torch_dtype": "auto",
+                    "low_cpu_mem_usage": True,
+                }
+                if bnb_cfg is not None:
+                    model_kwargs["quantization_config"] = bnb_cfg
+
                 proj_llm = HuggingFaceLLM(
                     model_name="openai/gpt-oss-20b",
                     tokenizer_name="openai/gpt-oss-20b",
                     device_map={"": 0} if torch.cuda.is_available() else "cpu",
-                    model_kwargs={"torch_dtype": "auto", "low_cpu_mem_usage": True},
+                    model_kwargs=model_kwargs,
                     generate_kwargs={"do_sample": False}
                 )
 

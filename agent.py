@@ -730,6 +730,7 @@ def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager):
     """
 
     def enhanced_web_search(query: str) -> str:
+        logger.info(f"enhanced_web_search called with query: {query}")
         return enhanced_web_search_and_update(query, manager=manager)
 
     # Provide a stable function name for tool display

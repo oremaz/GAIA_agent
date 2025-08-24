@@ -265,7 +265,6 @@ Settings.embed_model = embed_model
 def read_and_parse_content(input_path: str) -> List[Document]:
     """
     Reads and parses content from a local file path into Document objects.
-    URL handling has been moved to search_and_extract_top_url.
     """
     # Check if API mode and LlamaParse is available for enhanced document parsing
     if USE_API_MODE and LLAMAPARSE_AVAILABLE:
@@ -623,47 +622,39 @@ class DynamicQueryEngineManager:
 # Global instance
 dynamic_qe_manager = DynamicQueryEngineManager()
 
+
 def search_and_extract_content_from_url(query: str) -> List[Document]:
-    """
-    Searches web, gets top URL, and extracts both text content and images.
-    Returns a list of Document objects containing the extracted content.
-    """
-    # Try using ddgs (DDGS) with the 'google' backend first (preferred per request)
+    logger.info(f"[web] start search: {query}")
     url = None
     try:
+        # Add a short timeout using DDGS context + our own watchdog
         with DDGS() as ddg:
+            # DDGS has no built-in timeout; consider running in a thread with timeout or replacing with requests to a known endpoint when testing
             results = list(ddg.text(query, max_results=1, backend="google"))
-        if results and len(results) > 0:
+        logger.info(f"[web] ddgs results: {len(results)}")
+        if results:
             first = results[0]
-            # ddgs may expose the link under several keys depending on backend/version
             url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
-            # sometimes ddgs returns a dict-like string; coerce
-            if not url:
-                # try common keys by inspecting full dict
-                for k in ("href", "link", "url", "FirstURL", "first_url"):
-                    if k in first:
-                        url = first[k]
-                        break
-
     except Exception as e:
-        url = None
-
-    # Log the URL found (or lack thereof)
-    logger.info("search_and_extract_content_from_url: search query='%s' -> url=%s", query, str(url))
+        logger.warning(f"[web] ddgs failed: {e}")
 
     if not url:
-        return [Document(text="No URL could be extracted from the search results.")]
+        logger.info("[web] no URL extracted (blocked/timeout/empty)")
+        return [Document(text="No URL could be extracted from the search results.",
+                         metadata={"type": "web_text", "source": "search"})]
 
-    # sanitize URL
     url = str(url).rstrip(").,;:'\"")
-    documents: List[Document] = []
+    logger.info(f"[web] fetching url: {url}")
 
     try:
         netloc = urlparse(url).netloc.lower()
         if "youtube" in netloc or "youtu.be" in netloc:
+            logger.info("[web] using YoutubeTranscriptReader()")
             loader = YoutubeTranscriptReader()
             documents = loader.load_data(youtubelinks=[url])
         else:
+            logger.info("[web] using BeautifulSoupWebReader()")
+            # If your BS reader supports it, pass a timeout; otherwise wrap requests globally
             loader = BeautifulSoupWebReader()
             documents = loader.load_data(urls=[url])
 
@@ -673,16 +664,12 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
             doc.metadata["source"] = url
             doc.metadata["type"] = "web_text"
 
-        # Log a brief summary of extracted documents
-        logger.info("search_and_extract_content_from_url: extracted %d documents from %s", len(documents), url)
-        for i, d in enumerate(documents[:3]):
-            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
-            logger.debug(" doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
-
+        logger.info(f"[web] extracted {len(documents)} documents from {url}")
         return documents
     except Exception as e:
-        logger.exception("Error extracting content from URL %s: %s", url, e)
-        return [Document(text=f"Error extracting content from URL: {str(e)}")]
+        logger.warning(f"[web] fetch failed for {url}: {e}")
+        return [Document(text=f"Error extracting content from URL: {e}",
+                         metadata={"type": "web_text", "source": url})]
 
 def enhanced_web_search_and_update(query: str) -> str:
     """

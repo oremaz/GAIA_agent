@@ -644,28 +644,31 @@ class QwenCoderGGUFLLM(CustomLLM):
         for token in resp.text:
             yield CompletionResponse(text=token, delta=token)
 
+
 class JinaEmbeddingsV4(BaseEmbedding):
     """
-    Multimodal embedding wrapper for jinaai/jina-embeddings-v4.
-    Supports:
-      - Text-only: model.encode_text(..., task=..., prompt_name=...)
-      - Image-only: model.encode_image(..., task=...)
-      - Text+Image: model.encode(text=..., image=..., task=...)
-    Pass task/prompt_name at encode time per the official docs.
+    Memory-constrained wrapper for jinaai/jina-embeddings-v4.
+    - 4-bit NF4 + FP16 compute with automatic sharding/offload
+    - Caps sequence length and batch size to limit activation/KV memory spikes
+    - Processes items sequentially (batch_size=1) to avoid multi-GiB peaks
     """
     model_name: str = Field(default="jinaai/jina-embeddings-v4")
 
-    # Keep a handle to the HF model (initialized lazily)
+    # Memory guardrails
+    max_length_query: int = Field(default=512)     # tighten if needed (256–512)
+    max_length_passage: int = Field(default=768)   # tighten if needed (512–1024)
+    batch_size: int = Field(default=1)             # keep 1 for long texts
+    truncate_dim: Optional[int] = Field(default=None)  # e.g., 1024 to reduce head memory
+    offload_folder: str = Field(default="./offload_jina_v4")
+
+    # Private
     _model = PrivateAttr(default=None)
-    # Thread-safe lazy-init helpers
+    _processor = PrivateAttr(default=None)
     _loaded = PrivateAttr(default=False)
     _model_lock = PrivateAttr(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        # Do minimal work in constructor; defer heavy HF loads to _ensure_model
-        self._bnb_config = None
-        # Per-instance lock to avoid races when multiple threads try to lazy-load
         try:
             self._model_lock = threading.Lock()
         except Exception:
@@ -673,68 +676,49 @@ class JinaEmbeddingsV4(BaseEmbedding):
         self._loaded = False
 
     def _ensure_model(self):
-        """Lazy initialize the underlying HF model. Safe to call multiple times."""
-        import torch
-        from transformers import AutoModel
-        import gc, os
-
-        # Fast-path: already loaded
         if getattr(self, "_loaded", False):
             return
-
-        # Acquire lock if available to avoid concurrent initialization
         lock = getattr(self, "_model_lock", None)
         if lock is not None:
             lock.acquire()
         try:
-            # Double-check after acquiring lock
             if getattr(self, "_loaded", False):
                 return
 
-            # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
-            gc.collect()
-            if torch.cuda.is_available():
-                try:
-                    torch.cuda.empty_cache()
-                except Exception:
-                    pass
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+            os.makedirs(self.offload_folder, exist_ok=True)
 
-            # Prepare BitsAndBytes config if possible
+            from transformers import AutoModel, AutoProcessor
+            # BitsAndBytesConfig is available via transformers when bitsandbytes is installed
             try:
-                self._bnb_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                )
+                from transformers import BitsAndBytesConfig
             except Exception:
-                self._bnb_config = None
+                from bitsandbytes import BitsAndBytesConfig  # fallback import
 
-            # Choose device map: explicit single-device map when CUDA is available
-            device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.float16,  # choose bfloat16 if instability observed
+            )
 
-            load_kwargs = {
-                "trust_remote_code": True,
-                "low_cpu_mem_usage": True,
-            }
-            if self._bnb_config is not None and torch.cuda.is_available():
-                load_kwargs["quantization_config"] = self._bnb_config
-                load_kwargs["device_map"] = device_map
-            else:
-                load_kwargs["device_map"] = device_map
+            # Let HF place layers and offload automatically (prevents pinning on GPU:0)
+            self._model = AutoModel.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                offload_folder=self.offload_folder,
+                torch_dtype=torch.float16,
+                quantization_config=bnb_cfg,
+            ).eval()
 
-            # Log whether quantization will be used (helpful to debug GPU memory usage)
-            _logger.info("JinaEmbeddingsV4: quantization_enabled=%s device_map=%s", bool(self._bnb_config and torch.cuda.is_available()), device_map)
-
+            # Optional processor
             try:
-                self._model = AutoModel.from_pretrained(self.model_name, **load_kwargs).eval()
-            except Exception as e:
-                # If load failed, ensure _model remains None and propagate
-                print(f"Failed to lazy-load JinaEmbeddingsV4 model {self.model_name}: {e}")
-                raise
+                self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
+            except Exception:
+                self._processor = None
 
-            # Mark as loaded
             self._loaded = True
         finally:
             if lock is not None:
@@ -745,183 +729,129 @@ class JinaEmbeddingsV4(BaseEmbedding):
 
     @classmethod
     def class_name(cls) -> str:
-        return "jina_v4"
+        return "jina_v4_memory_guarded"
 
     def _embed(
         self,
         texts: List[str],
         image_paths: Optional[List[Optional[str]]] = None,
         task: str = "retrieval",
-        prompt_name: Optional[str] = "passage",  # "query" for queries, "passage" for docs; not used for images
+        prompt_name: Optional[str] = "passage",
         return_multivector: bool = False,
-        truncate_dim: Optional[int] = None,      # e.g., 128, 256, 512, 1024, 2048
-        max_length: Optional[int] = None,        # for texts
-        max_pixels: Optional[int] = None,        # for images
+        truncate_dim: Optional[int] = None,
+        max_length: Optional[int] = None,
+        max_pixels: Optional[int] = None,
         batch_size: Optional[int] = None,
+        is_query: bool = False,
     ) -> List[List[float]]:
         """
-        Encodes a batch of inputs; each item can be text-only, image-only, or text+image.
-        - task: "retrieval" | "text-matching" | "code"
-        - prompt_name: for retrieval/code text inputs ("query" or "passage"); not used for image-only
-        - return_multivector: if True, returns multi-vector outputs (here flattened per item)
+        Strict memory controls:
+        - batch_size forced to 1 by default
+        - max_length capped (queries vs passages)
+        - optional truncate_dim to reduce output dimensionality
         """
-        import torch
         from PIL import Image
 
-        # Ensure model is loaded (lazy)
         try:
             self._ensure_model()
         except Exception:
-            # If model couldn't be loaded, return zero vectors to avoid crashing the caller
-            dim = 2048
-            return [[0.0] * (truncate_dim or dim) for _ in texts]
+            # Safe fallback: return zeros
+            dim = truncate_dim or self.truncate_dim or 2048
+            return [[0.0] * dim for _ in texts]
+
         model = self._model
 
-        # Normalize image_paths to align with texts
+        # Effective limits
+        eff_batch = 1 if batch_size is None else max(1, int(batch_size))
+        default_max_len = self.max_length_query if is_query else self.max_length_passage
+        eff_max_len = int(max_length or default_max_len)
+        eff_truncate_dim = truncate_dim or self.truncate_dim
+
+        # Normalize image paths
         image_paths = image_paths or [None] * len(texts)
         if len(image_paths) == 1 and len(texts) > 1:
             image_paths = image_paths * len(texts)
 
-        results: List[List[float]] = []
-
-        # Helper to coerce model outputs to a single vector (first item if batched)
         def _to_list_vector(arr):
-            # Robust conversion to a plain Python list[float].
-            try:
-                import torch
-            except Exception:
-                torch = None
+            if isinstance(arr, torch.Tensor):
+                arr = arr.detach().cpu().numpy()
             try:
                 import numpy as np
             except Exception:
                 np = None
-
-            # If it's a torch Tensor, convert to numpy first
-            if torch is not None and isinstance(arr, torch.Tensor):
-                arr = arr.detach().cpu().numpy()
-
-            # If it's a numpy array, reduce batch dims and return list
             if np is not None and isinstance(arr, np.ndarray):
-                # Handle possible shapes: (N, D), (N, M, D), (D,)
+                # possible shapes: (N, D), (N, M, D), (D,)
                 if arr.ndim == 3:
-                    # average across the middle dimension (num_vecs) then take first batch
                     arr = arr.mean(axis=1)
                 if arr.ndim == 2:
                     arr = arr[0]
                 return [float(x) for x in arr.tolist()]
-
-            # If it's a list, try to coerce the first item's vector
             if isinstance(arr, list):
-                if len(arr) == 0:
+                if not arr:
                     return []
                 first = arr[0]
-                # If first element is tensor/ndarray/list, recurse on it
-                if (torch is not None and isinstance(first, torch.Tensor)) or (
-                    np is not None and isinstance(first, np.ndarray)
-                ) or isinstance(first, (list, tuple)):
+                if isinstance(first, (list, tuple, torch.Tensor)):
                     return _to_list_vector(first)
-                # Otherwise assume it's already a flat list of numbers
                 return [float(x) for x in arr]
-
-            # Scalars and other types -> coerce to float
             try:
                 return [float(arr)]
             except Exception:
-                # Last resort: stringify then cast
                 return [float(str(arr))]
 
-        with torch.no_grad():
+        results: List[List[float]] = []
+
+        # One-by-one to avoid overlapping activation peaks
+        with torch.inference_mode():
             for text, img_path in zip(texts, image_paths):
-                # Determine path: multimodal, image-only, or text-only
+                kwargs = dict(
+                    task=task,
+                    return_multivector=return_multivector,
+                    truncate_dim=eff_truncate_dim,
+                    max_length=eff_max_len,
+                    max_pixels=max_pixels,
+                    batch_size=eff_batch,
+                )
+
                 if img_path is not None and text:
-                    # Multimodal
                     img = Image.open(img_path).convert("RGB")
-                    emb = model.encode(
-                        text=text,
-                        image=img,
-                        task=task,
-                        return_multivector=return_multivector,
-                        truncate_dim=truncate_dim,
-                        max_length=max_length,
-                        max_pixels=max_pixels,
-                        batch_size=batch_size,
-                    )
-                    # For multimodal, remote code returns either single or multivector embedding
-                    # Flatten to a single vector if not returning multivector explicitly
-                    if return_multivector:
-                        # If multivector, you may want to keep the nested structure.
-                        # Here we average to return a single vector for compatibility.
-                        if hasattr(emb, "detach"):
-                            emb = emb.detach().cpu().numpy()
-                        elif hasattr(emb, "cpu"):
-                            emb = emb.cpu().numpy()
-                        if emb.ndim == 3:
-                            # shape (1, num_vecs, dim) -> avg across num_vecs
-                            emb = emb.mean(axis=1)[0]
-                        else:
-                            emb = emb[0] if emb.ndim == 2 else emb
-                        results.append(emb.tolist())
-                    else:
-                        results.append(_to_list_vector(emb))
-
+                    emb = model.encode(text=text, image=img, **kwargs)
+                    results.append(_to_list_vector(emb))
                 elif img_path is not None:
-                    # Image-only
                     img = Image.open(img_path).convert("RGB")
-                    emb = model.encode_image(
-                        images=[img],
-                        task=task,
-                        return_multivector=return_multivector,
-                        truncate_dim=truncate_dim,
-                        max_pixels=max_pixels,
-                        batch_size=batch_size,
-                    )
+                    emb = model.encode_image(images=[img], **kwargs)
                     results.append(_to_list_vector(emb))
-
                 else:
-                    # Text-only
-                    kwargs = {
-                        "texts": [text],
-                        "task": task,
-                        "return_multivector": return_multivector,
-                        "truncate_dim": truncate_dim,
-                        "max_length": max_length,
-                        "batch_size": batch_size,
-                    }
-                    # Only text tasks use prompt_name (retrieval/code); text-matching is symmetric
+                    ekw = {"texts": [text], **kwargs}
                     if prompt_name:
-                        kwargs["prompt_name"] = prompt_name
-
-                    emb = model.encode_text(**kwargs)
+                        ekw["prompt_name"] = prompt_name
+                    emb = model.encode_text(**ekw)
                     results.append(_to_list_vector(emb))
 
-        # Try to free any cached GPU memory after encoding to avoid incremental growth
-        if torch.cuda.is_available():
-            try:
-                before = torch.cuda.memory_allocated()
-                torch.cuda.empty_cache()
-                after = torch.cuda.memory_allocated()
-                _logger.info("JinaEmbeddingsV4._embed: cuda_memory_before_empty=%s after_empty=%s", before, after)
-            except Exception:
-                pass
+                # Encourage allocator reuse between items
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
 
         return results
 
     def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        # Retrieval query uses prompt_name="query"
+        # prompt_name="query" for text-only retrieval queries
         return self._embed(
             [query],
             [image_path] if image_path else None,
             task="retrieval",
-            prompt_name="query" if image_path is None else None,
+            prompt_name=None if image_path is not None else "query",
+            is_query=True,
         )[0]
 
     def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        # Retrieval passage (for indexing) uses prompt_name="passage"
+        # prompt_name="passage" for indexing
         return self._embed(
             [text],
             [image_path] if image_path else None,
             task="retrieval",
-            prompt_name="passage" if image_path is None else None,
+            prompt_name=None if image_path is not None else "passage",
+            is_query=False,
         )[0]
 
     def _get_text_embeddings(
@@ -929,20 +859,20 @@ class JinaEmbeddingsV4(BaseEmbedding):
         texts: List[str],
         image_paths: Optional[List[Optional[str]]] = None,
     ) -> List[List[float]]:
-        # Default to retrieval passages for document embeddings
         return self._embed(
             texts,
             image_paths,
             task="retrieval",
             prompt_name="passage",
+            is_query=False,
         )
 
+    # Async variants for compatibility with your current call sites
     async def _aget_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
         return self._get_query_embedding(query, image_path)
 
     async def _aget_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
         return self._get_text_embedding(text, image_path)
-
 
 class JinaMultimodalReranker:
     """

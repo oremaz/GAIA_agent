@@ -216,7 +216,7 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                     model_name="openai/gpt-oss-20b",
                     tokenizer_name="openai/gpt-oss-20b",
                     device_map={"": 0} if torch.cuda.is_available() else "cpu",
-                    model_kwargs={"torch_dtype": "auto"},
+                    model_kwargs={"torch_dtype": "auto", "low_cpu_mem_usage": True},
                     generate_kwargs={"do_sample": False}
                 )
 
@@ -231,15 +231,21 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
             logger.exception("Error initializing models: %s", e)
             raise
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-# Ensure there's a root handler to stdout so third-party libraries emit to stdout in notebooks/containers
+# Setup logging - force INFO logs to stdout so they are visible in notebooks/terminals
 root_logger = logging.getLogger()
-if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    root_logger.addHandler(sh)
+# Remove any existing StreamHandlers (they may be configured to stderr or filtered)
+for h in list(root_logger.handlers):
+    if isinstance(h, logging.StreamHandler):
+        root_logger.removeHandler(h)
+
+# Create a StreamHandler that writes to stdout and set it to INFO
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+sh.setLevel(logging.INFO)
+root_logger.addHandler(sh)
 root_logger.setLevel(logging.INFO)
+# Ensure basicConfig is set for libraries that check it
+logging.basicConfig(level=logging.INFO)
 
 # Make llama_index and related libraries more verbose for debugging (they will propagate to root handler)
 logging.getLogger("llama_index").setLevel(logging.DEBUG)
@@ -1122,16 +1128,6 @@ async def main():
 
     logger.info("Starting targeted tests for query: %s", query)
 
-    # 1) Direct web search extraction
-    try:
-        docs = search_and_extract_content_from_url(query)
-        logger.info("search_and_extract_content_from_url -> returned %d documents", len(docs) if docs is not None else 0)
-        for i, d in enumerate(docs[:3]):
-            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
-            logger.info(" doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
-    except Exception as e:
-        docs = []
-        logger.exception("search_and_extract_content_from_url failed: %s", e)
 
     # 2) Invoke the enhanced web search tool (manager-bound)
     try:
@@ -1156,7 +1152,6 @@ async def main():
     # Print concise summary for quick inspection
     print("=== TARGETED TEST SUMMARY ===")
     print("query:", query)
-    print("search_and_extract_content_from_url -> documents:", len(docs))
     print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
     print("solve_gaia_question -> answer:", str(answer))
 

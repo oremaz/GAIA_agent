@@ -19,9 +19,17 @@ class QwenVLCustomLLM(CustomLLM):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # Pre-load housekeeping to reduce memory spikes and fragmentation
+        import gc, os
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_name,
             device_map="auto",
+            low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
@@ -184,6 +192,13 @@ class Gemma3CustomLLM(CustomLLM):
             bnb_cfg = None
 
         try:
+            # Pre-load housekeeping: collect GC and free CUDA cache to reduce OOM risk
+            import gc, os
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+
             from transformers import Gemma3ForConditionalGeneration
 
             load_kwargs = {"device_map": "auto", "trust_remote_code": True}
@@ -194,6 +209,7 @@ class Gemma3CustomLLM(CustomLLM):
             self._model = Gemma3ForConditionalGeneration.from_pretrained(
                 self.model_name,
                 **load_kwargs,
+                low_cpu_mem_usage=True,
             ).eval()
 
             # Processor for multimodal inputs
@@ -275,6 +291,13 @@ class JinaEmbeddingsV4(BaseEmbedding):
         from transformers import AutoModel
 
         if self._model is None:
+            # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
+            import gc, os
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+
             #self._model = AutoModel.from_pretrained(
                 #self.model_name,
                 #trust_remote_code=True,
@@ -300,6 +323,7 @@ class JinaEmbeddingsV4(BaseEmbedding):
                 trust_remote_code=True,
                 quantization_config=self._bnb_config,
                 device_map=device_map,
+                low_cpu_mem_usage=True,
             ).eval()
 
     @classmethod

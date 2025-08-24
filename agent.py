@@ -1144,6 +1144,32 @@ async def main():
     # 2) Test the full agent pipeline: create an agent and ask it to solve the GAIA question
     try:
         agent_for_tool = EnhancedGAIAAgent()
+        # --- New: test make_enhanced_web_search_tool creation and safe invocation ---
+        manager = agent_for_tool.dynamic_qe_manager
+        test_tool = make_enhanced_web_search_tool(manager)
+
+        # Discover the callable stored on the FunctionTool (different llama_index versions use
+        # different attribute names). Try common names and pick the first available.
+        callable_names = ['fn', 'func', '_func', 'callable']
+        tool_callable = None
+        for n in callable_names:
+            tool_callable = getattr(test_tool, n, None)
+            if callable(tool_callable):
+                break
+            tool_callable = None
+
+        tool_call_result = None
+        if tool_callable is None:
+            tool_call_result = f"Tool created but no callable found on attributes {callable_names}; tool repr: {repr(test_tool)}"
+        else:
+            try:
+                # Run the (potentially blocking) tool call in a thread with a timeout so the test doesn't hang.
+                tool_call_result = asyncio.run(asyncio.wait_for(asyncio.to_thread(tool_callable, query), timeout=30))
+            except Exception as e:
+                tool_call_result = f"Tool invocation failed or timed out: {e}"
+
+        logger.info("make_enhanced_web_search_tool -> creation ok, invocation sample: %s", str(tool_call_result)[:400])
+        # --- end new test ---
         question_data = {"Question": query, "task_id": ""}
         # solve_gaia_question is async; await it inside this async main
         final_response = await agent_for_tool.solve_gaia_question(question_data)

@@ -261,76 +261,252 @@ def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
         _EMBEDDER_CACHE[key] = inst
         return inst
 
+from typing import Optional, List, Any, Iterator
+import os
+import gc
+import torch
+from pydantic import Field, PrivateAttr
+from llama_index.core.llms import CustomLLM, CompletionResponse, CompletionResponseGen, LLMMetadata
+from llama_index.core.llms.callbacks import llm_completion_callback
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from qwen_vl_utils import process_vision_info
+
 class QwenVLCustomLLM(CustomLLM):
+    """
+    Hardened Qwen2.5-VL Instruct loader with:
+    - Lazy init (model/processor) with CUDA hygiene
+    - Optional stop sequences for clean ReAct parsing
+    - Robust multimodal chat assembly and decoding
+    - Streamed token emission with deterministic slicing
+    """
+
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
     context_window: int = Field(default=32768)
     num_output: int = Field(default=256)
 
-    _model = PrivateAttr()
-    _processor = PrivateAttr()
-    _loaded = PrivateAttr(default=False)
+    # Private attrs (not part of model schema)
+    _model: Optional[Qwen2_5_VLForConditionalGeneration] = PrivateAttr(default=None)
+    _processor: Optional[AutoProcessor] = PrivateAttr(default=None)
+    _loaded: bool = PrivateAttr(default=False)
 
-    def __init__(self, **kwargs):
+    # Optional stop sequences to help downstream parsers (e.g., ReAct)
+    _default_stops: Optional[List[str]] = PrivateAttr(
+        default=["\nObservation:", "\nAnswer:", "\nAction:", "\nFINAL", "\nFinal"]
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        # Defer heavy loads until first call
         self._model = None
         self._processor = None
-    
-    def _ensure_model(self):
+        self._loaded = False
+
+    def _cuda_hygiene(self) -> None:
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _ensure_model(self) -> None:
         if self._loaded:
             return
-        import gc, os
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Memory/allocator guardrails
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+        self._cuda_hygiene()
 
+        # Load model and processor
+        load_kwargs = {
+            "device_map": "auto",
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_name, device_map="auto", trust_remote_code=True, low_cpu_mem_usage=True
+            self.model_name, **load_kwargs
         )
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
         self._loaded = True
 
     @property
     def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
+        return LLMMetadata(
+            context_window=self.context_window,
+            num_output=self.num_output,
+            model_name=self.model_name,
+        )
+
+    def _build_inputs(
+        self,
+        prompt: str,
+        image_paths: Optional[List[str]] = None,
+    ):
+        """
+        Build chat-text and vision inputs suitable for Qwen2.5-VL.
+        """
+        # Chat template: images first, then text
+        content: List[dict] = []
+        if image_paths:
+            for path in image_paths:
+                content.append({"type": "image", "image": path})
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
+
+        # Prepare text + vision
+        text = self._processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+
+        proc_inputs = self._processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        # Move to model device
+        proc_inputs = proc_inputs.to(self._model.device)
+        return proc_inputs
+
+    def _generate(
+        self,
+        inputs,
+        max_new_tokens: Optional[int] = None,
+        stops: Optional[List[str]] = None,
+        do_sample: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+    ):
+        # Set defaults
+        max_new = max_new_tokens or self.num_output
+        gen_kwargs = {
+            "max_new_tokens": int(max_new),
+            "do_sample": bool(do_sample),
+        }
+        if temperature is not None:
+            gen_kwargs["temperature"] = float(temperature)
+        if top_p is not None:
+            gen_kwargs["top_p"] = float(top_p)
+        if top_k is not None:
+            gen_kwargs["top_k"] = int(top_k)
+
+        # Native stopping via eos_token_id(s)
+        # Qwen generally supports eos; we also do post-trim with stops below.
+        with torch.inference_mode():
+            out_ids = self._model.generate(**inputs, **gen_kwargs)
+        return out_ids
+
+    def _decode_and_trim(self, inputs, out_ids, stops: Optional[List[str]] = None) -> str:
+        """
+        Remove the prompt prefix tokens and decode.
+        Optionally trim at the earliest occurrence of any stop string.
+        """
+        # For batched inputs, slice each sequence by its input prefix
+        if hasattr(inputs, "input_ids"):
+            in_ids = inputs.input_ids
+            # Take first sequence (batch=1 usage in this wrapper)
+            prefix_len = in_ids.shape[-1]
+            trimmed = out_ids[prefix_len:]
+        else:
+            trimmed = out_ids
+
+        text = self._processor.decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+        # Optional soft stop trimming to avoid trailing artifacts for ReAct
+        if stops:
+            cut = len(text)
+            for s in stops:
+                if not s:
+                    continue
+                idx = text.find(s)
+                if idx != -1:
+                    cut = min(cut, idx)
+            text = text[:cut].rstrip()
+
+        return text
 
     @llm_completion_callback()
     def complete(
-        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
+        self,
+        prompt: str,
+        image_paths: Optional[List[str]] = None,
+        stops: Optional[List[str]] = None,
+        do_sample: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        **kwargs: Any,
     ) -> CompletionResponse:
+        """
+        Text/multimodal completion with optional stop strings.
+        """
         self._ensure_model()
-        messages = [{"role": "user", "content": []}]
-        if image_paths:
-            for path in image_paths:
-                messages[0]["content"].append({"type": "image", "image": path})
-        messages[0]["content"].append({"type": "text", "text": prompt})
 
-        text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
+        # Build inputs
+        inputs = self._build_inputs(prompt, image_paths=image_paths)
 
-        inputs = self._processor(
-            text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
-        ).to(self._model.device)
-
-        generated_ids = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
-        generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-        output_text = self._processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        # Generate
+        out_ids = self._generate(
+            inputs,
+            max_new_tokens=self.num_output,
+            stops=stops,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
         )
-        _logger.info("Generated text: %s", output_text)
-        output_text = output_text[0] if output_text else ""
 
-        output_text = _truncate_on_stop(output_text, stop)
-        return CompletionResponse(text=output_text)
+        # Decode and trim
+        stops_final = stops if stops is not None else self._default_stops
+        text = self._decode_and_trim(inputs, out_ids, stops=stops_final)
+
+        # Light CUDA hygiene to reduce fragmentation over many calls
+        self._cuda_hygiene()
+
+        return CompletionResponse(text=text)
 
     @llm_completion_callback()
     def stream_complete(
-        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
+        self,
+        prompt: str,
+        image_paths: Optional[List[str]] = None,
+        stops: Optional[List[str]] = None,
+        do_sample: bool = False,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        top_k: Optional[int] = None,
+        **kwargs: Any,
     ) -> CompletionResponseGen:
-        resp = self.complete(prompt, image_paths=image_paths, stop=stop, **kwargs)
-        for ch in resp.text:
+        """
+        Character-streamed completion (client-side streaming):
+        generate once and yield characters progressively.
+        """
+        self._ensure_model()
+
+        # Build inputs
+        inputs = self._build_inputs(prompt, image_paths=image_paths)
+
+        # Generate once for determinism, then stream the decoded text
+        out_ids = self._generate(
+            inputs,
+            max_new_tokens=self.num_output,
+            stops=stops,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+        stops_final = stops if stops is not None else self._default_stops
+        text = self._decode_and_trim(inputs, out_ids, stops=stops_final)
+
+        # Stream characters (or tokens; characters is simplest and robust)
+        for ch in text:
             yield CompletionResponse(text=ch, delta=ch)
 
+        self._cuda_hygiene()
 
 # Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
 

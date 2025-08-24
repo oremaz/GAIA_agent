@@ -9,6 +9,12 @@ import torch
 from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
 from transformers import AutoModel, BitsAndBytesConfig
+import threading
+import logging
+
+# Lock to prevent races when creating cached instances concurrently
+_CACHE_LOCK = threading.Lock()
+_logger = logging.getLogger(__name__)
 
 # Module-level caches to avoid creating multiple heavyweight model instances
 _EMBEDDER_CACHE = {}
@@ -22,11 +28,42 @@ def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Option
     the class will be used.
     """
     key = (model_name or "jinaai/jina-embeddings-v4", device or "auto")
-    if key in _EMBEDDER_CACHE:
-        return _EMBEDDER_CACHE[key]
-    inst = JinaEmbeddingsV4(model_name=key[0]) if model_name is None or key[0] == "jinaai/jina-embeddings-v4" else JinaEmbeddingsV4(model_name=key[0])
-    _EMBEDDER_CACHE[key] = inst
-    return inst
+    # Fast path
+    inst = _EMBEDDER_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    # Ensure only one creator runs at a time
+    with _CACHE_LOCK:
+        inst = _EMBEDDER_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating Jina embedder for key=%s", key)
+        try:
+            before_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_alloc = None
+
+            inst = JinaEmbeddingsV4(model_name=key[0])
+
+            after_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    after_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                after_alloc = None
+
+            _logger.info("Jina embedder created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+        except Exception:
+            _logger.exception("Failed to create Jina embedder for key=%s", key)
+            raise
+
+        _EMBEDDER_CACHE[key] = inst
+        return inst
 
 
 def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5, device: str = "cpu"):
@@ -35,11 +72,40 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
     Keyed by (model_name, top_n, device).
     """
     key = (model_name or "jinaai/jina-reranker-m0", top_n, device)
-    if key in _RERANKER_CACHE:
-        return _RERANKER_CACHE[key]
-    inst = JinaMultimodalReranker(model_name=key[0], top_n=key[1], device=key[2])
-    _RERANKER_CACHE[key] = inst
-    return inst
+    inst = _RERANKER_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    with _CACHE_LOCK:
+        inst = _RERANKER_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating Jina reranker for key=%s", key)
+        try:
+            before_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_alloc = None
+
+            inst = JinaMultimodalReranker(model_name=key[0], top_n=key[1], device=key[2])
+
+            after_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    after_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                after_alloc = None
+
+            _logger.info("Jina reranker created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+        except Exception:
+            _logger.exception("Failed to create Jina reranker for key=%s", key)
+            raise
+
+        _RERANKER_CACHE[key] = inst
+        return inst
 
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")

@@ -1154,21 +1154,10 @@ async def main():
         tool_result = f"Tool invocation failed: {e}"
         logger.exception("enhanced_web_search_tool invocation failed: %s", e)
 
-    # 3) Run the agent's solve_gaia_question
-    try:
-        agent = EnhancedGAIAAgent()
-        question_data = {"Question": query, "task_id": ""}
-        answer = await agent.solve_gaia_question(question_data)
-        logger.info("solve_gaia_question -> %s", str(answer)[:500])
-    except Exception as e:
-        answer = f"solve_gaia_question failed: {e}"
-        logger.exception("solve_gaia_question failed: %s", e)
-
     # Print concise summary for quick inspection
     print("=== TARGETED TEST SUMMARY ===")
     print("query:", query)
     print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
-    print("solve_gaia_question -> answer:", str(answer))
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -233,15 +233,21 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("llama_index.core.agent").setLevel(logging.DEBUG)
-logging.getLogger("llama_index.llms").setLevel(logging.DEBUG)
-# Module logger
-logger = logging.getLogger(__name__)
-# Ensure logger writes INFO to stdout (useful in environments like Kaggle)
-if not logger.handlers:
+# Ensure there's a root handler to stdout so third-party libraries emit to stdout in notebooks/containers
+root_logger = logging.getLogger()
+if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(sh)
+    root_logger.addHandler(sh)
+root_logger.setLevel(logging.INFO)
+
+# Make llama_index and related libraries more verbose for debugging (they will propagate to root handler)
+logging.getLogger("llama_index").setLevel(logging.DEBUG)
+logging.getLogger("llama_index.core.agent").setLevel(logging.DEBUG)
+logging.getLogger("llama_index.llms").setLevel(logging.DEBUG)
+
+# Module logger
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
@@ -1086,7 +1092,9 @@ If you are asked for a comma separated list, apply the above rules depending of 
 
             async for event in handler.stream_events():
                 if isinstance(event, AgentStream):
-                    logger.info(event.delta)
+                    # preserve streaming behavior (no newline, immediate flush)
+                    sys.stdout.write(event.delta)
+                    sys.stdout.flush()
                     full_response += event.delta
 
             final_response = await handler

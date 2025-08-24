@@ -1164,9 +1164,13 @@ async def main():
         else:
             try:
                 # Run the (potentially blocking) tool call in a thread with a timeout so the test doesn't hang.
-                tool_call_result = asyncio.run(asyncio.wait_for(asyncio.to_thread(tool_callable, query), timeout=30))
+                # We're already inside an asyncio event loop, so use await instead of asyncio.run.
+                tool_call_result = await asyncio.wait_for(asyncio.to_thread(tool_callable, query), timeout=30)
             except Exception as e:
                 tool_call_result = f"Tool invocation failed or timed out: {e}"
+
+        # Expose the result to the outer scope for printing below
+        tool_result = tool_call_result
 
         logger.info("make_enhanced_web_search_tool -> creation ok, invocation sample: %s", str(tool_call_result)[:400])
         # --- end new test ---

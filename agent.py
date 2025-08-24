@@ -681,6 +681,7 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
 
         return documents
     except Exception as e:
+        logger.exception("Error extracting content from URL %s: %s", url, e)
         return [Document(text=f"Error extracting content from URL: {str(e)}")]
 
 def enhanced_web_search_and_update(query: str) -> str:
@@ -709,6 +710,7 @@ def enhanced_web_search_and_update(query: str) -> str:
         return summary
     else:
         error_msg = documents[0].text if documents else "No content extracted"
+        logger.warning("enhanced_web_search_and_update: failed to extract content for query '%s': %s", query, error_msg)
         return f"Failed to extract web content: {error_msg}"
 
 # Create the enhanced web search tool

@@ -20,6 +20,8 @@ from custom_models import (
     Qwen3GGUFEmbedding,
     Gemma3CustomLLM,
     QwenCoderGGUFLLM,
+    get_or_create_jina_reranker,
+    get_or_create_jina_embedder,
 )
 
 # LlamaIndex core imports
@@ -196,7 +198,8 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
             if multimodal:
                 # Multimodal pipeline (existing behavior)
                 proj_llm = QwenVLCustomLLM()
-                embed_model = JinaEmbeddingsV4()
+                # Use cached embedder to avoid repeated heavy loads
+                embed_model = get_or_create_jina_embedder()
 
                 # Code LLM (unchanged)
                 # Use local GGUF via llama.cpp for the code model to avoid heavy HF torch loads
@@ -587,11 +590,8 @@ class DynamicQueryEngineManager:
             def __init__(self):
                 # Choose reranker model depending on non-API multimodal flag
                 preferred = "jinaai/jina-reranker-m0" if NONAPI_MULTIMODAL else "jinaai/jina-reranker-v2-base-multilingual"
-                self.jina_reranker = JinaMultimodalReranker(
-                    model_name=preferred,
-                    top_n=5,
-                    device="cpu"
-                )
+                # Use cached reranker to avoid duplicate loads across managers
+                self.jina_reranker = get_or_create_jina_reranker(model_name=preferred, top_n=5, device="cpu")
 
             def postprocess_nodes(self, nodes, query_bundle):
                 # Use Jina multimodal reranker for all content types

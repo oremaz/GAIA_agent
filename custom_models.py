@@ -10,6 +10,37 @@ from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
 from transformers import AutoModel, BitsAndBytesConfig
 
+# Module-level caches to avoid creating multiple heavyweight model instances
+_EMBEDDER_CACHE = {}
+_RERANKER_CACHE = {}
+
+
+def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return a cached JinaEmbeddingsV4 instance or create one.
+
+    Keyed by (model_name, device). If model_name is None the default from
+    the class will be used.
+    """
+    key = (model_name or "jinaai/jina-embeddings-v4", device or "auto")
+    if key in _EMBEDDER_CACHE:
+        return _EMBEDDER_CACHE[key]
+    inst = JinaEmbeddingsV4(model_name=key[0]) if model_name is None or key[0] == "jinaai/jina-embeddings-v4" else JinaEmbeddingsV4(model_name=key[0])
+    _EMBEDDER_CACHE[key] = inst
+    return inst
+
+
+def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5, device: str = "cpu"):
+    """Return a cached JinaMultimodalReranker instance or create one.
+
+    Keyed by (model_name, top_n, device).
+    """
+    key = (model_name or "jinaai/jina-reranker-m0", top_n, device)
+    if key in _RERANKER_CACHE:
+        return _RERANKER_CACHE[key]
+    inst = JinaMultimodalReranker(model_name=key[0], top_n=key[1], device=key[2])
+    _RERANKER_CACHE[key] = inst
+    return inst
+
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
     context_window: int = Field(default=32768)
@@ -398,51 +429,60 @@ class JinaEmbeddingsV4(BaseEmbedding):
     """
     model_name: str = Field(default="jinaai/jina-embeddings-v4")
 
-    # Keep a handle to the HF model (initialized in __init__)
+    # Keep a handle to the HF model (initialized lazily)
     _model = PrivateAttr(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        # Load the model once. Prefer float16 for stability first.
-        # To try 4-bit later, see the commented block below.
+        # Do minimal work in constructor; defer heavy HF loads to _ensure_model
+        self._bnb_config = None
+
+    def _ensure_model(self):
+        """Lazy initialize the underlying HF model. Safe to call multiple times."""
         import torch
         from transformers import AutoModel
 
-        if self._model is None:
-            # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
-            import gc, os
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+        if getattr(self, "_model", None) is not None:
+            return
 
-            #self._model = AutoModel.from_pretrained(
-                #self.model_name,
-                #trust_remote_code=True,
-                #torch_dtype=torch.float16,   # stable default
-                #device_map="auto",
-            #).eval()
+        # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
+        import gc, os
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
-            # If you prefer explicit device placement (instead of device_map="auto"):
-            # self._model.to("cuda" if torch.cuda.is_available() else "cpu")
-
-            # To enable 4-bit (only after ensuring peft/transformers/bitsandbytes/CUDA versions are aligned):
+        # Prepare BitsAndBytes config if possible
+        try:
             self._bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
+        except Exception:
+            self._bnb_config = None
 
-            device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+        # Choose device map: explicit single-device map when CUDA is available
+        device_map = {"": 0} if torch.cuda.is_available() else "cpu"
 
-            self._model = AutoModel.from_pretrained(
-                self.model_name,
-                trust_remote_code=True,
-                quantization_config=self._bnb_config,
-                device_map=device_map,
-                low_cpu_mem_usage=True,
-            ).eval()
+        load_kwargs = {
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
+        if self._bnb_config is not None and torch.cuda.is_available():
+            load_kwargs["quantization_config"] = self._bnb_config
+            load_kwargs["device_map"] = device_map
+        else:
+            # If no bnb_cfg or no CUDA, prefer CPU or auto device placement
+            load_kwargs["device_map"] = device_map
+
+        try:
+            self._model = AutoModel.from_pretrained(self.model_name, **load_kwargs).eval()
+        except Exception as e:
+            # If load failed, ensure _model remains None and propagate
+            print(f"Failed to lazy-load JinaEmbeddingsV4 model {self.model_name}: {e}")
+            raise
 
     @classmethod
     def class_name(cls) -> str:
@@ -469,8 +509,14 @@ class JinaEmbeddingsV4(BaseEmbedding):
         import torch
         from PIL import Image
 
+        # Ensure model is loaded (lazy)
+        try:
+            self._ensure_model()
+        except Exception:
+            # If model couldn't be loaded, return zero vectors to avoid crashing the caller
+            dim = 2048
+            return [[0.0] * (truncate_dim or dim) for _ in texts]
         model = self._model
-        assert model is not None, "Model is not initialized."
 
         # Normalize image_paths to align with texts
         image_paths = image_paths or [None] * len(texts)

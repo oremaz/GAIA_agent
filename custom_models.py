@@ -126,12 +126,21 @@ class Qwen3GGUFEmbedding(BaseEmbedding):
                 gguf_file = None
                 from huggingface_hub import list_repo_files
                 files = list_repo_files(repo_id)
-                for f in files:
-                    if f.lower().endswith('.gguf') or f.lower().endswith('.bin'):
-                        gguf_file = f
-                        break
-                if gguf_file:
-                    path = hf_hub_download(repo_id=repo_id, filename=gguf_file)
+                # Collect candidate gguf/bin files and prefer q4_k_m (then q4_k, q4_0, q4)
+                candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
+                if candidates:
+                    pref_order = ["q4_k_m", "q4_k", "q4_0", "q4"]
+                    chosen = None
+                    for p in pref_order:
+                        for f in candidates:
+                            if p in f.lower():
+                                chosen = f
+                                break
+                        if chosen:
+                            break
+                    if not chosen:
+                        chosen = candidates[0]
+                    path = hf_hub_download(repo_id=repo_id, filename=chosen)
                     from llama_cpp import Llama
                     self._llama = Llama(model_path=path)
             except Exception:
@@ -303,14 +312,41 @@ class QwenCoderGGUFLLM(CustomLLM):
                 pass
 
             # Download model repo snapshot and locate GGUF file
-            repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
-            gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
-            if not gguf_candidates:
-                gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
-            if not gguf_candidates:
-                raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
-
-            model_path = gguf_candidates[0]
+            # Prefer downloading a single q4_k_m GGUF file when available to reduce memory
+            # First try to list repo files and pick preferred variant names
+            try:
+                from huggingface_hub import list_repo_files
+                files = list_repo_files(self.model_name)
+                candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
+                fav = None
+                for p in ["q4_k_m", "q4_k", "q4_0", "q4"]:
+                    for f in candidates:
+                        if p in f.lower():
+                            fav = f
+                            break
+                    if fav:
+                        break
+                if fav:
+                    from huggingface_hub import hf_hub_download
+                    model_path = hf_hub_download(repo_id=self.model_name, filename=fav)
+                else:
+                    # fallback to snapshot/download of the repo and glob search
+                    repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
+                    gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
+                    if not gguf_candidates:
+                        gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
+                    if not gguf_candidates:
+                        raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
+                    model_path = gguf_candidates[0]
+            except Exception:
+                # fallback to snapshot_download if listing failed
+                repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
+                gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
+                if not gguf_candidates:
+                    gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
+                if not gguf_candidates:
+                    raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
+                model_path = gguf_candidates[0]
 
             # Instantiate llama_cpp Llama
             from llama_cpp import Llama

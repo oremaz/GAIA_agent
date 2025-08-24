@@ -317,7 +317,7 @@ class QwenVLCustomLLM(CustomLLM):
         output_text = self._processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        _logger.debug("Generated text: %s", output_text)
+        _logger.info("Generated text: %s", output_text)
         output_text = output_text[0] if output_text else ""
 
         output_text = _truncate_on_stop(output_text, stop)

@@ -25,6 +25,7 @@ from custom_models import (
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings
+from llama_index.core.tools import FunctionTool
 from llama_index.core.agent.workflow import ReActAgent, AgentStream
 from llama_index.core.node_parser import UnstructuredElementNodeParser, SentenceSplitter
 from llama_index.core.workflow import Context
@@ -1156,6 +1157,34 @@ async def main():
     print("=== TARGETED TEST SUMMARY ===")
     print("query:", query)
     print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
+
+    # --- Dummy ReActAgent demo (minimal) ---
+    # Define a trivial tool the agent can call
+    def add_numbers(a: int, b: int) -> int:
+        """Add two integers and return the sum."""
+        return a + b
+
+    add_tool = FunctionTool.from_defaults(
+        fn=add_numbers,
+        name="add_numbers",
+        description="Add two integers. Use this to perform simple addition."
+    )
+
+    dummy_agent = ReActAgent(
+        name="dummy_react_agent",
+        description="A minimal ReActAgent example with a single add_numbers tool",
+        system_prompt="You are a simple helper agent. When arithmetic addition is needed, call the add_numbers tool.",
+        tools=[add_tool],
+        llm=proj_llm,
+        max_steps=4,
+        verbose=True
+    )
+
+    dummy_question = "If I have 7 apples and get 5 more, what is the total? Use the tool."
+    dummy_response = dummy_agent.chat(dummy_question)
+    print("\n=== DUMMY ReActAgent DEMO ===")
+    print("Question:", dummy_question)
+    print("Agent Response:", str(dummy_response))
 
 if __name__ == '__main__':
     asyncio.run(main())

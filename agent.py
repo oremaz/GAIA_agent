@@ -619,8 +619,9 @@ class DynamicQueryEngineManager:
     def get_tool(self):
         return self.query_engine_tool
 
-# Global instance
-dynamic_qe_manager = DynamicQueryEngineManager()
+# NOTE: do NOT create a module-level DynamicQueryEngineManager here.
+# Each EnhancedGAIAAgent creates and owns its own DynamicQueryEngineManager
+# to avoid shared mutable global state.
 
 
 def search_and_extract_content_from_url(query: str) -> List[Document]:
@@ -671,7 +672,7 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
         return [Document(text=f"Error extracting content from URL: {e}",
                          metadata={"type": "web_text", "source": url})]
 
-def enhanced_web_search_and_update(query: str) -> str:
+def enhanced_web_search_and_update(query: str, manager: DynamicQueryEngineManager = None) -> str:
     """
     Performs web search, extracts content, and adds it to the dynamic query engine.
     """
@@ -683,7 +684,12 @@ def enhanced_web_search_and_update(query: str) -> str:
         # Log before adding
         logger.info("enhanced_web_search_and_update: adding %d documents from search '%s'", len(documents), query)
 
-        dynamic_qe_manager.add_documents(documents)
+        if manager is None:
+            # Create a short-lived manager when caller didn't provide one
+            temp_manager = DynamicQueryEngineManager()
+            temp_manager.add_documents(documents)
+        else:
+            manager.add_documents(documents)
 
         # Return summary of what was added
         text_docs = [doc for doc in documents if doc.metadata.get("type") == "web_text"]
@@ -700,12 +706,13 @@ def enhanced_web_search_and_update(query: str) -> str:
         logger.warning("enhanced_web_search_and_update: failed to extract content for query '%s': %s", query, error_msg)
         return f"Failed to extract web content: {error_msg}"
 
-# Create the enhanced web search tool
-enhanced_web_search_tool = FunctionTool.from_defaults(
-    fn=enhanced_web_search_and_update,
-    name="enhanced_web_search",
-    description="Search the web, extract content and images, and add them to the knowledge base for future queries."
-)
+def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager) -> FunctionTool:
+    """Factory returning a FunctionTool bound to the provided manager."""
+    return FunctionTool.from_defaults(
+        fn=lambda q: enhanced_web_search_and_update(q, manager=manager),
+        name="enhanced_web_search",
+        description="Search the web, extract content and images, and add them to the knowledge base for future queries."
+    )
 
 def safe_import(module_name):
     """Safely import a module, return None if not available"""
@@ -914,7 +921,7 @@ For example:
 
 Always add relevant content to your knowledge base, then query it for answers.""",
             tools=[
-                enhanced_web_search_tool,
+                make_enhanced_web_search_tool(self.dynamic_qe_manager),
                 self.dynamic_qe_manager.get_tool(),
                 code_execution_tool
             ],
@@ -1022,7 +1029,7 @@ Always add relevant content to your knowledge base, then query it for answers.""
 
                 # Update the agent's tools with the refreshed query engine
                 self.external_knowledge_agent.tools = [
-                    enhanced_web_search_tool,
+                    make_enhanced_web_search_tool(self.dynamic_qe_manager),
                     self.dynamic_qe_manager.get_tool(),  # Get the updated tool
                     code_execution_tool
                 ]
@@ -1126,13 +1133,11 @@ async def main():
         docs = []
         logger.exception("search_and_extract_content_from_url failed: %s", e)
 
-    # 2) Invoke the enhanced web search tool (prefer the FunctionTool's fn if present)
+    # 2) Invoke the enhanced web search tool (manager-bound)
     try:
-        if hasattr(enhanced_web_search_tool, 'fn') and callable(getattr(enhanced_web_search_tool, 'fn')):
-            tool_result = enhanced_web_search_tool.fn(query)
-        else:
-            # Fallback to calling the underlying function directly
-            tool_result = enhanced_web_search_and_update(query)
+        # Create an agent (so we have a manager) and call the manager-bound web search
+        agent_for_tool = EnhancedGAIAAgent()
+        tool_result = enhanced_web_search_and_update(query, manager=agent_for_tool.dynamic_qe_manager)
         logger.info("enhanced_web_search_tool -> result (truncated): %s", str(tool_result)[:400])
     except Exception as e:
         tool_result = f"Tool invocation failed: {e}"

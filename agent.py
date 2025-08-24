@@ -5,7 +5,6 @@ import sys
 import re
 from typing import Dict, Any, List
 from urllib.parse import urlparse
-from gaia_tools import normalize_query_payload
 import torch
 import asyncio
 import mimetypes

@@ -3,7 +3,8 @@ import logging
 import os
 import sys
 import re
-from typing import Dict, Any, List
+import hashlib
+from typing import Dict, Any, List, Optional, Set
 from urllib.parse import urlparse
 import torch
 import asyncio
@@ -451,76 +452,114 @@ def read_and_parse_content(input_path: str) -> List[Document]:
     return documents
 
 class DynamicQueryEngineManager:
-    """Single unified manager for all RAG operations - replaces the entire static approach."""
+    """Manager supporting incremental document insertion without full index rebuild each time."""
 
-    def __init__(self, initial_documents: List[str] = None):
-        self.documents = []
+    def __init__(self, initial_documents: Optional[List[str]] = None):
+        self.documents: List[Document] = []
         self.query_engine_tool = None
+        self.index: Optional[VectorStoreIndex] = None
+        self.vector_store = None  # ChromaVectorStore instance
+        self.element_parser = UnstructuredElementNodeParser()
+        if RecursiveCharacterTextSplitter is not None:
+            self.splitter = RecursiveCharacterTextSplitter(chunk_size=4096, chunk_overlap=512)
+        else:
+            self.splitter = SentenceSplitter(chunk_size=4096, chunk_overlap=512)
+        self._text_hashes: Set[str] = set()  # simple dedup on chunk text
+        self._hybrid_reranker = None
 
-        # Load initial documents if provided
         if initial_documents:
             self._load_initial_documents(initial_documents)
 
-        self._create_rag_tool()
+        self._ensure_index_initialized()
 
+    # ---- Initialization helpers ----
     def _load_initial_documents(self, document_paths: List[str]):
-        """Load initial documents using read_and_parse_content."""
         for path in document_paths:
             docs = read_and_parse_content(path)
             self.documents.extend(docs)
-        logger.info(f"Loaded {len(self.documents)} initial documents")
+        logger.info("Loaded %d initial documents", len(self.documents))
 
-    def _create_rag_tool(self):
-        """Create RAG tool using multimodal-aware parsing."""
-        documents = self.documents if self.documents else [
-            Document(text="No documents loaded yet. Use web search to add content.")
-        ]
-        logger.info(f"_create_rag_tool: starting with {len(documents)} documents")
+    def _build_hybrid_reranker(self):
+        class HybridReranker:
+            def __init__(self):
+                preferred = "jinaai/jina-reranker-m0" if NONAPI_MULTIMODAL else "jinaai/jina-reranker-v2-base-multilingual"
+                self.jina_reranker = get_or_create_jina_reranker(model_name=preferred, top_n=5, device="cpu")
 
-        # Separate text and image documents for proper processing
-        text_documents = []
-        image_documents = []
+            def postprocess_nodes(self, nodes, query_bundle):
+                try:
+                    q = getattr(query_bundle, 'query_str', None)
+                except Exception:
+                    q = None
+                logger.debug("HybridReranker.postprocess_nodes: nodes=%s query=%s", len(nodes) if nodes else 0, q)
+                return self.jina_reranker.postprocess_nodes(nodes, query_bundle)
+        self._hybrid_reranker = HybridReranker()
 
+    def _ensure_index_initialized(self):
+        if self.index is not None:
+            return
+        if not self.documents:
+            self.documents = [Document(text="No documents loaded yet. Use web search to add content.")]
+        logger.info("Initializing index with %d documents", len(self.documents))
+        nodes = self._parse_documents_to_nodes(self.documents)
+        try:
+            import chromadb
+            from chromadb.config import Settings as ChromaSettings
+            from llama_index.vector_stores.chroma import ChromaVectorStore
+            from inspect import signature
+            Client = chromadb.Client
+            chroma_client = None
+            try:
+                params = signature(Client).parameters
+                if 'settings' in params:
+                    chroma_client = Client(settings=ChromaSettings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+                elif 'persist_directory' in params or 'chroma_db_impl' in params:
+                    chroma_client = Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
+                else:
+                    chroma_client = Client()
+            except Exception:
+                try:
+                    chroma_client = chromadb.Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
+                except Exception:
+                    chroma_client = chromadb.Client()
+            collection = chroma_client.get_or_create_collection(name="gaia_collection")
+            self.vector_store = ChromaVectorStore(chroma_collection=collection)
+            self.index = VectorStoreIndex(nodes, vector_store=self.vector_store)
+            logger.info("Chroma vector store initialized (initial nodes=%d)", len(nodes))
+        except Exception as e:
+            logger.exception("Chroma init failed, using in-memory store: %s", e)
+            self.index = VectorStoreIndex(nodes)
+        self._build_hybrid_reranker()
+        self._create_or_update_query_engine_tool(rebuild=True)
+
+    # ---- Parsing ----
+    def _parse_documents_to_nodes(self, documents: List[Document]):
+        text_docs: List[Document] = []
+        image_docs: List[Document] = []
         for doc in documents:
             doc_type = doc.metadata.get("type", "")
             source = doc.metadata.get("source", "").lower()
             file_type = doc.metadata.get("file_type", "")
-
-            # Identify image documents
-            if (doc_type in ["image", "web_image"] or
-                file_type in ['jpg', 'png', 'jpeg', 'gif', 'bmp', 'webp'] or
-                any(ext in source for ext in ['.jpg', '.png', '.jpeg', '.gif', '.bmp', '.webp'])):
-                image_documents.append(doc)
+            if (doc_type in ["image", "web_image"] or file_type in ['jpg', 'png', 'jpeg', 'gif', 'bmp', 'webp'] or any(ext in source for ext in ['.jpg', '.png', '.jpeg', '.gif', '.bmp', '.webp'])):
+                image_docs.append(doc)
             else:
-                text_documents.append(doc)
-
-        logger.info(f"_create_rag_tool: {len(text_documents)} text_documents, {len(image_documents)} image_documents")
-
-        # Use UnstructuredElementNodeParser for text content with multimodal awareness
-        element_parser = UnstructuredElementNodeParser()
-        # Semantic-first chunking: try RecursiveCharacterTextSplitter, fall back to SentenceSplitter
-        if RecursiveCharacterTextSplitter is not None:
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=4096,
-                chunk_overlap=512,
-            )
-        else:
-            splitter = SentenceSplitter(chunk_size=4096, chunk_overlap=512)
+                text_docs.append(doc)
         nodes = []
-
-        # Process text documents with UnstructuredElementNodeParser
-        if text_documents:
-            initial_nodes = element_parser.get_nodes_from_documents(text_documents)
-            # If splitter supports get_nodes_from_documents use it, otherwise split text manually
+        if text_docs:
+            initial_nodes = self.element_parser.get_nodes_from_documents(text_docs)
             try:
-                final_nodes = splitter.get_nodes_from_documents(initial_nodes)
+                split_nodes = self.splitter.get_nodes_from_documents(initial_nodes)
             except Exception:
-                final_nodes = splitter.get_nodes_from_documents(initial_nodes)
-            nodes.extend(final_nodes)
-
-        # Process image documents as ImageNodes
-        if image_documents:
-            for img_doc in image_documents:
+                split_nodes = self.splitter.get_nodes_from_documents(initial_nodes)
+            # Deduplicate by text hash
+            for n in split_nodes:
+                txt = getattr(n, 'text', '') or ''
+                h = hashlib.sha1(txt.strip().lower().encode('utf-8')).hexdigest()
+                if h in self._text_hashes:
+                    continue
+                self._text_hashes.add(h)
+                nodes.append(n)
+        if image_docs:
+            for img_doc in image_docs:
                 try:
                     image_node = ImageNode(
                         text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
@@ -531,84 +570,18 @@ class DynamicQueryEngineManager:
                     nodes.append(image_node)
                 except Exception as e:
                     logger.exception("Error creating ImageNode: %s", e)
-                    # Fallback to regular TextNode for images
-                    text_node = TextNode(
-                        text=img_doc.text or f"Image content from {img_doc.metadata.get('source', 'unknown')}",
-                        metadata=img_doc.metadata
-                    )
-                    nodes.append(text_node)
+                    nodes.append(TextNode(text=img_doc.text or "Image node fallback", metadata=img_doc.metadata))
+        return nodes
 
-        logger.info(f"_create_rag_tool: built {len(nodes)} nodes")
-
-        try:
-            # Chroma Python client (chromadb) + llama_index Chroma wrapper
-            import chromadb
-            from chromadb.config import Settings as ChromaSettings
-            from llama_index.vector_stores.chroma import ChromaVectorStore
-
-
-            # Create a persistent chroma client and collection using the best available
-            # constructor for the installed chromadb version. Newer chromadb versions
-            # changed the Client constructor; try multiple signatures to be robust.
-            from inspect import signature
-            Client = chromadb.Client
-            chroma_client = None
-            try:
-                params = signature(Client).parameters
-                if 'settings' in params:
-                    # Newer API expects a 'settings' keyword
-                    chroma_client = Client(settings=ChromaSettings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
-                elif 'persist_directory' in params or 'chroma_db_impl' in params:
-                    # Older API accepts these kwargs directly
-                    chroma_client = Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
-                else:
-                    # Last resort: default constructor
-                    chroma_client = Client()
-            except Exception:
-                # If introspection fails, try a couple of common constructor forms
-                try:
-                    chroma_client = chromadb.Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
-                except Exception:
-                    chroma_client = chromadb.Client()
-
-            # Create or get a collection named 'gaia_collection'
-            collection = chroma_client.get_or_create_collection(name="gaia_collection")
-
-            chroma_store = ChromaVectorStore(chroma_collection=collection)
-
-            index = VectorStoreIndex(nodes, vector_store=chroma_store)
-            logger.info("Using Chroma vector store backend for VectorStoreIndex")
-        except Exception as e:
-            logger.exception("Chroma backend not available or failed to initialize (%s). Falling back to default VectorStoreIndex.", e)
-            index = VectorStoreIndex(nodes)
-
-        class HybridReranker:
-            def __init__(self):
-                # Choose reranker model depending on non-API multimodal flag
-                preferred = "jinaai/jina-reranker-m0" if NONAPI_MULTIMODAL else "jinaai/jina-reranker-v2-base-multilingual"
-                # Use cached reranker to avoid duplicate loads across managers
-                self.jina_reranker = get_or_create_jina_reranker(model_name=preferred, top_n=5, device="cpu")
-
-            def postprocess_nodes(self, nodes, query_bundle):
-                # Use Jina multimodal reranker for all content types
-                try:
-                    q = getattr(query_bundle, 'query_str', None)
-                except Exception:
-                    q = None
-                logger.debug(f"HybridReranker.postprocess_nodes: called with {len(nodes) if nodes is not None else 0} nodes, query={str(q)}")
-                res = self.jina_reranker.postprocess_nodes(nodes, query_bundle)
-                logger.debug(f"HybridReranker.postprocess_nodes: returned {len(res) if res is not None else 0} nodes")
-                return res
-
-        hybrid_reranker = HybridReranker()
-
-        query_engine = index.as_query_engine(
+    # ---- Query Engine Tool ----
+    def _create_or_update_query_engine_tool(self, rebuild: bool = False):
+        if self.index is None:
+            return
+        query_engine = self.index.as_query_engine(
             similarity_top_k=20,
-            node_postprocessors=[hybrid_reranker],
+            node_postprocessors=[self._hybrid_reranker] if self._hybrid_reranker else [],
             response_mode="tree_summarize"
         )
-
-        # Create QueryEngineTool
         from llama_index.core.tools import QueryEngineTool
         if self.query_engine_tool is None:
             self.query_engine_tool = QueryEngineTool.from_defaults(
@@ -622,19 +595,37 @@ class DynamicQueryEngineManager:
                 )
             )
         else:
-            # Update existing tool's query engine (attribute name is 'query_engine').
-            self.query_engine_tool.query_engine = query_engine
+            # Only swap the underlying query_engine if a rebuild occurred
+            if rebuild:
+                self.query_engine_tool.query_engine = query_engine
 
+    # ---- Public API ----
     def add_documents(self, new_documents: List[Document]):
-        """Add documents from web search and recreate tool."""
-        # Append and log a brief summary for debugging
+        self._ensure_index_initialized()
+        if not new_documents:
+            return
+        logger.info("Incremental add: %d raw documents", len(new_documents))
         self.documents.extend(new_documents)
-        logger.info("DynamicQueryEngineManager.add_documents: adding %d documents", len(new_documents))
-        for i, d in enumerate(new_documents[:3]):
-            txt = (d.text[:200] + '...') if getattr(d, 'text', None) else '<no-text>'
-            logger.debug(" new_doc[%d] source=%s type=%s text_sample=%s", i, d.metadata.get('source'), d.metadata.get('type'), txt)
-        self._create_rag_tool()  # Recreate with ALL documents
-        logger.info("Added %d documents. Total: %d", len(new_documents), len(self.documents))
+        new_nodes = self._parse_documents_to_nodes(new_documents)
+        if not new_nodes:
+            logger.info("No new unique nodes to insert (all duplicates)")
+            return
+        # Insert nodes (embeddings computed automatically by index)
+        try:
+            self.index.insert_nodes(new_nodes)
+            logger.info("Inserted %d new nodes (total docs=%d hashes=%d)", len(new_nodes), len(self.documents), len(self._text_hashes))
+        except Exception as e:
+            logger.exception("Incremental insert failed; consider rebuild: %s", e)
+            self.rebuild_all()
+
+    def rebuild_all(self):
+        """Full rebuild (e.g., after splitter config change)."""
+        logger.info("Starting full rebuild of index (%d documents)", len(self.documents))
+        self.index = None
+        self._text_hashes.clear()
+        self._ensure_index_initialized()
+        self._create_or_update_query_engine_tool(rebuild=True)
+        logger.info("Rebuild complete")
 
     def get_tool(self):
         return self.query_engine_tool
@@ -722,14 +713,8 @@ def enhanced_web_search_and_update(query: str, manager: DynamicQueryEngineManage
         return f"Failed to extract web content: {error_msg}"
 
 def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager):
-    """enhanced_web_search(query: str) -> str
-
-    Perform a web search for the provided query, extract textual (and when present image)
-    content, add it to the dynamic knowledge base, and return a brief summary of what was
-    added. Returns an error message string if extraction fails.
-    """
-
     def enhanced_web_search(query: str) -> str:
+        "Perform a web search for the provided query, extract textual (and when present image) content, add it to the dynamic knowledge base, and return a brief summary of what was added. Returns an error message string if extraction fails."
         logger.info(f"enhanced_web_search called with query: {query}")
         return enhanced_web_search_and_update(query, manager=manager)
 
@@ -923,6 +908,8 @@ class EnhancedGAIAAgent:
         # Initialize the dynamic query engine manager
         self.dynamic_qe_manager = DynamicQueryEngineManager()
 
+        self.web_tool = make_enhanced_web_search_tool(self.dynamic_qe_manager)
+
         # Create enhanced agents with dynamic tools
         self.external_knowledge_agent = ReActAgent(
             name="external_knowledge_agent",
@@ -958,7 +945,7 @@ Do NOT wrap Action Input in JSON. Do NOT add quotes or braces.
 After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer from the updated knowledge base.
 """,
             tools=[
-                make_enhanced_web_search_tool(self.dynamic_qe_manager),  
+                self.web_tool,  # Enhanced web search tool
                 self.dynamic_qe_manager.get_tool(),                      
                 execute_python_code                                    
             ],

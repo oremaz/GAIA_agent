@@ -316,7 +316,9 @@ class QwenVLCustomLLM(CustomLLM):
         generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
         output_text = self._processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0]
+        )
+        _logger.debug("Generated text: %s", output_text)
+        output_text = output_text[0] if output_text else ""
 
         output_text = _truncate_on_stop(output_text, stop)
         return CompletionResponse(text=output_text)

@@ -894,6 +894,16 @@ class JinaEmbeddingsV4(BaseEmbedding):
                     emb = model.encode_text(**kwargs)
                     results.append(_to_list_vector(emb))
 
+        # Try to free any cached GPU memory after encoding to avoid incremental growth
+        if torch.cuda.is_available():
+            try:
+                before = torch.cuda.memory_allocated()
+                torch.cuda.empty_cache()
+                after = torch.cuda.memory_allocated()
+                _logger.info("JinaEmbeddingsV4._embed: cuda_memory_before_empty=%s after_empty=%s", before, after)
+            except Exception:
+                pass
+
         return results
 
     def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:

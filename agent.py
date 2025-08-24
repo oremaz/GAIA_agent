@@ -514,8 +514,29 @@ class DynamicQueryEngineManager:
             from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
-            # Create a persistent chroma client and collection using ChromaSettings
-            chroma_client = chromadb.Client(ChromaSettings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+            # Create a persistent chroma client and collection using the best available
+            # constructor for the installed chromadb version. Newer chromadb versions
+            # changed the Client constructor; try multiple signatures to be robust.
+            from inspect import signature
+            Client = chromadb.Client
+            chroma_client = None
+            try:
+                params = signature(Client).parameters
+                if 'settings' in params:
+                    # Newer API expects a 'settings' keyword
+                    chroma_client = Client(settings=ChromaSettings(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db"))
+                elif 'persist_directory' in params or 'chroma_db_impl' in params:
+                    # Older API accepts these kwargs directly
+                    chroma_client = Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
+                else:
+                    # Last resort: default constructor
+                    chroma_client = Client()
+            except Exception:
+                # If introspection fails, try a couple of common constructor forms
+                try:
+                    chroma_client = chromadb.Client(chroma_db_impl="duckdb+parquet", persist_directory="./chroma_db")
+                except Exception:
+                    chroma_client = chromadb.Client()
 
             # Create or get a collection named 'gaia_collection'
             collection = chroma_client.get_or_create_collection(name="gaia_collection")

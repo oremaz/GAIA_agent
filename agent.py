@@ -1145,30 +1145,30 @@ async def main():
     # 2) enhanced_web_search_tool (invoke the underlying function)
     # 3) EnhancedGAIAAgent.solve_gaia_question (async)
 
-    query = "Mercedes Sosa studio albums 2000-2009"
+    #query = "Mercedes Sosa studio albums 2000-2009"
 
-    logger.info("Starting targeted tests for query: %s", query)
+    #logger.info("Starting targeted tests for query: %s", query)
 
     # 2) Test the full agent pipeline: create an agent and ask it to solve the GAIA question
-    try:
-        agent_for_tool = EnhancedGAIAAgent()
-        question_data = {"Question": query, "task_id": ""}
+    #try:
+        #agent_for_tool = EnhancedGAIAAgent()
+        #question_data = {"Question": query, "task_id": ""}
         # solve_gaia_question is async; await it inside this async main with a timeout
-        try:
-            final_response = await agent_for_tool.solve_gaia_question(question_data)
-            tool_result = final_response
-            logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
-        except Exception as e:
-            tool_result = f"solve_gaia_question failed or timed out: {e}"
-            logger.exception("solve_gaia_question invocation failed: %s", e)
-    except Exception as e:
-        tool_result = f"Tool invocation failed: {e}"
-        logger.exception("solve_gaia_question invocation failed: %s", e)
+        #try:
+            #final_response = await agent_for_tool.solve_gaia_question(question_data)
+            #tool_result = final_response
+            #logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
+        #except Exception as e:
+            #tool_result = f"solve_gaia_question failed or timed out: {e}"
+            #logger.exception("solve_gaia_question invocation failed: %s", e)
+    #except Exception as e:
+        #tool_result = f"Tool invocation failed: {e}"
+        #logger.exception("solve_gaia_question invocation failed: %s", e)
 
     # Print concise summary for quick inspection
-    print("=== TARGETED TEST SUMMARY ===")
-    print("query:", query)
-    print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
+    #print("=== TARGETED TEST SUMMARY ===")
+    #print("query:", query)
+    #print("enhanced_web_search_tool -> sample:", str(tool_result)[:400])
 
     # --- Dummy ReActAgent demo (minimal) ---
     # Define a trivial tool the agent can call

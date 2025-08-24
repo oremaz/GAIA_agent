@@ -1141,16 +1141,17 @@ async def main():
 
     logger.info("Starting targeted tests for query: %s", query)
 
-
-    # 2) Invoke the enhanced web search tool (manager-bound)
+    # 2) Test the full agent pipeline: create an agent and ask it to solve the GAIA question
     try:
-        # Create an agent (so we have a manager) and call the manager-bound web search
         agent_for_tool = EnhancedGAIAAgent()
-        tool_result = enhanced_web_search_and_update(query, manager=agent_for_tool.dynamic_qe_manager)
-        logger.info("enhanced_web_search_tool -> result (truncated): %s", str(tool_result)[:400])
+        question_data = {"Question": query, "task_id": ""}
+        # solve_gaia_question is async; await it inside this async main
+        final_response = await agent_for_tool.solve_gaia_question(question_data)
+        tool_result = final_response
+        logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
     except Exception as e:
         tool_result = f"Tool invocation failed: {e}"
-        logger.exception("enhanced_web_search_tool invocation failed: %s", e)
+        logger.exception("solve_gaia_question invocation failed: %s", e)
 
     # Print concise summary for quick inspection
     print("=== TARGETED TEST SUMMARY ===")

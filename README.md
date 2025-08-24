@@ -85,7 +85,7 @@ Concise, code-driven comparison (accurate to the repository):
 - smolagents variant (file: `agent2.py`)
 	- Pattern: Tool-first, multi-agent orchestration. Agents are composed from explicit tools and managed agents rather than implicitly querying a central vector KB.
 	- Key components (exact symbols in `agent2.py`):
-        - Tools: `WebSearchTool`, `visit_webpage`, `get_youtube_transcript`, `UnifiedMultimodalTool`, `FinalAnswerTool`, `ChromaBM25HybridRetrieverTool` (Chroma + BM25 hybrid used for local text chunks; alpha=0.5 by default).
+	- Tools: `WebSearchTool`, `visit_webpage`, `get_youtube_transcript`, `UnifiedMultimodalTool`, `FinalAnswerTool`, `ChromaBM25HybridRetrieverTool` (uses LangChain's `EnsembleRetriever` to combine Chroma and BM25 retrievers; alpha=0.5 by default).
 		- Agents: `CodeAgent` (coder), `ToolCallingAgent` (retriever/runner) and a high-level `ToolCallingAgent` that can manage `managed_agents` like the coder and retriever.
 		- Observability: Langfuse/OpenTelemetry setup in `_setup_langfuse_observability()` and instrumentation via `SmolagentsInstrumentor`.
 
@@ -139,7 +139,7 @@ Below are concise architecture diagrams and component roles for each supported c
 	- `CodeAgent` — dedicated to performing Python code execution tasks via `PythonInterpreterTool`.
 	- `ToolCallingAgent` / `ToolCallingAgent` (higher-level agent) — routes queries to tools like `BM25RetrieverTool`, `WebSearchTool`, `UnifiedMultimodalTool` and the coder agent.
 	- `UnifiedMultimodalTool` — handles audio/video/image processing using the cloud files API or inline processing.
- - Retrieval: Chroma + BM25 hybrid retriever in `agent2.py` (`ChromaBM25HybridRetrieverTool`). `agent2.load_documents_from_file()` creates a local Chroma vectorstore from document chunks (dense) and a BM25 retriever (lexical) and attaches a hybrid tool that merges scores. The `alpha` parameter (default 0.5) controls the relative weight of dense vs lexical scoring. If you prefer purely lexical or purely dense retrieval, set alpha to 0.0 or 1.0 respectively in the tool constructor.
+	- Retrieval: Chroma + BM25 hybrid retriever in `agent2.py` (`ChromaBM25HybridRetrieverTool`). The tool composes the Chroma retriever (via `chroma.as_retriever(...)`) and the `BM25Retriever` into a LangChain `EnsembleRetriever` and uses the ensemble to fetch relevant Documents. The `alpha` parameter (default 0.5) is used to build ensemble weights (dense weight = alpha, lexical weight = 1-alpha).
 - Observability: Langfuse + OpenTelemetry added to trace agent flows and outputs.
 - When to use: local dev or API-first setups where you prefer explicit tool contracts, multi-agent orchestration, and observability.
 

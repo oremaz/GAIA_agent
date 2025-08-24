@@ -6,6 +6,7 @@ from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 from smolagents import CodeAgent, OpenAIServerModel, Tool, ToolCallingAgent
 from smolagents import PythonInterpreterTool
 
@@ -513,6 +514,30 @@ class ChromaBM25HybridRetrieverTool(Tool):
         self.bm25 = bm25
         self.top_k = top_k
         self.alpha = float(alpha)
+        # Build an EnsembleRetriever from the provided retrievers. Assume both retrievers are available.
+        chroma_retriever = None
+        bm25_retriever = None
+        if self.chroma:
+            try:
+                # Chroma provides an as_retriever helper
+                chroma_retriever = self.chroma.as_retriever(search_kwargs={"k": self.top_k})
+            except Exception:
+                # fallback to using similarity methods via a small adapter (not needed per user instruction)
+                chroma_retriever = None
+
+        if self.bm25:
+            bm25_retriever = self.bm25
+
+        # Create EnsembleRetriever with weights: dense (chroma) weight = alpha, lexical (bm25) weight = 1-alpha
+        retrievers = [r for r in (chroma_retriever, bm25_retriever) if r is not None]
+        weights = []
+        if chroma_retriever is not None:
+            weights.append(self.alpha)
+        if bm25_retriever is not None:
+            weights.append(1.0 - self.alpha)
+
+        # Construct the ensemble retriever
+        self.ensemble = EnsembleRetriever(retrievers=retrievers, weights=weights) if retrievers else None
 
     def _doc_uid(self, d: Document):
         if d.metadata and isinstance(d.metadata, dict):
@@ -520,106 +545,17 @@ class ChromaBM25HybridRetrieverTool(Tool):
         return ('', d.page_content[:200])
 
     def forward(self, query: str) -> str:
-        if not (self.chroma or self.bm25):
+        if not self.ensemble:
             return "No documents loaded for retrieval."
 
         assert isinstance(query, str), "Your search query must be a string"
 
-        dense_results = []  # list of (doc, score)
-        lexical_results = []  # list of (doc, score)
-
-        # Get dense scores from Chroma if available
-        if self.chroma:
-            try:
-                if hasattr(self.chroma, 'similarity_search_with_score'):
-                    dense_results = self.chroma.similarity_search_with_score(query, k=self.top_k)
-                else:
-                    docs = self.chroma.similarity_search(query, k=self.top_k)
-                    dense_results = [(d, 1.0) for d in docs]
-            except Exception:
-                dense_results = []
-
-        # Get lexical scores from BM25 if available
-        if self.bm25:
-            try:
-                # Some BM25 implementations expose a scoring API
-                if hasattr(self.bm25, 'get_relevant_documents_with_score'):
-                    lexical_results = self.bm25.get_relevant_documents_with_score(query)
-                elif hasattr(self.bm25, 'get_relevant_documents'):
-                    docs = self.bm25.get_relevant_documents(query)
-                    # assign decreasing scores based on rank
-                    lexical_results = [(d, float(max(0, self.top_k - i))) for i, d in enumerate(docs[: self.top_k])]
-                else:
-                    docs = self.bm25(query)
-                    lexical_results = [(d, float(max(0, self.top_k - i))) for i, d in enumerate(docs[: self.top_k])]
-            except Exception:
-                lexical_results = []
-
-        # Build maps doc_uid -> best dense score / lexical score
-        dense_map = {}
-        for d, s in dense_results:
-            uid = self._doc_uid(d)
-            dense_map[uid] = max(dense_map.get(uid, float('-inf')), float(s))
-
-        lexical_map = {}
-        for d, s in lexical_results:
-            uid = self._doc_uid(d)
-            lexical_map[uid] = max(lexical_map.get(uid, float('-inf')), float(s))
-
-        # Collect all unique uids and corresponding Document instances
-        docs_by_uid = {}
-        for d, _ in dense_results:
-            docs_by_uid[self._doc_uid(d)] = d
-        for d, _ in lexical_results:
-            docs_by_uid.setdefault(self._doc_uid(d), d)
-
-        if not docs_by_uid:
+        # Use EnsembleRetriever to get relevant documents. Slice to top_k to keep behaviour consistent.
+        docs = self.ensemble.get_relevant_documents(query)
+        if not docs:
             return "No relevant documents found."
 
-        # Normalize scores to 0..1
-        def normalize_map(m):
-            if not m:
-                return {}
-            vals = list(m.values())
-            mn = min(vals)
-            mx = max(vals)
-            if mx == mn:
-                # everything same score -> map to 1.0
-                return {k: 1.0 for k in m}
-            # If scores look like distances (larger is worse), invert by 1/(1+score)
-            # Heuristic: if average > 1.0 treat as distance and invert
-            avg = sum(vals) / len(vals)
-            if avg > 1.0:
-                inv = {k: 1.0 / (1.0 + v) for k, v in m.items()}
-                vmin = min(inv.values())
-                vmax = max(inv.values())
-                return {k: (val - vmin) / (vmax - vmin) if vmax != vmin else 1.0 for k, val in inv.items()}
-            else:
-                return {k: (v - mn) / (mx - mn) for k, v in m.items()}
-
-        norm_dense = normalize_map(dense_map)
-        norm_lex = normalize_map(lexical_map)
-
-        # Compute hybrid score
-        hybrid_scores = {}
-        for uid in docs_by_uid.keys():
-            dscore = norm_dense.get(uid, 0.0)
-            lscore = norm_lex.get(uid, 0.0)
-            # If one of the modalities is missing, rely on the other
-            if (dscore == 0.0) and (lscore == 0.0):
-                score = 0.0
-            elif (dscore == 0.0):
-                score = lscore
-            elif (lscore == 0.0):
-                score = dscore
-            else:
-                score = self.alpha * dscore + (1.0 - self.alpha) * lscore
-            hybrid_scores[uid] = score
-
-        # Sort by hybrid score desc
-        sorted_uids = sorted(hybrid_scores.items(), key=lambda kv: kv[1], reverse=True)
-
-        results = [docs_by_uid[uid] for uid, _ in sorted_uids[: self.top_k]]
+        results = docs[: self.top_k]
 
         return "\nRetrieved documents:\n" + "".join([
             f"\n\n===== Document {str(i)} =====\n" + doc.page_content

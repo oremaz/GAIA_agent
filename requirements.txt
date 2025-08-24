@@ -32,7 +32,6 @@ llama-index==0.13.2
 llama-index-core==0.13.2
 llama-index-llms-huggingface==0.6.0
 llama-index-embeddings-huggingface==0.6.0
-llama-index-callbacks-wandb==0.4.0
 llama-index-tools-arxiv==0.4.0
 llama-index-readers-file==0.5.0
 llama-index-readers-web==0.5.0
@@ -44,6 +43,7 @@ llama-index-llms-gemini==0.6.0
 llama-index-embeddings-gemini==0.4.0
 llama-index-llms-vllm==0.6.0
 llama-cloud-services==0.6.54
+llama-index-vector-stores-chroma == 0.5.1
 
 pymupdf==1.22.0
 pypdf==5.9.0
@@ -66,7 +66,7 @@ requests==2.32.3
 trafilatura==2.0.0
 arxiv==2.2.0
 
-weave==0.51.0
+weave
 
 numpy==1.26.4
 scipy==1.16.1

@@ -26,8 +26,6 @@ from custom_models import (
 from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.core.agent.workflow import ReActAgent, AgentStream
 from llama_index.core.node_parser import UnstructuredElementNodeParser, SentenceSplitter
-from llama_index.core.postprocessor import SentenceTransformerRerank
-from llama_index.core.tools import FunctionTool
 from llama_index.core.workflow import Context
 from llama_index.core.schema import ImageNode, TextNode
 
@@ -612,17 +610,20 @@ class DynamicQueryEngineManager:
 
         # Create QueryEngineTool
         from llama_index.core.tools import QueryEngineTool
-
-        self.query_engine_tool = QueryEngineTool.from_defaults(
-            query_engine=query_engine,
-            name="dynamic_hybrid_multimodal_rag_tool",
-            description=(
-                "Advanced dynamic knowledge base with multimodal reranking. "
-                "Uses Jina reranker-m0 for unified text and visual content reranking. "
-                "Supports text-to-text, text-to-image, image-to-text, and image-to-image ranking. "
-                "Automatically updated with web search content."
+        if self.query_engine_tool is None:
+            self.query_engine_tool = QueryEngineTool.from_defaults(
+                query_engine=query_engine,
+                name="dynamic_hybrid_multimodal_rag_tool",
+                description=(
+                    "Advanced dynamic knowledge base with multimodal reranking. "
+                    "Uses Jina reranker-m0 for unified text and visual content reranking. "
+                    "Supports text-to-text, text-to-image, image-to-text, and image-to-image ranking. "
+                    "Automatically updated with web search content."
+                )
             )
-        )
+        else:
+            # Update existing tool's query engine (attribute name is 'query_engine').
+            self.query_engine_tool.query_engine = query_engine
 
     def add_documents(self, new_documents: List[Document]):
         """Add documents from web search and recreate tool."""
@@ -637,11 +638,6 @@ class DynamicQueryEngineManager:
 
     def get_tool(self):
         return self.query_engine_tool
-
-# NOTE: do NOT create a module-level DynamicQueryEngineManager here.
-# Each EnhancedGAIAAgent creates and owns its own DynamicQueryEngineManager
-# to avoid shared mutable global state.
-
 
 def search_and_extract_content_from_url(query: str) -> List[Document]:
     logger.info(f"[web] start search: {query}")
@@ -725,18 +721,20 @@ def enhanced_web_search_and_update(query: str, manager: DynamicQueryEngineManage
         logger.warning("enhanced_web_search_and_update: failed to extract content for query '%s': %s", query, error_msg)
         return f"Failed to extract web content: {error_msg}"
 
-def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager) -> FunctionTool:
-    """Factory returning a FunctionTool bound to the provided manager."""
-    # Wrap the tool function so it tolerates different Action Input shapes emitted by
-    # various ReAct parsers / LlamaIndex versions. Delegate normalization to gaia_tools.normalize_query_payload
-    def _enhanced_web_search_wrapper(query: str) -> str:
+def make_enhanced_web_search_tool(manager: DynamicQueryEngineManager):
+    """enhanced_web_search(query: str) -> str
+
+    Perform a web search for the provided query, extract textual (and when present image)
+    content, add it to the dynamic knowledge base, and return a brief summary of what was
+    added. Returns an error message string if extraction fails.
+    """
+
+    def enhanced_web_search(query: str) -> str:
         return enhanced_web_search_and_update(query, manager=manager)
 
-    return FunctionTool.from_defaults(
-        fn=_enhanced_web_search_wrapper,
-        name="enhanced_web_search",
-        description="Search the web, extract content and images, and add them to the knowledge base for future queries."
-    )
+    # Provide a stable function name for tool display
+    enhanced_web_search.__name__ = "enhanced_web_search"
+    return enhanced_web_search
 
 def safe_import(module_name):
     """Safely import a module, return None if not available"""
@@ -813,21 +811,22 @@ if safe_globals.get("PIL"):
         safe_globals["Image"] = image_module
 
 def execute_python_code(code: str) -> str:
+    """python_code_execution(code: str) -> str
+
+    Execute arbitrary Python code inside a restricted global namespace containing only
+    a curated subset of safe builtins and optionally-available data/ML libraries.
+    If the executed code defines a variable named 'result', its string value is returned;
+    otherwise a generic success message is returned. Any exception is caught and its
+    message returned prefixed with 'Code execution failed'.
+    """
     try:
         exec_locals = {}
         exec(code, safe_globals, exec_locals)
         if 'result' in exec_locals:
             return str(exec_locals['result'])
-        else:
-            return "Code executed successfully"
+        return "Code executed successfully"
     except Exception as e:
         return f"Code execution failed: {str(e)}"
-
-code_execution_tool = FunctionTool.from_defaults(
-    fn=execute_python_code,
-    name="Python Code Execution",
-    description="Executes Python code safely for calculations and data processing"
-)
 
 def clean_response(response: str) -> str:
     """Clean response by removing common prefixes"""
@@ -958,9 +957,9 @@ Do NOT wrap Action Input in JSON. Do NOT add quotes or braces.
 After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer from the updated knowledge base.
 """,
             tools=[
-                make_enhanced_web_search_tool(self.dynamic_qe_manager),
-                self.dynamic_qe_manager.get_tool(),
-                code_execution_tool
+                make_enhanced_web_search_tool(self.dynamic_qe_manager),  
+                self.dynamic_qe_manager.get_tool(),                      
+                execute_python_code                                    
             ],
             llm=proj_llm,
             max_steps=8,
@@ -971,7 +970,7 @@ After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer fro
             name="code_agent",
             description="Handles Python code for calculations and data processing",
             system_prompt="You are a Python programming specialist. You work with Python code to perform calculations, data analysis, and mathematical operations.",
-            tools=[code_execution_tool],
+            tools=[execute_python_code],
             llm=code_llm,
             max_steps=6,
             verbose=True
@@ -1063,14 +1062,7 @@ After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer fro
             if documents:
                 self.dynamic_qe_manager.add_documents(documents)
                 logger.info(f"Added {len(documents)} documents from {file_path} to dynamic knowledge base")
-
-                # Update the agent's tools with the refreshed query engine
-                self.external_knowledge_agent.tools = [
-                    make_enhanced_web_search_tool(self.dynamic_qe_manager),
-                    self.dynamic_qe_manager.get_tool(),  # Get the updated tool
-                    code_execution_tool
-                ]
-
+                # No need to replace the tools list; QueryEngineTool is updated in-place.
                 return True
         except Exception as e:
             logger.exception("Failed to add documents from %s: %s", file_path, e)

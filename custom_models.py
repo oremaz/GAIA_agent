@@ -111,7 +111,9 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 
 def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return cached QwenVLCustomLLM or create one (lazy-load inside the class)."""
-    key = (model_name or QwenVLCustomLLM.model_name, device or "auto")
+    # Avoid accessing Pydantic-model attributes at import time (AttributeError).
+    # Use the same default literal as defined in the class to form the cache key.
+    key = (model_name or "Qwen/Qwen2.5-VL-32B-Instruct-AWQ", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -150,7 +152,8 @@ def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional
 
 def get_or_create_gemma3_llm(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return cached Gemma3CustomLLM or create one."""
-    key = (model_name or Gemma3CustomLLM.model_name, device or "auto")
+    # Use literal default to avoid referencing Pydantic class attrs at import time
+    key = (model_name or "google/gemma-3-27b-it", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -189,7 +192,8 @@ def get_or_create_gemma3_llm(model_name: Optional[str] = None, device: Optional[
 
 def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: str = "cpu"):
     """Return cached QwenCoderGGUFLLM or create one."""
-    key = (model_name or QwenCoderGGUFLLM.model_name, device)
+    # Use literal default to avoid Pydantic class attribute access at import
+    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", device)
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -228,7 +232,8 @@ def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: 
 
 def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
     """Return cached Qwen3GGUFEmbedding or create one."""
-    key = (model_name or Qwen3GGUFEmbedding.model_name,)
+    # Literal default to avoid accessing Pydantic attributes at import time
+    key = (model_name or "Qwen/Qwen3-Embedding-0.6B-GGUF",)
     inst = _EMBEDDER_CACHE.get(key)
     if inst is not None:
         return inst

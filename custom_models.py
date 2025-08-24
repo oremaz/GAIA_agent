@@ -19,6 +19,7 @@ _logger = logging.getLogger(__name__)
 # Module-level caches to avoid creating multiple heavyweight model instances
 _EMBEDDER_CACHE = {}
 _RERANKER_CACHE = {}
+_LLM_CACHE = {}
 
 
 def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Optional[str] = None):
@@ -107,6 +108,146 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
         _RERANKER_CACHE[key] = inst
         return inst
 
+
+def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached QwenVLCustomLLM or create one (lazy-load inside the class)."""
+    key = (model_name or QwenVLCustomLLM.model_name, device or "auto")
+    inst = _LLM_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    with _CACHE_LOCK:
+        inst = _LLM_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating QwenVLCustomLLM for key=%s", key)
+        try:
+            before_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_alloc = None
+
+            inst = QwenVLCustomLLM(model_name=key[0])
+            # record after-instantiation allocation (model still lazy until first call)
+            after_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    after_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                after_alloc = None
+
+            _logger.info("QwenVLCustomLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+        except Exception:
+            _logger.exception("Failed to create QwenVLCustomLLM for key=%s", key)
+            raise
+
+        _LLM_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_gemma3_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached Gemma3CustomLLM or create one."""
+    key = (model_name or Gemma3CustomLLM.model_name, device or "auto")
+    inst = _LLM_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    with _CACHE_LOCK:
+        inst = _LLM_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating Gemma3CustomLLM for key=%s", key)
+        try:
+            before_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_alloc = None
+
+            inst = Gemma3CustomLLM(model_name=key[0])
+
+            after_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    after_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                after_alloc = None
+
+            _logger.info("Gemma3CustomLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+        except Exception:
+            _logger.exception("Failed to create Gemma3CustomLLM for key=%s", key)
+            raise
+
+        _LLM_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: str = "cpu"):
+    """Return cached QwenCoderGGUFLLM or create one."""
+    key = (model_name or QwenCoderGGUFLLM.model_name, device)
+    inst = _LLM_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    with _CACHE_LOCK:
+        inst = _LLM_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating QwenCoderGGUFLLM for key=%s", key)
+        try:
+            before_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    before_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                before_alloc = None
+
+            inst = QwenCoderGGUFLLM(model_name=key[0])
+
+            after_alloc = None
+            try:
+                if torch.cuda.is_available():
+                    after_alloc = torch.cuda.memory_allocated()
+            except Exception:
+                after_alloc = None
+
+            _logger.info("QwenCoderGGUFLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+        except Exception:
+            _logger.exception("Failed to create QwenCoderGGUFLLM for key=%s", key)
+            raise
+
+        _LLM_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
+    """Return cached Qwen3GGUFEmbedding or create one."""
+    key = (model_name or Qwen3GGUFEmbedding.model_name,)
+    inst = _EMBEDDER_CACHE.get(key)
+    if inst is not None:
+        return inst
+
+    with _CACHE_LOCK:
+        inst = _EMBEDDER_CACHE.get(key)
+        if inst is not None:
+            return inst
+
+        _logger.info("Creating Qwen3GGUFEmbedding for key=%s", key)
+        try:
+            inst = Qwen3GGUFEmbedding(model_name=key[0])
+        except Exception:
+            _logger.exception("Failed to create Qwen3GGUFEmbedding for key=%s", key)
+            raise
+
+        _EMBEDDER_CACHE[key] = inst
+        return inst
+
 class QwenVLCustomLLM(CustomLLM):
     model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
     context_window: int = Field(default=32768)
@@ -116,11 +257,22 @@ class QwenVLCustomLLM(CustomLLM):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Pre-load housekeeping to reduce memory spikes and fragmentation
+        # Defer heavy HF model loads until first use (lazy init)
+        self._model = None
+        self._processor = None
+        self._loaded = False
+
+    def _ensure_model(self):
+        """Lazy-load the Qwen VL HF model and processor on first use."""
+        if getattr(self, "_loaded", False):
+            return
         import gc, os
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
         load_kwargs = {"device_map": "auto", "trust_remote_code": True, "low_cpu_mem_usage": True}
@@ -130,6 +282,7 @@ class QwenVLCustomLLM(CustomLLM):
             **load_kwargs,
         )
         self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
+        self._loaded = True
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -146,6 +299,9 @@ class QwenVLCustomLLM(CustomLLM):
         image_paths: Optional[List[str]] = None,
         **kwargs: Any
     ) -> CompletionResponse:
+        # Ensure model is loaded lazily
+        self._ensure_model()
+
         # Prepare multimodal input
         messages = [{"role": "user", "content": []}]
         if image_paths:
@@ -180,6 +336,8 @@ class QwenVLCustomLLM(CustomLLM):
         image_paths: Optional[List[str]] = None,
         **kwargs: Any
     ) -> CompletionResponseGen:
+        # Ensure model is loaded lazily
+        self._ensure_model()
         response = self.complete(prompt, image_paths)
         for token in response.text:
             yield CompletionResponse(text=token, delta=token)
@@ -286,45 +444,50 @@ class Gemma3CustomLLM(CustomLLM):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # Prepare a BitsAndBytesConfig for 4-bit quantized load when possible
+        # Prepare BitsAndBytes config placeholder; actual loading deferred to _ensure_model
         try:
-            bnb_cfg = BitsAndBytesConfig(
+            self._bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
         except Exception:
-            bnb_cfg = None
+            self._bnb_config = None
 
-        try:
-            # Pre-load housekeeping: collect GC and free CUDA cache to reduce OOM risk
-            import gc, os
-            gc.collect()
-            if torch.cuda.is_available():
+        # Defer heavy HF model and processor loading until first completion call
+        self._model = None
+        self._processor = None
+        self._loaded = False
+
+    def _ensure_model(self):
+        if getattr(self, "_loaded", False):
+            return
+        import gc, os
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
                 torch.cuda.empty_cache()
-            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+            except Exception:
+                pass
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
-            from transformers import Gemma3ForConditionalGeneration
+        from transformers import Gemma3ForConditionalGeneration
 
-            load_kwargs = {"device_map": "auto", "trust_remote_code": True}
-            if bnb_cfg is not None and torch.cuda.is_available():
-                load_kwargs["quantization_config"] = bnb_cfg
+        load_kwargs = {"device_map": "auto", "trust_remote_code": True}
+        if self._bnb_config is not None and torch.cuda.is_available():
+            load_kwargs["quantization_config"] = self._bnb_config
 
-            # Load model (prefer 4-bit quantized when possible)
-            self._model = Gemma3ForConditionalGeneration.from_pretrained(
-                self.model_name,
-                **load_kwargs,
-                low_cpu_mem_usage=True,
-            ).eval()
+        # Load model (prefer 4-bit quantized when possible)
+        self._model = Gemma3ForConditionalGeneration.from_pretrained(
+            self.model_name,
+            **load_kwargs,
+            low_cpu_mem_usage=True,
+        ).eval()
 
-            # Processor for multimodal inputs
-            self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
-
-        except Exception as e:
-            # Surface the error for debugging in environments without HF weights
-            print(f"Failed to initialize Gemma3CustomLLM: {e}")
-            raise
+        # Processor for multimodal inputs
+        self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
+        self._loaded = True
 
     @property
     def metadata(self) -> LLMMetadata:
@@ -336,6 +499,9 @@ class Gemma3CustomLLM(CustomLLM):
 
     @llm_completion_callback()
     def complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
+        # Ensure model is loaded lazily
+        self._ensure_model()
+
         # Build chat-style messages: system + user content (images then text)
         messages = [{"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]}]
         user_content = []
@@ -366,6 +532,8 @@ class Gemma3CustomLLM(CustomLLM):
 
     @llm_completion_callback()
     def stream_complete(self, prompt: str, image_paths: Optional[List[str]] = None, **kwargs: Any):
+        # Ensure model loaded
+        self._ensure_model()
         resp = self.complete(prompt, image_paths=image_paths, **kwargs)
         # Yield tokens/characters as delta to match previous streaming behavior
         for ch in resp.text:
@@ -392,51 +560,37 @@ class QwenCoderGGUFLLM(CustomLLM):
         super().__init__(**kwargs)
         if model_name:
             self.model_name = model_name
+        # Defer heavy GGUF download / llama_cpp instantiation until first use
+        self._llm = None
+        self._gguf_path = None
 
+    def _ensure_llm(self):
+        if self._llm is not None:
+            return
+        import gc
+        import glob
         try:
-            # Local imports to avoid import-time dependency on llama_cpp when not used.
-            import gc
-            import glob
-            from huggingface_hub import snapshot_download
-
-            # Keep housekeeping to reduce fragmentation
+            from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
             gc.collect()
             try:
-                import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
                 pass
 
-            # Download model repo snapshot and locate GGUF file
-            # Prefer downloading a single q4_k_m GGUF file when available to reduce memory
-            # First try to list repo files and pick preferred variant names
-            try:
-                from huggingface_hub import list_repo_files
-                files = list_repo_files(self.model_name)
-                candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
-                fav = None
-                for p in ["q4_k_m", "q4_k", "q4_0", "q4"]:
-                    for f in candidates:
-                        if p in f.lower():
-                            fav = f
-                            break
-                    if fav:
+            files = list_repo_files(self.model_name)
+            candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
+            fav = None
+            for p in ["q4_k_m", "q4_k", "q4_0", "q4"]:
+                for f in candidates:
+                    if p in f.lower():
+                        fav = f
                         break
                 if fav:
-                    from huggingface_hub import hf_hub_download
-                    model_path = hf_hub_download(repo_id=self.model_name, filename=fav)
-                else:
-                    # fallback to snapshot/download of the repo and glob search
-                    repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
-                    gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
-                    if not gguf_candidates:
-                        gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
-                    if not gguf_candidates:
-                        raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
-                    model_path = gguf_candidates[0]
-            except Exception:
-                # fallback to snapshot_download if listing failed
+                    break
+            if fav:
+                model_path = hf_hub_download(repo_id=self.model_name, filename=fav)
+            else:
                 repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
                 gguf_candidates = glob.glob(f"{repo_dir}/*.gguf")
                 if not gguf_candidates:
@@ -445,9 +599,9 @@ class QwenCoderGGUFLLM(CustomLLM):
                     raise RuntimeError(f"No .gguf file found for {self.model_name} in {repo_dir}")
                 model_path = gguf_candidates[0]
 
-            # Instantiate llama_cpp Llama
             from llama_cpp import Llama
             self._llm = Llama(model_path=model_path)
+            self._gguf_path = model_path
         except Exception as e:
             raise RuntimeError(f"Failed to initialize QwenCoderGGUFLLM: {e}")
 
@@ -461,8 +615,9 @@ class QwenCoderGGUFLLM(CustomLLM):
 
     @llm_completion_callback()
     def complete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
+        # Ensure GGUF/llama is initialized lazily
         if self._llm is None:
-            raise RuntimeError("llama_cpp model not initialized")
+            self._ensure_llm()
         try:
             resp = self._llm.create(prompt=prompt, max_tokens=self.num_output)
             text = ""
@@ -497,58 +652,88 @@ class JinaEmbeddingsV4(BaseEmbedding):
 
     # Keep a handle to the HF model (initialized lazily)
     _model = PrivateAttr(default=None)
+    # Thread-safe lazy-init helpers
+    _loaded = PrivateAttr(default=False)
+    _model_lock = PrivateAttr(default=None)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         # Do minimal work in constructor; defer heavy HF loads to _ensure_model
         self._bnb_config = None
+        # Per-instance lock to avoid races when multiple threads try to lazy-load
+        try:
+            self._model_lock = threading.Lock()
+        except Exception:
+            self._model_lock = None
+        self._loaded = False
 
     def _ensure_model(self):
         """Lazy initialize the underlying HF model. Safe to call multiple times."""
         import torch
         from transformers import AutoModel
+        import gc, os
 
-        if getattr(self, "_model", None) is not None:
+        # Fast-path: already loaded
+        if getattr(self, "_loaded", False):
             return
 
-        # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
-        import gc, os
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
-
-        # Prepare BitsAndBytes config if possible
+        # Acquire lock if available to avoid concurrent initialization
+        lock = getattr(self, "_model_lock", None)
+        if lock is not None:
+            lock.acquire()
         try:
-            self._bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-        except Exception:
-            self._bnb_config = None
+            # Double-check after acquiring lock
+            if getattr(self, "_loaded", False):
+                return
 
-        # Choose device map: explicit single-device map when CUDA is available
-        device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+            # Pre-load housekeeping to reduce CPU/GPU memory fragmentation
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
 
-        load_kwargs = {
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-        }
-        if self._bnb_config is not None and torch.cuda.is_available():
-            load_kwargs["quantization_config"] = self._bnb_config
-            load_kwargs["device_map"] = device_map
-        else:
-            # If no bnb_cfg or no CUDA, prefer CPU or auto device placement
-            load_kwargs["device_map"] = device_map
+            # Prepare BitsAndBytes config if possible
+            try:
+                self._bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+            except Exception:
+                self._bnb_config = None
 
-        try:
-            self._model = AutoModel.from_pretrained(self.model_name, **load_kwargs).eval()
-        except Exception as e:
-            # If load failed, ensure _model remains None and propagate
-            print(f"Failed to lazy-load JinaEmbeddingsV4 model {self.model_name}: {e}")
-            raise
+            # Choose device map: explicit single-device map when CUDA is available
+            device_map = {"": 0} if torch.cuda.is_available() else "cpu"
+
+            load_kwargs = {
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": True,
+            }
+            if self._bnb_config is not None and torch.cuda.is_available():
+                load_kwargs["quantization_config"] = self._bnb_config
+                load_kwargs["device_map"] = device_map
+            else:
+                load_kwargs["device_map"] = device_map
+
+            try:
+                self._model = AutoModel.from_pretrained(self.model_name, **load_kwargs).eval()
+            except Exception as e:
+                # If load failed, ensure _model remains None and propagate
+                print(f"Failed to lazy-load JinaEmbeddingsV4 model {self.model_name}: {e}")
+                raise
+
+            # Mark as loaded
+            self._loaded = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
     @classmethod
     def class_name(cls) -> str:
@@ -752,7 +937,7 @@ class JinaMultimodalReranker:
         self.top_n = top_n
         self.device = device
         self._model = None
-        self._load_model()
+        self._loaded = False
     
     def _load_model(self):
         """Load the Jina reranker model"""
@@ -985,6 +1170,16 @@ class JinaMultimodalReranker:
         """
         if not nodes:
             return []
+
+        # Lazy-load reranker model on first use
+        if not getattr(self, "_loaded", False):
+            try:
+                self._load_model()
+                self._loaded = True
+            except Exception as e:
+                print(f"Reranker lazy-load failed: {e}")
+                # If loading fails, return the original nodes limited to top_n
+                return nodes[:self.top_n]
         
         query = query_bundle.query_str
         

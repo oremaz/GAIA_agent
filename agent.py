@@ -14,14 +14,12 @@ import mimetypes
 import requests
 # Third-party imports
 from custom_models import (
-    QwenVLCustomLLM,
-    JinaEmbeddingsV4,
-    JinaMultimodalReranker,
-    Qwen3GGUFEmbedding,
-    Gemma3CustomLLM,
-    QwenCoderGGUFLLM,
     get_or_create_jina_reranker,
     get_or_create_jina_embedder,
+    get_or_create_qwen_vl_llm,
+    get_or_create_qwen_coder_gguf_llm,
+    get_or_create_qwen3_gguf_embedding,
+    get_or_create_gemma3_llm,
 )
 
 # LlamaIndex core imports
@@ -197,13 +195,13 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
         try:
             if multimodal:
                 # Multimodal pipeline (existing behavior)
-                proj_llm = QwenVLCustomLLM()
+                # Use shared, lazily-loaded Qwen VL LLM wrapper
+                proj_llm = get_or_create_qwen_vl_llm()
                 # Use cached embedder to avoid repeated heavy loads
                 embed_model = get_or_create_jina_embedder()
 
-                # Code LLM (unchanged)
-                # Use local GGUF via llama.cpp for the code model to avoid heavy HF torch loads
-                code_llm = QwenCoderGGUFLLM(model_name="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
+                # Code LLM via shared GGUF factory (llama.cpp backend)
+                code_llm = get_or_create_qwen_coder_gguf_llm(model_name="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
             else:
                 # Text-only pipeline: GPT-OSS as main LLM + code LLM, Qwen3 GGUF on CPU for embeddings,
                 # and use the jina reranker v2 on CPU (configured when creating reranker instance)
@@ -242,7 +240,7 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                 code_llm = proj_llm
 
                 # Embedding model: local Qwen3 GGUF via llama.cpp wrapper
-                embed_model = Qwen3GGUFEmbedding()
+                embed_model = get_or_create_qwen3_gguf_embedding()
 
             return proj_llm, code_llm, embed_model
         except Exception as e:

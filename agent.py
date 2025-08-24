@@ -1181,7 +1181,7 @@ async def main():
         question_data = {"Question": query, "task_id": ""}
         # solve_gaia_question is async; await it inside this async main with a timeout
         try:
-            final_response = await asyncio.wait_for(agent_for_tool.solve_gaia_question(question_data), timeout=120)
+            final_response = await agent_for_tool.solve_gaia_question(question_data)
             tool_result = final_response
             logger.info("solve_gaia_question -> result (truncated): %s", str(tool_result)[:400])
         except Exception as e:

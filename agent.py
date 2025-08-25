@@ -280,6 +280,7 @@ NONAPI_MULTIMODAL = os.environ.get("NONAPI_MULTIMODAL", "true").lower() == "true
 proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE, multimodal=NONAPI_MULTIMODAL)
 
 # Set global settings
+Settings.llm = proj_llm
 Settings.embed_model = embed_model
 
 def read_and_parse_content(input_path: str) -> List[Document]:

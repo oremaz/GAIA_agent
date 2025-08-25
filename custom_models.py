@@ -232,32 +232,34 @@ def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
 
 # Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
 
-# qwen25_llamaindex_mm_llm.py (within custom_models.py)
-
+from typing import Any, Dict, Iterable, List, Optional, Sequence, AsyncIterator
 import asyncio
 import threading
-from typing import Any, Dict, Iterable, List, Optional, Sequence, AsyncIterator, Union
-
 import torch
-from pydantic import PrivateAttr, Field
+
+from pydantic import Field, PrivateAttr
 from transformers import AutoProcessor, TextIteratorStreamer
 from transformers import Qwen2_5_VLForConditionalGeneration
-
 from qwen_vl_utils import process_vision_info
 
-# LlamaIndex interfaces/types
-from llama_index.core.multi_modal_llms import MultiModalLLM
-from llama_index.core.llms import LLMMetadata
-from llama_index.core.llms import ChatMessage, ChatResponse, CompletionResponse
+from llama_index.core.llms import (
+    CustomLLM,
+    CompletionResponse,
+    CompletionResponseGen,
+    LLMMetadata,
+    ChatMessage,
+    ChatResponse,
+)
+from llama_index.core.llms.callbacks import llm_completion_callback
 from llama_index.core.schema import ImageDocument
 
 
-MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
+_DEFAULT_QWEN_VL = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
 
 
-class Qwen25VLMultiModal(MultiModalLLM):
-    # -------- Pydantic model fields (config/state) --------
-    model_id: str = Field(default=MODEL_ID)
+class Qwen25VLMultiModal(CustomLLM):
+    # Config (lightweight, Pydantic-managed)
+    model_id: str = Field(default=_DEFAULT_QWEN_VL)
     max_new_tokens: int = Field(default=512)
     temperature: float = Field(default=0.2)
     top_p: float = Field(default=0.95)
@@ -266,19 +268,27 @@ class Qwen25VLMultiModal(MultiModalLLM):
     max_pixels: Optional[int] = Field(default=None)
     use_flash_attn2: bool = Field(default=False)
 
-    # Heavy runtime objects should not be Pydantic fields
+    # Heavy runtime objects (excluded from validation/serialization)
     _processor: Any = PrivateAttr(default=None)
     _model: Any = PrivateAttr(default=None)
 
-    def __init__(self, **data: Any):
-        # Initialize Pydantic fields
+    def __init__(self, **data: Any) -> None:
         super().__init__(**data)
-        # Initialize HF processor/model lazily here
         self._init_hf()
 
-    # -------- HF initialization --------
-    def _init_hf(self):
-        # Processor with optional visual-token budget control
+    # ---- LLM metadata ----
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=8192,               # concrete integer to avoid validation issues
+            num_output=self.max_new_tokens,    # keep in sync with generation config
+            is_chat_model=True,
+            is_function_calling_model=False,
+        )
+
+    # ---- HF init ----
+    def _init_hf(self) -> None:
         if self.min_pixels is not None or self.max_pixels is not None:
             self._processor = AutoProcessor.from_pretrained(
                 self.model_id,
@@ -286,48 +296,40 @@ class Qwen25VLMultiModal(MultiModalLLM):
                 max_pixels=self.max_pixels,
             )
         else:
-            self._processor = AutoProcessor.from_pretrained(self.model_id)  # supports Qwen2.5-VL chat template
+            self._processor = AutoProcessor.from_pretrained(self.model_id)
 
         model_kwargs: Dict[str, Any] = {
-            "torch_dtype": torch.bfloat16,  # good default for AWQ on T4
-            "device_map": self.device_map,  # shard across GPUs via accelerate
+            "torch_dtype": torch.bfloat16,
+            "device_map": self.device_map,
         }
         if self.use_flash_attn2:
-            # Avoid on older GPUs; caller controls this flag
             model_kwargs["attn_implementation"] = "flash_attention_2"
 
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.model_id, **model_kwargs
         )
 
-    # -------- required metadata --------
-    @property
-    def metadata(self) -> LLMMetadata:
-        # context_window must be an int for downstream validation
-        return LLMMetadata(
-            model_name=self.model_id,
-            context_window=8192,
-            num_output=self.max_new_tokens,
-            is_chat_model=True,
-            is_function_calling_model=False,
-        )
-
-    # -------- helpers --------
-    def _build_user_messages(
-        self, prompt: str, image_documents: Optional[Sequence[ImageDocument]]
-    ) -> List[dict]:
-        msg: Dict[str, Any] = {"role": "user", "content": []}
-        if image_documents:
-            for img in image_documents:
-                msg["content"].append({"type": "image", "image": f"file://{img.image_path}"})
-        msg["content"].append({"type": "text", "text": prompt})
-        return [msg]  # Qwen2.5-VL expects image+text content blocks per message
+    # ---- helpers for prompt packing ----
+    def _coerce_messages(self, messages: List[Any]) -> List[dict]:
+        """Accept LlamaIndex ChatMessage or raw dicts; return list of dicts for Qwen."""
+        out: List[dict] = []
+        for m in messages:
+            if isinstance(m, dict):
+                out.append(dict(m))
+            else:
+                # LlamaIndex ChatMessage(role, content)
+                role = getattr(m, "role", "user")
+                content = getattr(m, "content", "")
+                out.append({"role": role, "content": content})
+        return out
 
     def _attach_images_to_messages(
         self, messages: List[dict], image_documents: Optional[Sequence[ImageDocument]]
     ) -> List[dict]:
         if not image_documents:
             return messages
+
+        # Find or create the latest user turn
         user_idx = None
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
@@ -336,17 +338,32 @@ class Qwen25VLMultiModal(MultiModalLLM):
         if user_idx is None:
             messages.append({"role": "user", "content": []})
             user_idx = len(messages) - 1
+
+        # Normalize to content blocks
         if isinstance(messages[user_idx].get("content"), str):
             messages[user_idx]["content"] = [{"type": "text", "text": messages[user_idx]["content"]}]
+
         for img in image_documents:
-            messages[user_idx]["content"].insert(0, {"type": "image", "image": f"file://{img.image_path}"})
-        return messages  # merge images into latest user turn
+            messages[user_idx]["content"].insert(
+                0, {"type": "image", "image": f"file://{img.image_path}"}
+            )
+        return messages
+
+    def _build_user_messages(
+        self, prompt: str, image_documents: Optional[Sequence[ImageDocument]]
+    ) -> List[dict]:
+        msg: Dict[str, Any] = {"role": "user", "content": []}
+        if image_documents:
+            for img in image_documents:
+                msg["content"].append({"type": "image", "image": f"file://{img.image_path}"})
+        msg["content"].append({"type": "text", "text": prompt})
+        return [msg]
 
     def _prepare_inputs_from_messages(self, messages: List[dict]) -> Dict[str, Any]:
         prompt_text = self._processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
-        )  # official Qwen2.5-VL chat template
-        image_inputs, video_inputs = process_vision_info(messages)  # helper to pack images/videos
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
         inputs = self._processor(
             text=[prompt_text],
             images=image_inputs,
@@ -354,27 +371,31 @@ class Qwen25VLMultiModal(MultiModalLLM):
             padding=True,
             return_tensors="pt",
         )
-        # Device placement handled by accelerate mappings
+        # Device placement from accelerate/device_map; still move tensors safely if needed
         inputs = {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inputs.items()}
         return inputs
 
     def _decode_new_tokens(self, inputs: Dict[str, Any], generated_ids) -> str:
-        trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)]
+        trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]
         texts = self._processor.batch_decode(
             trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )
-        # Qwen tokenizer returns a list of strings; join if multiple
+        # Return first (single-item batch)
         if isinstance(texts, list):
-            return "".join(texts)
-        return str(texts)
+            return texts if texts else ""
+        return texts or ""
 
-    # -------- non-streaming sync --------
+    # ---- text LLM API: non-streaming ----
+    @llm_completion_callback()
     def complete(
         self,
         prompt: str,
-        image_documents: Optional[Sequence[ImageDocument]] = None,
+        stop: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> CompletionResponse:
+        image_documents: Optional[Sequence[ImageDocument]] = kwargs.pop("image_documents", None)
         messages = self._build_user_messages(prompt, image_documents)
         inputs = self._prepare_inputs_from_messages(messages)
         gen_kwargs = dict(
@@ -385,16 +406,23 @@ class Qwen25VLMultiModal(MultiModalLLM):
         )
         out = self._model.generate(**inputs, **gen_kwargs)
         text = self._decode_new_tokens(inputs, out)
+        # Apply stop tokens locally for consistency
+        if stop:
+            for s in stop:
+                if s and s in text:
+                    text = text.split(s, 1)
+                    break
         return CompletionResponse(text=text)
 
     def chat(
         self,
-        messages: List[dict],
-        image_documents: Optional[Sequence[ImageDocument]] = None,
+        messages: List[Any],
         **kwargs: Any,
     ) -> ChatResponse:
-        messages = self._attach_images_to_messages(messages, image_documents)
-        inputs = self._prepare_inputs_from_messages(messages)
+        image_documents: Optional[Sequence[ImageDocument]] = kwargs.pop("image_documents", None)
+        msgs = self._coerce_messages(messages)
+        msgs = self._attach_images_to_messages(msgs, image_documents)
+        inputs = self._prepare_inputs_from_messages(msgs)
         gen_kwargs = dict(
             max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
             do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
@@ -405,13 +433,15 @@ class Qwen25VLMultiModal(MultiModalLLM):
         text = self._decode_new_tokens(inputs, out)
         return ChatResponse(message=ChatMessage(role="assistant", content=text))
 
-    # -------- streaming sync --------
+    # ---- text LLM API: streaming (sync) ----
+    @llm_completion_callback()
     def stream_complete(
         self,
         prompt: str,
-        image_documents: Optional[Sequence[ImageDocument]] = None,
+        stop: Optional[List[str]] = None,
         **kwargs: Any,
-    ) -> Iterable[CompletionResponse]:
+    ) -> CompletionResponseGen:
+        image_documents: Optional[Sequence[ImageDocument]] = kwargs.pop("image_documents", None)
         messages = self._build_user_messages(prompt, image_documents)
         inputs = self._prepare_inputs_from_messages(messages)
         gen_kwargs = dict(
@@ -431,19 +461,30 @@ class Qwen25VLMultiModal(MultiModalLLM):
             daemon=True,
         )
         th.start()
-        text = ""
+
+        text_accum = ""
         for delta in streamer:
-            text += delta
-            yield CompletionResponse(text=text, delta=delta)
+            text_accum += delta
+            # local stop handling
+            if stop and any(s and s in text_accum for s in stop):
+                # Trim at first stop sequence
+                for s in stop:
+                    if s and s in text_accum:
+                        text_accum = text_accum.split(s, 1)
+                        break
+                yield CompletionResponse(text=text_accum, delta="")
+                break
+            yield CompletionResponse(text=text_accum, delta=delta)
 
     def stream_chat(
         self,
-        messages: List[dict],
-        image_documents: Optional[Sequence[ImageDocument]] = None,
+        messages: List[Any],
         **kwargs: Any,
     ) -> Iterable[ChatResponse]:
-        messages = self._attach_images_to_messages(messages, image_documents)
-        inputs = self._prepare_inputs_from_messages(messages)
+        image_documents: Optional[Sequence[ImageDocument]] = kwargs.pop("image_documents", None)
+        msgs = self._coerce_messages(messages)
+        msgs = self._attach_images_to_messages(msgs, image_documents)
+        inputs = self._prepare_inputs_from_messages(msgs)
         gen_kwargs = dict(
             max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
             do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
@@ -461,6 +502,7 @@ class Qwen25VLMultiModal(MultiModalLLM):
             daemon=True,
         )
         th.start()
+
         content = ""
         for delta in streamer:
             content += delta
@@ -469,125 +511,51 @@ class Qwen25VLMultiModal(MultiModalLLM):
                 delta=delta,
             )
 
-    # -------- non-streaming async --------
-    async def acomplete(
-        self,
-        prompt: str,
-        image_documents: Optional[Sequence[ImageDocument]] = None,
-        **kwargs: Any,
-    ) -> CompletionResponse:
-        return await asyncio.to_thread(self.complete, prompt, image_documents, **kwargs)
+    # ---- async bridges (thread off sync impls) ----
+    async def acomplete(self, prompt: str, **kwargs: Any) -> CompletionResponse:
+        return await asyncio.to_thread(self.complete, prompt, **kwargs)
 
-    async def achat(
-        self,
-        messages: List[dict],
-        image_documents: Optional[Sequence[ImageDocument]] = None,
-        **kwargs: Any,
-    ) -> ChatResponse:
-        return await asyncio.to_thread(self.chat, messages, image_documents, **kwargs)
+    async def achat(self, messages: List[Any], **kwargs: Any) -> ChatResponse:
+        return await asyncio.to_thread(self.chat, messages, **kwargs)
 
-    # -------- streaming async --------
-    async def astream_complete(
-        self,
-        prompt: str,
-        image_documents: Optional[Sequence[ImageDocument]] = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[CompletionResponse]:
-        messages = self._build_user_messages(prompt, image_documents)
-        inputs = self._prepare_inputs_from_messages(messages)
-        gen_kwargs = dict(
-            max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
-            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
-            temperature=kwargs.get("temperature", self.temperature),
-            top_p=kwargs.get("top_p", self.top_p),
-        )
-
-        streamer = TextIteratorStreamer(
-            self._processor.tokenizer,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-
+    async def astream_complete(self, prompt: str, **kwargs: Any) -> AsyncIterator[CompletionResponse]:
         loop = asyncio.get_event_loop()
-        q: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        q: "asyncio.Queue[Optional[CompletionResponse]]" = asyncio.Queue()
 
         def _producer():
             try:
-                for chunk in streamer:
+                for chunk in self.stream_complete(prompt, **kwargs):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
-        th = threading.Thread(
-            target=self._model.generate, kwargs={**inputs, **gen_kwargs, "streamer": streamer}, daemon=True
-        )
-        th.start()
+        threading.Thread(target=_producer, daemon=True).start()
 
-        prod = threading.Thread(target=_producer, daemon=True)
-        prod.start()
-
-        text = ""
         while True:
-            delta = await q.get()
-            if delta is None:
+            item = await q.get()
+            if item is None:
                 break
-            text += delta
-            yield CompletionResponse(text=text, delta=delta)
+            yield item
 
-    async def astream_chat(
-        self,
-        messages: List[dict],
-        image_documents: Optional[Sequence[ImageDocument]] = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ChatResponse]:
-        """
-        Return an async iterator (not a bare async generator object awaited directly by callers).
-        ReActAgent and other components can `async for` over the returned iterator safely.
-        """
-        messages = self._attach_images_to_messages(messages, image_documents)
-        inputs = self._prepare_inputs_from_messages(messages)
-
-        gen_kwargs = dict(
-            max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
-            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
-            temperature=kwargs.get("temperature", self.temperature),
-            top_p=kwargs.get("top_p", self.top_p),
-        )
-
-        streamer = TextIteratorStreamer(
-            self._processor.tokenizer,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-
+    async def astream_chat(self, messages: List[Any], **kwargs: Any) -> AsyncIterator[ChatResponse]:
         loop = asyncio.get_event_loop()
-        q: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+        q: "asyncio.Queue[Optional[ChatResponse]]" = asyncio.Queue()
 
         def _producer():
             try:
-                for chunk in streamer:
+                for chunk in self.stream_chat(messages, **kwargs):
                     loop.call_soon_threadsafe(q.put_nowait, chunk)
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, None)
 
-        th = threading.Thread(
-            target=self._model.generate, kwargs={**inputs, **gen_kwargs, "streamer": streamer}, daemon=True
-        )
-        th.start()
+        threading.Thread(target=_producer, daemon=True).start()
 
-        prod = threading.Thread(target=_producer, daemon=True)
-        prod.start()
-
-        content = ""
         while True:
-            delta = await q.get()
-            if delta is None:
+            item = await q.get()
+            if item is None:
                 break
-            content += delta
-            yield ChatResponse(
-                message=ChatMessage(role="assistant", content=content),
-                delta=delta,
-            )
+            yield item
+
 
 class Qwen3GGUFEmbedding(BaseEmbedding):
     """Wrapper to load a Qwen3 GGUF embedding model via llama.cpp or gguf loader.

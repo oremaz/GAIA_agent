@@ -284,7 +284,7 @@ class Qwen25VLMultiModal(CustomLLM):
     def metadata(self) -> LLMMetadata:
         return LLMMetadata(
             model_name=self.model_id,
-            context_window=None,
+            context_window=8192,
             num_output=self.max_new_tokens,
             is_chat_model=True,
             is_function_calling_model=False,

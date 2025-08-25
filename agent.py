@@ -280,7 +280,6 @@ NONAPI_MULTIMODAL = os.environ.get("NONAPI_MULTIMODAL", "true").lower() == "true
 proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE, multimodal=NONAPI_MULTIMODAL)
 
 # Set global settings
-Settings.llm = proj_llm
 Settings.embed_model = embed_model
 
 def read_and_parse_content(input_path: str) -> List[Document]:
@@ -452,14 +451,21 @@ def read_and_parse_content(input_path: str) -> List[Document]:
     return documents
 
 class DynamicQueryEngineManager:
-    """Manager supporting incremental document insertion without full index rebuild each time."""
+    """Manager supporting incremental document insertion without full index rebuild each time.
 
-    def __init__(self, initial_documents: Optional[List[str]] = None):
+    An explicit LLM reference is stored (self.llm) since global Settings.llm was removed
+    to allow coexistence of text-only and multimodal models. All query engines and any
+    summarization should therefore use this instance LLM explicitly.
+    """
+
+    def __init__(self, initial_documents: Optional[List[str]] = None, llm=None):
         self.documents: List[Document] = []
         self.query_engine_tool = None
         self.index: Optional[VectorStoreIndex] = None
         self.vector_store = None  # ChromaVectorStore instance
         self.element_parser = UnstructuredElementNodeParser()
+        # Store explicit llm reference (fallback to module-level proj_llm)
+        self.llm = llm or proj_llm
         if RecursiveCharacterTextSplitter is not None:
             self.splitter = RecursiveCharacterTextSplitter(chunk_size=4096, chunk_overlap=512)
         else:
@@ -580,7 +586,8 @@ class DynamicQueryEngineManager:
         query_engine = self.index.as_query_engine(
             similarity_top_k=20,
             node_postprocessors=[self._hybrid_reranker] if self._hybrid_reranker else [],
-            response_mode="tree_summarize"
+            response_mode="tree_summarize",
+            llm=self.llm  # explicit LLM (Settings.llm not set globally)
         )
         from llama_index.core.tools import QueryEngineTool
         if self.query_engine_tool is None:

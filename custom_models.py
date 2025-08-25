@@ -248,10 +248,6 @@ from qwen_vl_utils import process_vision_info  # [17]
 # LlamaIndex imports (v0.10+ API)
 from llama_index.core.multi_modal_llms import MultiModalLLM  # base interface [11]
 from llama_index.core.schema import ImageDocument  # pass images to agent [10]
-from llama_index.core.agent.react_multimodal.step import MultimodalReActAgentWorker  # [10]
-
-# Optional: LlamaIndex tools; here we keep it empty, but you can add QueryEngineTool etc. [10]
-from llama_index.core.agent import AgentRunner  # if you prefer AgentRunner wiring [10]
 
 MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"  # AWQ quantized repository [1]
 

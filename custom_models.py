@@ -260,7 +260,7 @@ from llama_index.core.llms.callbacks import llm_completion_callback
 
 _DEFAULT_QWEN_VL = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
 
-class Qwen25VLAsLLM(CustomLLM):
+class Qwen25VLMultiModal(CustomLLM):
     # Config (lightweight, Pydantic-managed)
     model_id: str = Field(default=_DEFAULT_QWEN_VL)
     max_new_tokens: int = Field(default=512)

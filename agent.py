@@ -20,7 +20,6 @@ from custom_models import (
     get_or_create_qwen_vl_llm,
     get_or_create_qwen_coder_gguf_llm,
     get_or_create_qwen3_gguf_embedding,
-    get_or_create_gemma3_llm,
 )
 
 # LlamaIndex core imports

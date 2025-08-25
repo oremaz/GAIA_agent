@@ -118,7 +118,13 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 
 
 def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached QwenVLCustomLLM or create one (lazy-load inside the class)."""
+    """Return cached Qwen25VLMultiModal or create one.
+
+    Qwen25VLMultiModal is the new multimodal wrapper replacing the deprecated
+    QwenVLCustomLLM. We keep the factory name for backward compatibility with
+    existing import sites (e.g. agent initialization) but change the created
+    class. Cached by (model_name, device).
+    """
     # Avoid accessing Pydantic-model attributes at import time (AttributeError).
     # Use the same default literal as defined in the class to form the cache key.
     key = (model_name or "Qwen/Qwen2.5-VL-32B-Instruct-AWQ", device or "auto")
@@ -131,71 +137,33 @@ def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional
         if inst is not None:
             return inst
 
-        _logger.info("Creating QwenVLCustomLLM for key=%s", key)
+    _logger.info("Creating Qwen25VLMultiModal for key=%s", key)
+    try:
+        before_alloc = None
         try:
-            before_alloc = None
-            try:
-                if torch.cuda.is_available():
-                    before_alloc = torch.cuda.memory_allocated()
-            except Exception:
-                before_alloc = None
-
-            inst = QwenVLCustomLLM(model_name=key[0])
-            # record after-instantiation allocation (model still lazy until first call)
-            after_alloc = None
-            try:
-                if torch.cuda.is_available():
-                    after_alloc = torch.cuda.memory_allocated()
-            except Exception:
-                after_alloc = None
-
-            _logger.info("QwenVLCustomLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+            if torch.cuda.is_available():
+                before_alloc = torch.cuda.memory_allocated()
         except Exception:
-            _logger.exception("Failed to create QwenVLCustomLLM for key=%s", key)
-            raise
+            before_alloc = None
 
-        _LLM_CACHE[key] = inst
-        return inst
-
-
-def get_or_create_gemma3_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached Gemma3CustomLLM or create one."""
-    # Use literal default to avoid referencing Pydantic class attrs at import time
-    key = (model_name or "google/gemma-3-27b-it", device or "auto")
-    inst = _LLM_CACHE.get(key)
-    if inst is not None:
-        return inst
-
-    with _CACHE_LOCK:
-        inst = _LLM_CACHE.get(key)
-        if inst is not None:
-            return inst
-
-        _logger.info("Creating Gemma3CustomLLM for key=%s", key)
+        # Instantiate the multimodal model wrapper (loads weights immediately)
+        from_path_model_name = key[0]
+        inst = Qwen25VLMultiModal(model_id=from_path_model_name, device_map=device or "auto")
+        # record after-instantiation allocation (model still lazy until first call)
+        after_alloc = None
         try:
-            before_alloc = None
-            try:
-                if torch.cuda.is_available():
-                    before_alloc = torch.cuda.memory_allocated()
-            except Exception:
-                before_alloc = None
-
-            inst = Gemma3CustomLLM(model_name=key[0])
-
-            after_alloc = None
-            try:
-                if torch.cuda.is_available():
-                    after_alloc = torch.cuda.memory_allocated()
-            except Exception:
-                after_alloc = None
-
-            _logger.info("Gemma3CustomLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+            if torch.cuda.is_available():
+                after_alloc = torch.cuda.memory_allocated()
         except Exception:
-            _logger.exception("Failed to create Gemma3CustomLLM for key=%s", key)
-            raise
+            after_alloc = None
 
-        _LLM_CACHE[key] = inst
-        return inst
+        _logger.info("Qwen25VLMultiModal created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+    except Exception:
+        _logger.exception("Failed to create Qwen25VLMultiModal for key=%s", key)
+        raise
+
+    _LLM_CACHE[key] = inst
+    return inst
 
 
 def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: str = "cpu"):
@@ -261,78 +229,291 @@ def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
         _EMBEDDER_CACHE[key] = inst
         return inst
 
-class QwenVLCustomLLM(CustomLLM):
-    model_name: str = Field(default="Qwen/Qwen2.5-VL-32B-Instruct-AWQ")
-    context_window: int = Field(default=32768)
-    num_output: int = Field(default=256)
-
-    _model = PrivateAttr()
-    _processor = PrivateAttr()
-    _loaded = PrivateAttr(default=False)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._model = None
-        self._processor = None
-    
-    def _ensure_model(self):
-        if self._loaded:
-            return
-        import gc, os
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
-
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_name, device_map="auto", trust_remote_code=True, low_cpu_mem_usage=True
-        )
-        self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
-        self._loaded = True
-
-    @property
-    def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
-
-    @llm_completion_callback()
-    def complete(
-        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
-    ) -> CompletionResponse:
-        self._ensure_model()
-        messages = [{"role": "user", "content": []}]
-        if image_paths:
-            for path in image_paths:
-                messages[0]["content"].append({"type": "image", "image": path})
-        messages[0]["content"].append({"type": "text", "text": prompt})
-
-        text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-
-        inputs = self._processor(
-            text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
-        ).to(self._model.device)
-
-        generated_ids = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
-        generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
-        output_text = self._processor.batch_decode(
-            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        _logger.info("Generated text: %s", output_text)
-        output_text = output_text[0] if output_text else ""
-        _logger.info("Final output text: %s", CompletionResponse(text=output_text))
-        
-        output_text = _truncate_on_stop(output_text, stop)
-        return CompletionResponse(text=output_text)
-
-    @llm_completion_callback()
-    def stream_complete(
-        self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any
-    ) -> CompletionResponseGen:
-        resp = self.complete(prompt, image_paths=image_paths, stop=stop, **kwargs)
-        for ch in resp.text:
-            yield CompletionResponse(text=ch, delta=ch)
 
 # Removed GPTOSSInternVLRouterLLM routing class: text-only pipeline will directly use GPT-OSS via HuggingFaceLLM
+
+# qwen25_llamaindex_mm_agent.py
+
+import os
+from typing import List, Optional, Any, Sequence
+
+import torch
+from transformers import AutoProcessor
+# Use the new model class for Qwen2.5-VL (requires latest transformers)
+from transformers import Qwen2_5_VLForConditionalGeneration  # [1]
+
+# Qwen's lightweight helper for packing images/videos into the processor inputs
+from qwen_vl_utils import process_vision_info  # [17]
+
+# LlamaIndex imports (v0.10+ API)
+from llama_index.core.multi_modal_llms import MultiModalLLM  # base interface [11]
+from llama_index.core.schema import ImageDocument  # pass images to agent [10]
+from llama_index.core.agent.react_multimodal.step import MultimodalReActAgentWorker  # [10]
+
+# Optional: LlamaIndex tools; here we keep it empty, but you can add QueryEngineTool etc. [10]
+from llama_index.core.agent import AgentRunner  # if you prefer AgentRunner wiring [10]
+
+MODEL_ID = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"  # AWQ quantized repository [1]
+
+class Qwen25VLMultiModal(MultiModalLLM):
+    """
+    Minimal Hugging Face Qwen2.5-VL wrapper implementing the MultiModalLLM interface expected by
+    LlamaIndex's multi-modal ReAct agent. [11]
+    """
+
+    def __init__(
+        self,
+        model_id: str = MODEL_ID,
+        torch_dtype: Optional[torch.dtype] = None,
+        device_map: str = "auto",
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        top_p: float = 0.95,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        use_flash_attn2: bool = False,
+    ):
+        """
+        device_map='auto' will shard across the two Kaggle T4 GPUs automatically (Accelerate). [1]
+        You can control visual token budget via min_pixels/max_pixels to save memory. [1]
+        """
+        self.model_id = model_id
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+
+        # Build processor (optionally constrain visual token budget)
+        if min_pixels is not None or max_pixels is not None:
+            self.processor = AutoProcessor.from_pretrained(
+                model_id,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+        else:
+            self.processor = AutoProcessor.from_pretrained(model_id)  # [1]
+
+        # Model init
+        model_kwargs = {
+            "torch_dtype": torch_dtype or "auto",
+            "device_map": device_map,  # shards across multi-GPU automatically [1]
+        }
+        if use_flash_attn2:
+            # Only enable on GPUs supporting FA2 (T4 generally does not). [1]
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_id, **model_kwargs
+        )  # [1]
+
+    # Synchronous "complete" is the core used by LlamaIndex MM flows.
+    def complete(
+        self,
+        prompt: str,
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
+    ):
+        """
+        Execute a single-turn multimodal generation with text prompt + image(s). [11]
+        """
+        messages = [{"role": "user", "content": []}]
+
+        # Pack images first (can be multiple)
+        if image_documents:
+            for img_doc in image_documents:
+                # LlamaIndex ImageDocument exposes image_path; Qwen utils accept file:// URIs. [10][17]
+                messages["content"].append(
+                    {"type": "image", "image": f"file://{img_doc.image_path}"}
+                )
+
+        # Then add the text instruction
+        messages["content"].append({"type": "text", "text": prompt})  # [1]
+
+        # Apply Qwen chat template and convert images/videos into model inputs
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )  # [1]
+        image_inputs, video_inputs = process_vision_info(messages)  # [17]
+
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )  # [1][17]
+
+        # Put tensors on CUDA (Accelerate will map per device_map automatically)
+        inputs = {k: v.to("cuda") if hasattr(v, "to") else v for k, v in inputs.items()}  # [1]
+
+        # Generate
+        gen_kwargs = dict(
+            max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
+            do_sample=(self.temperature is not None and self.temperature > 0),
+            temperature=kwargs.get("temperature", self.temperature),
+            top_p=kwargs.get("top_p", self.top_p),
+        )  # [1]
+        generated_ids = self.model.generate(**inputs, **gen_kwargs)  # [1]
+
+        # Trim prompt tokens and decode
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]  # [1]
+        output_texts = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )  # [1]
+
+        # Return plain string (LlamaIndex will wrap as needed in agent steps)
+        return output_texts  # [10]
+
+    # Optional: single-turn chat alias to satisfy some agent paths expecting .chat
+    def chat(self, messages: List[dict], image_documents: Optional[Sequence[ImageDocument]] = None, **kwargs: Any):
+        """
+        Accept a list of messages in the same {role, content} format, append images if passed. [11]
+        """
+        # Merge any passed images into the last user turn (or create one)
+        if image_documents:
+            # Find last user turn
+            user_idx = None
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    user_idx = i
+                    break
+            if user_idx is None:
+                messages.append({"role": "user", "content": []})
+                user_idx = len(messages) - 1
+            if isinstance(messages[user_idx]["content"], str):
+                messages[user_idx]["content"] = [{"type": "text", "text": messages[user_idx]["content"]}]
+            for img_doc in image_documents:
+                messages[user_idx]["content"].insert(0, {"type": "image", "image": f"file://{img_doc.image_path}"})
+
+        # Use the same pipeline as .complete
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)  # [1]
+        image_inputs, video_inputs = process_vision_info(messages)  # [17]
+        inputs = self.processor(
+            text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
+        )  # [1][17]
+        inputs = {k: v.to("cuda") if hasattr(v, "to") else v for k, v in inputs.items()}  # [1]
+        generated_ids = self.model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=(self.temperature is not None and self.temperature > 0),
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )  # [1]
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]  # [1]
+        output_texts = self.processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )  # [1]
+        return output_texts  # [10]
+
+
+    def _prepare_inputs_from_messages(self, messages):
+        # Shared helper for streaming and non-streaming
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to("cuda") if hasattr(v, "to") else v for k, v in inputs.items()}
+        return inputs
+
+    def stream_complete(
+        self,
+        prompt: str,
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
+    ):
+        # Build Qwen-style messages
+        messages = [{"role": "user", "content": []}]
+        if image_documents:
+            for img_doc in image_documents:
+                messages["content"].append(
+                    {"type": "image", "image": f"file://{img_doc.image_path}"}
+                )
+        messages["content"].append({"type": "text", "text": prompt})
+
+        inputs = self._prepare_inputs_from_messages(messages)
+
+        gen_kwargs = dict(
+            max_new_tokens=kwargs.get("max_new_tokens", self.max_new_tokens),
+            do_sample=(kwargs.get("temperature", self.temperature) or 0) > 0,
+            temperature=kwargs.get("temperature", self.temperature),
+            top_p=kwargs.get("top_p", self.top_p),
+        )
+
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        t = threading.Thread(
+            target=self.model.generate,
+            kwargs={**inputs, **gen_kwargs, "streamer": streamer},
+            daemon=True,
+        )
+        t.start()
+
+        for new_text in streamer:
+            # Yield incremental text chunks
+            yield new_text
+
+    def stream_chat(
+        self,
+        messages: List[dict],
+        image_documents: Optional[Sequence[ImageDocument]] = None,
+        **kwargs: Any,
+    ):
+        # Optionally support streaming for a messages list
+        # Attach images to the last user message (or create one)
+        if image_documents:
+            user_idx = None
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    user_idx = i
+                    break
+            if user_idx is None:
+                messages.append({"role": "user", "content": []})
+                user_idx = len(messages) - 1
+            if isinstance(messages[user_idx]["content"], str):
+                messages[user_idx]["content"] = [{"type": "text", "text": messages[user_idx]["content"]}]
+            for img_doc in image_documents:
+                messages[user_idx]["content"].insert(
+                    0, {"type": "image", "image": f"file://{img_doc.image_path}"}
+                )
+
+        inputs = self._prepare_inputs_from_messages(messages)
+
+        gen_kwargs = dict(
+            max_new_tokens=self.max_new_tokens,
+            do_sample=(self.temperature or 0) > 0,
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )
+
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+        t = threading.Thread(
+            target=self.model.generate,
+            kwargs={**inputs, **gen_kwargs, "streamer": streamer},
+            daemon=True,
+        )
+        t.start()
+
+        for new_text in streamer:
+            yield new_text
 
 
 class Qwen3GGUFEmbedding(BaseEmbedding):
@@ -416,77 +597,6 @@ class Qwen3GGUFEmbedding(BaseEmbedding):
 
     def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
         return self._embed([text])[0]
-
-
-class Gemma3CustomLLM(CustomLLM):
-    model_name: str = Field(default="google/gemma-3-27b-it")
-    context_window: int = Field(default=131072)
-    num_output: int = Field(default=512)
-
-    _model = PrivateAttr()
-    _processor = PrivateAttr()
-    _loaded = PrivateAttr(default=False)
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        from transformers import BitsAndBytesConfig
-        self._bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16
-        ) if torch.cuda.is_available() else None
-
-    def _ensure_model(self):
-        if self._loaded:
-            return
-        import gc, os
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
-
-        from transformers import Gemma3ForConditionalGeneration
-        load_kwargs = {"device_map": "auto", "trust_remote_code": True}
-        if self._bnb_config is not None:
-            load_kwargs["quantization_config"] = self._bnb_config
-
-        self._model = Gemma3ForConditionalGeneration.from_pretrained(
-            self.model_name, **load_kwargs, low_cpu_mem_usage=True
-        ).eval()
-        self._processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
-        self._loaded = True
-
-    @property
-    def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
-
-    @llm_completion_callback()
-    def complete(self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
-        self._ensure_model()
-        messages = [{"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant."}]}]
-        user_content = []
-        if image_paths:
-            for path in image_paths:
-                user_content.append({"type": "image", "image": path})
-        user_content.append({"type": "text", "text": prompt})
-        messages.append({"role": "user", "content": user_content})
-
-        inputs = self._processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
-                                                     return_dict=True, return_tensors="pt").to(self._model.device, dtype=torch.bfloat16)
-        input_len = inputs["input_ids"].shape[-1]
-
-        with torch.inference_mode():
-            generation = self._model.generate(**inputs, max_new_tokens=self.num_output, do_sample=False)
-        generation = generation[0][input_len:]
-        decoded = self._processor.decode(generation, skip_special_tokens=True)
-
-        decoded = _truncate_on_stop(decoded, stop)
-        return CompletionResponse(text=decoded)
-
-    @llm_completion_callback()
-    def stream_complete(self, prompt: str, image_paths: Optional[List[str]] = None, stop: Optional[List[str]] = None, **kwargs: Any):
-        resp = self.complete(prompt, image_paths=image_paths, stop=stop, **kwargs)
-        for ch in resp.text:
-            yield CompletionResponse(text=ch, delta=ch)
 
 
 # If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.

@@ -21,7 +21,7 @@ The rest of this README documents how the code maps to the Unit4 challenge and h
 	- Non-API mode (USE_API_MODE=false): local models. The repo supports both multimodal (images + text) and text-only local pipelines via the `NONAPI_MULTIMODAL` flag.
 - Document handling: office files (docx/doc/pptx) are converted to PDF using LibreOffice headless (`soffice`) and parsed via `SmartPDFLoader` + `PyMuPDFReader` for images.
 - Semantic-first chunking (preferred): `RecursiveCharacterTextSplitter(chunk_size=4096, chunk_overlap=512)` with fallback to sentence-based splitting.
-- Local custom model wrappers in `custom_models.py`: Qwen multimodal LLM, Qwen3 GGUF embedding wrapper, Gemma3 4-bit quantized loader, and Jina embeddings/reranker wrappers.
+- Local custom model wrappers in `custom_models.py`: Qwen25 multimodal LLM (`Qwen25VLMultiModal`), Qwen3 GGUF embedding wrapper, and Jina embeddings/reranker wrappers. (Gemma3 removed)
 - Persistent vector backend: optional Chroma integration (falls back to in-memory index if `chromadb` is unavailable).
 
 ## Requirements and environment
@@ -32,7 +32,7 @@ The rest of this README documents how the code maps to the Unit4 challenge and h
 	- LibreOffice CLI (`soffice`) available — the notebook includes a command to install it (`!brew install --cask libreoffice` in the provided notebook; on Linux you may prefer `apt-get install libreoffice-common libreoffice-writer libreoffice-core` in a container/VM).
 	- Hardware:
 		- API mode: CPU is OK.
-		- Non-API multimodal: 2 GPUs (NVIDIA T4 recommended) for stable multimodal model loading (Qwen/Gemma etc.).
+		- Non-API multimodal: 2 GPUs (NVIDIA T4 recommended) for stable multimodal model loading (Qwen models).
 		- Non-API text-only: 1 GPU (NVIDIA T4 recommended).
 
 - Local / development environment (for `agent2.py`, `app.py`):
@@ -58,7 +58,7 @@ Main files involved: `hf-agents.ipynb` (runner), `agent.py` (main agent implemen
 Key implementation notes (Kaggle / `agent.py` / `custom_models.py`):
 - initialize_models(use_api_mode, multimodal): selects models depending on `USE_API_MODE` and `NONAPI_MULTIMODAL`:
 	- API mode + Gemini available -> uses `Gemini` LLM & `GeminiEmbedding`.
-	- Non-API multimodal -> `QwenVLCustomLLM` + `JinaEmbeddingsV4` + a Qwen coder for code LLM (HF loader with quantization flags).
+	- Non-API multimodal -> `Qwen25VLMultiModal` + `JinaEmbeddingsV4` + a Qwen coder for code LLM (HF loader with quantization flags).
 	- Non-API text-only -> `HuggingFaceLLM` using `openai/gpt-oss-20b` as the main LLM (and code LLM), and `Qwen3GGUFEmbedding()` for CPU GGUF embeddings.
 - Document ingestion: `read_and_parse_content()` handles file download/format detection. Office documents (.doc/.docx/.pptx/.ppt/.odt) are converted to PDF using LibreOffice headless (`convert_to_pdf` helper) and then parsed via `MultimodalPDFReader` (which combines `SmartPDFLoader` for layout-text and `PyMuPDFReader` for images). In text-only mode the pipeline will prefer `SmartPDFLoader` only (no image nodes) while PyMuPDF is used only for image extraction in multimodal mode.
 - Semantic chunking: `RecursiveCharacterTextSplitter(chunk_size=4096, chunk_overlap=512)` is used where available and falls back to `SentenceSplitter`. This implements the requested semantic-first chunking.
@@ -114,7 +114,7 @@ Below are concise architecture diagrams and component roles for each supported c
 - When to use: CPU-only environments where cloud LLMs handle heavy lifting (recommended for small GPU or CPU-only Kaggle instances).
 
 2) Non-API multimodal (Kaggle notebook, `USE_API_MODE=false` and `NONAPI_MULTIMODAL=true`)
-- Core LLM: local multimodal LLM wrapper `QwenVLCustomLLM` or `Gemma3CustomLLM` (if available and GPU resources permit). These load large multimodal weights and use `AutoProcessor` for images+text.
+- Core LLM: local multimodal LLM wrapper `Qwen25VLMultiModal`. This loads large multimodal weights and uses `AutoProcessor` for images+text. (Gemma3 path removed)
 - Embeddings: `JinaEmbeddingsV4` (multimodal embeddings) — can encode text, images, or text+image.
 - Ingestion: `MultimodalPDFReader` extracts text and images from PDFs; image nodes become `ImageNode` objects.
 - Chunking & nodes: `UnstructuredElementNodeParser` → `RecursiveCharacterTextSplitter` (4096/512) produces semantic nodes.
@@ -190,14 +190,14 @@ How to run locally (short checklist)
 
 ## How this solves the Unit4 hands-on
 - Implements the same API routes described in the Unit4 hands-on: `GET /questions` (fetch), `GET /files/{task_id}` (download files), and `POST /submit` (submit results). The template demonstrates the full loop: fetch questions, download files where necessary, extract and index file content, run the agent to answer, and submit answers in GAIA format.
-- The repository includes both an API/cloud friendly path (Gemini) and a local, self-contained path (Qwen/Gemma local wrappers + GGUF embedding) so you can iterate in CPU-only and GPU-enabled environments.
+- The repository includes both an API/cloud friendly path (Gemini) and a local, self-contained path (Qwen local wrappers + GGUF embedding) so you can iterate in CPU-only and GPU-enabled environments.
 
 ## Checklist (requirements coverage)
 - Add multimodal boolean and USE_API_MODE branching -> Done (see `initialize_models` in `agent.py`).
 - Text-only pipeline uses GPT-OSS on GPU and Qwen3 GGUF embeddings on CPU -> Implemented in `initialize_models` and `custom_models.py`.
 - Office files converted to PDF using LibreOffice (`convert_to_pdf`) -> Done (LibreOffice-only, fail-fast).
 - Semantic-first chunking (chunk_size=4096, overlap=512) -> Done (RecursiveCharacterTextSplitter fallback present).
-- Gemma3 27B int4 model wrapper and Qwen3 GGUF embedding wrapper -> Done in `custom_models.py`.
+- Qwen25 multimodal model and Qwen3 GGUF embedding wrapper -> Implemented in `custom_models.py`.
 - Chroma persistent backend with fallback -> Attempted in `_create_rag_tool` (falls back to in-memory `VectorStoreIndex`).
 
 If you want, I can now:

@@ -1078,7 +1078,8 @@ After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer fro
 
     async def solve_gaia_question(self, question_data: Dict[str, Any]) -> str:
         """
-        Solve GAIA question with dynamic knowledge base integration
+        Solve GAIA question with dynamic knowledge base integration.
+        Uses a non-streaming await pattern for the workflow execution.
         """
         question = question_data.get("Question", "")
         task_id = question_data.get("task_id", "")
@@ -1091,47 +1092,38 @@ After enhanced_web_search, call dynamic_hybrid_multimodal_rag_tool to answer fro
                 if file_path:
                     # Add documents to dynamic knowledge base
                     self.add_documents_to_knowledge_base(file_path)
-                    logger.info(f"Successfully integrated GAIA file into dynamic knowledge base")
+                    logger.info("Successfully integrated GAIA file into dynamic knowledge base")
             except Exception as e:
                 logger.exception("Failed to download/process file for task %s: %s", task_id, e)
 
-        # Enhanced context prompt with dynamic knowledge base awareness and step-by-step reasoning
+        # Context prompt for the workflow
         context_prompt = f"""
-GAIA Task ID: {task_id}
-Question: {question}
-{f'File processed and added to knowledge base: {file_path}' if file_path else 'No additional files'}
+    GAIA Task ID: {task_id}
+    Question: {question}
+    {f'File processed and added to knowledge base: {file_path}' if file_path else 'No additional files'}
+    You are a general AI assistant. I will ask you a question.
 
-You are a general AI assistant. I will ask you a question. 
+    IMPORTANT INSTRUCTIONS:
+    1. Think through this STEP BY STEP, carefully analyzing all aspects of the question.
+    2. Pay special attention to specific qualifiers like dates, types, categories, or locations.
+    3. Make sure your searches include ALL important details from the question.
+    4. Report your thoughts and reasoning process clearly.
+    5. Finish your answer with: FINAL ANSWER: [YOUR FINAL ANSWER]
 
-IMPORTANT INSTRUCTIONS:
-1. Think through this STEP BY STEP, carefully analyzing all aspects of the question.
-2. Pay special attention to specific qualifiers like dates, types, categories, or locations.
-3. Make sure your searches include ALL important details from the question.
-4. Report your thoughts and reasoning process clearly.
-5. Finish your answer with: FINAL ANSWER: [YOUR FINAL ANSWER]
-
-YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. 
-If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. 
-If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. 
-If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string."""
+    YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings.
+    If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise.
+    If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise.
+    If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
+    """.strip()
 
         try:
             ctx = Context(self.coordinator)
             logger.info("=== AGENT REASONING STEPS ===")
-            logger.info(f"Dynamic knowledge base contains {len(self.dynamic_qe_manager.documents)} documents")
+            logger.info("Dynamic knowledge base contains %d documents", len(self.dynamic_qe_manager.documents))
 
+            # Non-streaming pattern: await the workflow run directly
+            final_response = await self.coordinator.run(ctx=ctx, user_msg=context_prompt)
 
-            handler = self.coordinator.run(ctx=ctx, user_msg=context_prompt)
-
-            # Optional: stream to console (but don't use it as the return value)
-            async for event in handler.stream_events():
-                if isinstance(event, AgentStream):
-                    # if you really want to print, prefer stderr to avoid interleaving with logs
-                    sys.stderr.write(event.delta)
-                    sys.stderr.flush()
-
-            # Await the final result and return it
-            final_response = await handler
             logger.info("\n=== END REASONING ===")
             return str(final_response)
         except Exception as e:
@@ -1185,7 +1177,8 @@ async def main():
 
     add_tool = FunctionTool.from_defaults(
         fn=add_numbers,
-        name="add_numbers"    )
+        name="add_numbers"
+    )
 
     dummy_agent = ReActAgent(
         name="dummy_react_agent",
@@ -1199,17 +1192,13 @@ async def main():
 
     dummy_question = "If I have 7 apples and get 5 more, what is the total? Use the tool."
 
-    # Run dummy agent using the streaming handler/await pattern
-    dummy_handler = dummy_agent.run(user_msg=dummy_question)
-    async for event in dummy_handler.stream_events():
-        if isinstance(event, AgentStream):
-            sys.stderr.write(event.delta)
-            sys.stderr.flush()
-    dummy_response = await dummy_handler
+    # Non-streaming: directly await the run call
+    dummy_response = await dummy_agent.run(user_msg=dummy_question)
 
     print("\n=== DUMMY ReActAgent DEMO (async) ===")
     print("Question:", dummy_question)
     print("Agent Response:", str(dummy_response))
+
 
 if __name__ == '__main__':
     asyncio.run(main())

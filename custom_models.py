@@ -258,7 +258,7 @@ from qwen_vl_utils import process_vision_info
 
 # LlamaIndex interfaces/types
 from llama_index.core.multi_modal_llms import MultiModalLLM
-from llama_index.core.multi_modal_llms.types import MultiModalLLMMetadata
+from llama_index.core.llms import LLMMetadata
 from llama_index.core.llms import ChatMessage, ChatResponse, CompletionResponse
 from llama_index.core.schema import ImageDocument
 
@@ -311,15 +311,14 @@ class Qwen25VLMultiModal(MultiModalLLM):
 
     # -------- required metadata --------
     @property
-    def metadata(self) -> MultiModalLLMMetadata:
-        return MultiModalLLMMetadata(
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
             model_name=self.model_id,
-            context_window=None,          # unknown for multimodal
+            context_window=None,
             num_output=self.max_new_tokens,
-            num_input_files=None,
             is_chat_model=True,
             is_function_calling_model=False,
-        )  # multimodal metadata contract [11][3]
+        )
 
     # -------- helpers --------
     def _build_user_messages(

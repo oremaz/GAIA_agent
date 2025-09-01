@@ -1,0 +1,39 @@
+# Core framework
+smolagents[openai]>=1.0.0
+litellm>=1.0.0
+
+# Document retrieval
+langchain>=0.1.0
+langchain-community>=0.0.20
+rank-bm25>=0.2.2
+
+# Web automation
+selenium>=4.0.0
+helium>=3.0.0
+webdriver-manager>=3.8.0
+
+# Document processing
+pypdf>=3.0.0
+python-docx>=0.8.11
+beautifulsoup4>=4.11.0
+
+# Image and HTTP
+Pillow>=9.0.0
+requests>=2.28.0
+
+# Observability
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+langfuse
+openinference-instrumentation-smolagents
+
+# Utilities
+python-dotenv>=0.19.0
+pandas>=2.0.0
+tqdm>=4.65.0
+python-docx
+python-pptx
+pypdf
+openpyxl
+chromadb

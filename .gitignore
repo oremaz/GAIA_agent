@@ -1,0 +1,8 @@
+# Ignore VS Code and editor history folders
+.history/
+.env
+__pycache__/
+
+# Ignore audio and spreadsheet files
+*.mp3
+*.xlsx

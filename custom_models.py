@@ -247,6 +247,8 @@ class GPTOSSWrapper(CustomLLM):
     _loaded: bool = PrivateAttr(default=False)
     _lock: Any = PrivateAttr(default=None)
     _tool_registry: Any = PrivateAttr(default=None)
+    _last_tool: Any = PrivateAttr(default=None)
+    _same_tool_count: int = PrivateAttr(default=0)
 
     def __init__(self, **data: Any):
         super().__init__(**data)
@@ -356,19 +358,38 @@ class GPTOSSWrapper(CustomLLM):
     JSON_TOOL_CALL_RE: ClassVar[re.Pattern] = re.compile(r'\{"query":\s*"([^"]+)"(?:,\s*"[^"]*":\s*[^}]*)?\}')
 
     def _extract_calls(self, text: str):
-        # First try the standard TOOL_CALL format
+        # Strategy 1: standard TOOL_CALL syntax
         calls = [(m.group(1), m.group(2)) for m in self.TOOL_CALL_RE.finditer(text)]
-        
-        # If no standard format found, try JSON-style tool calls
+
+        # Strategy 2: explicit `to=tool json{...}` format (as seen in some corrupted outputs)
+        if not calls:
+            match = re.search(r'to=([A-Za-z0-9_]+)\s*json\s*(\{[^}]*\})', text, re.IGNORECASE)
+            if match:
+                tool = match.group(1)
+                try:
+                    data = json.loads(match.group(2))
+                    query = data.get("input") or data.get("query") or ""
+                except Exception:
+                    query = match.group(2)
+                calls.append((tool, query))
+                _logger.warning("Extracted tool %s from JSON-style output", tool)
+
+        # Strategy 3: generic JSON blob with query field
         if not calls:
             json_matches = list(self.JSON_TOOL_CALL_RE.finditer(text))
-            if json_matches:
-                # For JSON style, assume it's a web search tool call
-                for match in json_matches:
-                    query = match.group(1)
-                    calls.append(("enhanced_web_search", query))
-                    _logger.info("Extracted JSON-style tool call: enhanced_web_search('%s')", query)
-        
+            for match in json_matches:
+                query = match.group(1)
+                calls.append(("enhanced_web_search", query))
+                _logger.info("Extracted JSON-style tool call: enhanced_web_search('%s')", query)
+
+        # Strategy 4: fallback search for tool names in corrupted text
+        if not calls:
+            lowered = text.lower()
+            for name in self._tool_registry.keys():
+                if name.lower() in lowered:
+                    calls.append((name, ""))
+                    _logger.warning("Extracted %s from corrupted output", name)
+
         return calls
 
     def _exec_calls(self, calls):
@@ -383,6 +404,19 @@ class GPTOSSWrapper(CustomLLM):
             except Exception as e:
                 outputs.append(f"Tool {name} error: {e}")
         return outputs
+
+    def force_final_answer(self, question: str, last_response: str) -> str:
+        """Generate a final answer without further tool calls."""
+        prompt = (
+            "Based on the conversation so far, provide a FINAL ANSWER to the following question.\n"
+            f"Question: {question}\n"
+            f"Last response: {last_response}\n"
+            "Respond with 'FINAL ANSWER: <answer>' without calling any tools."
+        )
+        out = self._generate(prompt)
+        if "FINAL ANSWER:" not in out:
+            out = "FINAL ANSWER: " + out.strip()
+        return out
 
     def solve(self, question: str, max_iterations: int = 5, reasoning_effort: str = "medium") -> str:
         """Solve a question using GPT-OSS with proper chat template, reasoning effort, and tool execution loop."""
@@ -530,16 +564,29 @@ class GPTOSSWrapper(CustomLLM):
                 tool_calls = self._extract_calls(response)
                 if tool_calls:
                     _logger.info("Found %d tool calls: %s", len(tool_calls), [name for name, _ in tool_calls])
+
+                    # Consecutive tool call prevention (quick fix)
+                    primary = tool_calls[0][0]
+                    if self._last_tool == primary:
+                        self._same_tool_count += 1
+                    else:
+                        self._same_tool_count = 0
+                    self._last_tool = primary
+
+                    if self._same_tool_count >= 2:
+                        _logger.warning("Stopping consecutive %s calls", primary)
+                        return self.force_final_answer(question, response)
+
                     tool_results = self._exec_calls(tool_calls)
                     for name, _ in tool_calls:
                         used_tools.add(name)
-                    
+
                     # Build next prompt with tool results
                     tool_context = "\n".join([
-                        f"TOOL_RESULT {i+1} ({tool_calls[i][0]}): {result}" 
+                        f"TOOL_RESULT {i+1} ({tool_calls[i][0]}): {result}"
                         for i, result in enumerate(tool_results)
                     ])
-                    
+
                     current_prompt = (
                         f"Incorporate these tool results to progress toward the final answer. "
                         f"If sufficient information is available, produce 'FINAL ANSWER: <answer>' on next turn.\n"

@@ -218,6 +218,14 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                     **({"quantization_config": bnb_config} if bnb_config is not None else {}),
                 }
 
+                # When multiple GPUs are available (e.g., 2x T4 on Kaggle), provide an
+                # explicit max_memory mapping so that `device_map="auto"` can shard the
+                # model across them instead of attempting to fit everything on a single
+                # device. This prevents out-of-memory errors during initialization.
+                max_memory = get_max_memory_config("14GiB")
+                if max_memory is not None:
+                    model_kwargs["max_memory"] = max_memory
+
                 proj_llm = HuggingFaceLLM(
                     model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
                     tokenizer_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -1231,7 +1239,11 @@ class TextOnlyGPTOSSAgent:
         self.wrapper.add_tool(
             name="enhanced_web_search",
             func=self.web_tool_fn,
-            description="Search the web, extract textual content, and automatically add it to the dynamic knowledge base. Takes a natural language query string as input."
+            description=(
+                "Search the web for information on a given topic. "
+                "After retrieving results, analyze them and move toward a final answer. "
+                "Do not call this tool repeatedly for the same query."
+            ),
         )
         if rag_tool is not None:
             # Provide a callable wrapper for query engine tool

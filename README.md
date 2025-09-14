@@ -168,6 +168,9 @@ How to run the Kaggle notebook (short checklist)
 
 Notes about hardware on Kaggle
 - For non-API multimodal runs you will need 2  NVIDIA T4 GPUs.
+- The agent automatically assigns ~14GiB of memory per GPU so the 30B
+  Qwen model can be sharded across both devices without running out of
+  memory.
 - For text-only (non-API) a single GPU (T4) is typically sufficient.
 - API mode uses cloud models and is tolerant of CPU-only environments.
 

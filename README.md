@@ -42,7 +42,7 @@ This repository offers a complete Unit 4 GAIA agent with three practical entry p
 
 Hardware tips:
 - API mode is CPU-friendly.
-- Local multimodal runs expect at least two T4s (Qwen3-VL + coder).
+- Local multimodal runs are tuned for a single A100 40 GB (enough headroom for Qwen3-VL + coder).
 - Text-only runs generally need one T4 (GGUF on CPU runs but is significantly slower).
 
 ## Environment variables

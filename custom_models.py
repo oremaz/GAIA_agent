@@ -863,7 +863,7 @@ class JinaMultimodalReranker:
     Supports text-to-text, text-to-image, image-to-text, and image-to-image reranking.
     """
     
-    def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "cpu"):
+    def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "auto"):
         self.model_name = model_name
         self.top_n = top_n
         self.device = device

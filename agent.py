@@ -196,11 +196,10 @@ def initialize_models(use_api_mode=False):
                 model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
                 device="auto"
             )
-            code_llm = proj_llm
-            #get_or_create_qwen_coder_llm(
-                #model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                #device="auto"
-            #)
+            code_llm = get_or_create_qwen_coder_llm(
+                model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
+                device="auto"
+            )
             return embed_model, proj_llm, code_llm
         except Exception as e:
             logger.exception("Error initializing models: %s", e)
@@ -472,7 +471,7 @@ class DynamicQueryEngineManager:
         class HybridReranker:
             def __init__(self):
                 self.jina_reranker = get_or_create_jina_reranker(
-                    model_name="jinaai/jina-reranker-m0", top_n=5, device="cuda:1"
+                    model_name="jinaai/jina-reranker-m0", top_n=5
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):

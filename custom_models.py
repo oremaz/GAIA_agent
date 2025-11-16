@@ -782,25 +782,27 @@ class JinaEmbeddingsV4(BaseEmbedding):
         # One-by-one to avoid overlapping activation peaks
         with torch.inference_mode():
             for text, img_path in zip(texts, image_paths):
-                kwargs = dict(
+                base_kwargs = dict(
                     task=task,
                     return_multivector=return_multivector,
                     truncate_dim=eff_truncate_dim,
                     max_length=eff_max_len,
-                    max_pixels=max_pixels,
                     batch_size=eff_batch,
                 )
+                image_kwargs = dict(base_kwargs)
+                if max_pixels is not None:
+                    image_kwargs["max_pixels"] = max_pixels
 
                 if img_path is not None and text:
                     img = Image.open(img_path).convert("RGB")
-                    emb = model.encode(text=text, image=img, **kwargs)
+                    emb = model.encode(text=text, image=img, **image_kwargs)
                     results.append(_to_list_vector(emb))
                 elif img_path is not None:
                     img = Image.open(img_path).convert("RGB")
-                    emb = model.encode_image(images=[img], **kwargs)
+                    emb = model.encode_image(images=[img], **image_kwargs)
                     results.append(_to_list_vector(emb))
                 else:
-                    ekw = {"texts": [text], **kwargs}
+                    ekw = {"texts": [text], **base_kwargs}
                     if prompt_name:
                         ekw["prompt_name"] = prompt_name
                     emb = model.encode_text(**ekw)

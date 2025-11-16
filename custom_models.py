@@ -232,7 +232,6 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
             _logger.warning("BitsAndBytes unavailable for Qwen coder (%s); loading in full precision.", exc)
         model_kwargs = {
             "torch_dtype": compute_dtype,
-            "device_map": key[1],
         }
         if quant_config is not None:
             model_kwargs["quantization_config"] = quant_config
@@ -248,6 +247,7 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
             },
             messages_to_prompt=_qwen_messages_to_prompt,
             completion_to_prompt=_qwen_completion_to_prompt,
+            device_map=key[1],
         )
         _LLM_CACHE[key] = inst
         return inst

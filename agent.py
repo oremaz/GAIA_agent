@@ -195,10 +195,11 @@ def initialize_models(use_api_mode=False):
                 model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
                 device="auto"
             )
-            code_llm = get_or_create_qwen_coder_llm(
-                model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
-                device="auto"
-            )
+            code_llm = proj_llm
+            #get_or_create_qwen_coder_llm(
+                #model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
+                #device="auto"
+            #)
             embed_model = get_or_create_jina_embedder()
             return proj_llm, code_llm, embed_model
         except Exception as e:

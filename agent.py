@@ -23,6 +23,7 @@ from custom_models import (
 
 # LlamaIndex core imports
 from llama_index.core import VectorStoreIndex, Document, Settings, PromptTemplate
+from llama_index.core.base.query_engine import BaseQueryEngine
 from llama_index.core.tools import FunctionTool
 from llama_index.core.agent.workflow import ReActAgent, AgentStream
 from llama_index.core.node_parser import UnstructuredElementNodeParser, SentenceSplitter
@@ -229,6 +230,39 @@ logging.getLogger("llama_index.llms").setLevel(logging.DEBUG)
 # Module logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+class LoggingQueryEngine(BaseQueryEngine):
+    """Thin wrapper that adds structured logging around query execution."""
+
+    def __init__(self, inner_engine: BaseQueryEngine, name: str = "dynamic_hybrid_multimodal_rag_tool"):
+        self._inner_engine = inner_engine
+        self._logger = logging.getLogger(__name__)
+        self._tool_name = name
+
+    def query(self, query: str, **kwargs):
+        self._logger.info("%s query received: %s", self._tool_name, query)
+        try:
+            response = self._inner_engine.query(query, **kwargs)
+            self._logger.info("%s query succeeded", self._tool_name)
+            return response
+        except Exception:
+            self._logger.exception("%s query failed", self._tool_name)
+            raise
+
+    async def aquery(self, query: str, **kwargs):
+        self._logger.info("%s async query received: %s", self._tool_name, query)
+        try:
+            response = await self._inner_engine.aquery(query, **kwargs)
+            self._logger.info("%s async query succeeded", self._tool_name)
+            return response
+        except Exception:
+            self._logger.exception("%s async query failed", self._tool_name)
+            raise
+
+    def __getattr__(self, item):
+        # Delegate everything else to the wrapped engine (streaming, metadata, etc.)
+        return getattr(self._inner_engine, item)
 
 
 # Use environment variables to determine API mode
@@ -566,12 +600,13 @@ class DynamicQueryEngineManager:
     def _create_or_update_query_engine_tool(self, rebuild: bool = False):
         if self.index is None:
             return
-        query_engine = self.index.as_query_engine(
+        base_query_engine = self.index.as_query_engine(
             similarity_top_k=20,
             node_postprocessors=[self._hybrid_reranker] if self._hybrid_reranker else [],
             response_mode="tree_summarize",
             llm=self.llm  # explicit LLM (Settings.llm not set globally)
         )
+        query_engine = LoggingQueryEngine(base_query_engine)
         from llama_index.core.tools import QueryEngineTool
         if self.query_engine_tool is None:
             self.query_engine_tool = QueryEngineTool.from_defaults(

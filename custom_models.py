@@ -1108,73 +1108,89 @@ class JinaMultimodalReranker:
                 self._load_model()
                 self._loaded = True
             except Exception as e:
-                print(f"Reranker lazy-load failed: {e}")
+                _logger.exception("Reranker lazy-load failed: %s", e)
                 # If loading fails, return the original nodes limited to top_n
                 return nodes[:self.top_n]
-        
-        query = query_bundle.query_str
-        
+
+        query = getattr(query_bundle, "query_str", "") or ""
+        _logger.debug("Reranker received %d nodes for query='%s'", len(nodes), query)
+
         # Prepare query-document pairs for reranking
         text_pairs = []
+        text_indices = []
         image_pairs = []
-        node_indices = []
-        
-        for i, node in enumerate(nodes):
-            # Check if node contains image content
+        image_indices = []
+
+        def _unwrap(node_like):
+            return getattr(node_like, "node", None) or node_like
+
+        for i, node_wrapper in enumerate(nodes):
+            node = _unwrap(node_wrapper)
             has_image = self._node_has_image(node)
-            
+
             if has_image:
-                # Get image path/URL from node
                 image_path = self._extract_image_path(node)
                 if image_path:
                     image_pairs.append([query, image_path])
-                    node_indices.append(('image', i))
+                    image_indices.append(i)
+                else:
+                    _logger.debug("Image node missing path for index %s", i)
             else:
-                # Text content
-                text_content = node.get_content()
-                text_pairs.append([query, text_content])
-                node_indices.append(('text', i))
-        
-        # Compute scores
+                text_content = ""
+                if hasattr(node, "get_content"):
+                    try:
+                        text_content = node.get_content() or ""
+                    except Exception as err:
+                        _logger.debug("get_content failed for node %s: %s", i, err)
+                        text_content = ""
+                if not text_content:
+                    text_content = getattr(node, "text", "") or ""
+                if text_content:
+                    text_pairs.append([query, text_content])
+                    text_indices.append(i)
+                else:
+                    _logger.debug("Skipping empty text node at index %s", i)
+
         all_scores = []
-        
+
         try:
-            # Score text pairs
             if text_pairs:
                 text_scores = self._model.compute_score(
-                    text_pairs, 
-                    max_length=1024, 
+                    text_pairs,
+                    max_length=1024,
                     doc_type="text"
                 )
-                all_scores.extend([(score, 'text', idx) for score, (_, idx) in zip(text_scores, [x for x in node_indices if x[0] == 'text'])])
-            
-            # Score image pairs  
+                for score, idx in zip(text_scores, text_indices):
+                    all_scores.append((score, idx))
+
             if image_pairs:
                 image_scores = self._model.compute_score(
-                    image_pairs, 
-                    max_length=2048, 
+                    image_pairs,
+                    max_length=2048,
                     doc_type="image"
                 )
-                all_scores.extend([(score, 'image', idx) for score, (_, idx) in zip(image_scores, [x for x in node_indices if x[0] == 'image'])])
-        
+                for score, idx in zip(image_scores, image_indices):
+                    all_scores.append((score, idx))
+
         except Exception as e:
-            print(f"Error during reranking: {e}")
-            # Return original nodes if reranking fails
+            _logger.exception("Error during reranking: %s", e)
             return nodes[:self.top_n]
-        
-        # Sort by score (descending)
+
+        if not all_scores:
+            _logger.debug("No reranker scores computed; returning original nodes")
+            return nodes[:self.top_n]
+
         all_scores.sort(key=lambda x: x[0], reverse=True)
-        
-        # Return top N reranked nodes
+
         reranked_nodes = []
-        for score, content_type, node_idx in all_scores[:self.top_n]:
+        for score, node_idx in all_scores[:self.top_n]:
             if node_idx < len(nodes):
                 node = nodes[node_idx]
-                # Update node score
                 if hasattr(node, 'score'):
                     node.score = score
                 reranked_nodes.append(node)
-        
+
+        _logger.debug("Reranker returning %d nodes", len(reranked_nodes))
         return reranked_nodes
     
     def _node_has_image(self, node) -> bool:

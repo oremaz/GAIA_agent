@@ -182,7 +182,7 @@ def initialize_models(use_api_mode=False):
                 task_type="retrieval_document"
             )
 
-            return proj_llm, code_llm, embed_model
+            return embed_model, proj_llm, code_llm
         except Exception as e:
             logger.exception("Error initializing API mode: %s", e)
             logger.info("Falling back to non-API mode...")
@@ -191,6 +191,7 @@ def initialize_models(use_api_mode=False):
         logger.info("Initializing models in non-API mode with local models...")
         try:
             logger.info("Initializing Qwen3-VL multimodal pipeline via get_or_create_qwen_vl_llm")
+            embed_model = get_or_create_jina_embedder()
             proj_llm = get_or_create_qwen_vl_llm(
                 model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
                 device="auto"
@@ -200,8 +201,7 @@ def initialize_models(use_api_mode=False):
                 #model_name="Qwen/Qwen2.5-Coder-3B-Instruct",
                 #device="auto"
             #)
-            embed_model = get_or_create_jina_embedder()
-            return proj_llm, code_llm, embed_model
+            return embed_model, proj_llm, code_llm
         except Exception as e:
             logger.exception("Error initializing models: %s", e)
             raise
@@ -236,7 +236,7 @@ logger.setLevel(logging.INFO)
 USE_API_MODE = os.environ.get("USE_API_MODE", "false").lower() == "true"
 
 # Initialize models based on API mode and multimodal setting
-proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE)
+embed_model, proj_llm, code_llm = initialize_models(use_api_mode=USE_API_MODE)
 
 Settings.llm = proj_llm
 Settings.embed_model = embed_model

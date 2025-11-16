@@ -9,8 +9,12 @@ import sys
 # --- Constants ---
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
-# Import your custom agent from agent.py
-from agent import GAIAAgent
+TEXT_ONLY = os.environ.get("TEXT_ONLY", "false").lower() == "true"
+if TEXT_ONLY:
+    from agent3 import TextOnlyGptOssAgent as GAIAAgent  # type: ignore
+    print("Running app in TEXT_ONLY mode – using agent3.TextOnlyGptOssAgent.")
+else:
+    from agent import GAIAAgent  # type: ignore
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------

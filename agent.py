@@ -18,8 +18,7 @@ from custom_models import (
     get_or_create_jina_reranker,
     get_or_create_jina_embedder,
     get_or_create_qwen_vl_llm,
-    get_or_create_qwen3_gguf_embedding,
-    get_or_create_gpt_llm,
+    get_or_create_qwen_coder_llm,
 )
 
 # LlamaIndex core imports
@@ -31,7 +30,6 @@ from llama_index.core.workflow import Context
 from llama_index.core.schema import ImageNode, TextNode, ImageDocument
 
 # LlamaIndex specialized imports
-from llama_index.llms.huggingface import HuggingFaceLLM
 from llama_index.readers.assemblyai import AssemblyAIAudioTranscriptReader
 from llama_index.readers.json import JSONReader
 from llama_index.readers.web import BeautifulSoupWebReader
@@ -149,13 +147,11 @@ def get_max_memory_config(max_memory_per_gpu):
     return None
 
 # Initialize models based on API availability
-def initialize_models(use_api_mode=False, multimodal: bool = True):
-    """Initialize LLM, Code LLM, and Embed models based on mode.
+def initialize_models(use_api_mode=False):
+    """Initialize LLM, Code LLM, and Embed models.
 
     Args:
         use_api_mode: when True use API-backed models (Gemini/GeminiEmbedding)
-        multimodal: when False use text-only pipeline (GPT-OSS, Qwen3 GGUF embeddings,
-                    and CPU reranker). When True keep the multimodal pipeline.
     """
     if use_api_mode and GEMINI_AVAILABLE:
         # API Mode - Using Google's Gemini models
@@ -166,7 +162,7 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
                 logger.warning("WARNING: GOOGLE_API_KEY not found. Falling back to non-API mode.")
                 return initialize_models(use_api_mode=False)
 
-            # Main LLM - Gemini 2.0 Flash
+            # Main LLM - Gemini 2.5 Flash
             proj_llm = Gemini(
                 model="models/gemini-2.5-flash",
                 api_key=google_api_key,
@@ -192,61 +188,18 @@ def initialize_models(use_api_mode=False, multimodal: bool = True):
             logger.info("Falling back to non-API mode...")
             return initialize_models(use_api_mode=False)
     else:
-        # Non-API Mode - Using local models
         logger.info("Initializing models in non-API mode with local models...")
-
         try:
-            if multimodal:
-                # Multimodal pipeline using Qwen3-30B-A3B-Instruct-2507
-                # Based on the model documentation recommendations
-                # 4-bit quantization configuration (NF4 + bfloat16 compute) to reduce VRAM while preserving quality
-                try:
-                    from transformers import BitsAndBytesConfig
-                    bnb_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",          # NF4 quantization (better than FP4 for many models)
-                        bnb_4bit_use_double_quant=True,       # double quantization for additional memory savings
-                        bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                    )
-                except Exception:
-                    bnb_config = None
-
-                model_kwargs = {
-                    "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else "auto",  # prefer bfloat16 compute
-                    "low_cpu_mem_usage": True,
-                    # Enable memory-efficient loading if bitsandbytes is available
-                    **({"quantization_config": bnb_config} if bnb_config is not None else {}),
-                }
-
-                proj_llm = HuggingFaceLLM(
-                    model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
-                    tokenizer_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
-                    device_map="auto" if torch.cuda.is_available() else "cpu",
-                    model_kwargs=model_kwargs,
-                    max_new_tokens=2048,  # Recommended output length from docs
-                    generate_kwargs={
-                        "do_sample": True,
-                        "temperature": 0.2,
-                        "top_p": 0.9,
-                        "top_k": 20,
-                        "repetition_penalty": 1.1
-                    }
-                )
-                # Use cached embedder to avoid repeated heavy loads
-                embed_model = get_or_create_jina_embedder()
-
-                # Code LLM via shared GGUF factory (llama.cpp backend)
-                code_llm = proj_llm
-            else:
-                # Text-only pipeline: acquire GPT-OSS wrapper via factory
-                logger.info("Initializing text-only local pipeline via get_or_create_gpt_llm + Qwen3 GGUF embeddings")
-                proj_llm = get_or_create_gpt_llm(
-                    model_name="openai/gpt-oss-20b",
-                    device="cuda:0" if torch.cuda.is_available() else "cpu"
-                )
-                code_llm = proj_llm  # reuse
-                embed_model = get_or_create_qwen3_gguf_embedding()
-
+            logger.info("Initializing Qwen3-VL multimodal pipeline via get_or_create_qwen_vl_llm")
+            proj_llm = get_or_create_qwen_vl_llm(
+                model_name="Qwen/Qwen3-VL-30B-A3B-Instruct",
+                device="auto"
+            )
+            code_llm = get_or_create_qwen_coder_llm(
+                model_name="Qwen/Qwen2.5-Coder-3B-Instruct-AWQ",
+                device="auto"
+            )
+            embed_model = get_or_create_jina_embedder()
             return proj_llm, code_llm, embed_model
         except Exception as e:
             logger.exception("Error initializing models: %s", e)
@@ -283,7 +236,7 @@ USE_API_MODE = os.environ.get("USE_API_MODE", "false").lower() == "true"
 NONAPI_MULTIMODAL = os.environ.get("NONAPI_MULTIMODAL", "true").lower() == "true"
 
 # Initialize models based on API mode and multimodal setting
-proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE, multimodal=NONAPI_MULTIMODAL)
+proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE)
 
 Settings.llm = proj_llm
 Settings.embed_model = embed_model
@@ -294,22 +247,10 @@ logger.info(f"proj_llm model_name: {getattr(proj_llm, 'model_name', 'N/A')}")
 logger.info(f"embed_model type: {type(embed_model)}")
 
 
-# Optional separate lighter multimodal model (7B) for image-to-text captioning
-IMAGE_CAPTION_LLM = None
-if (not USE_API_MODE) and NONAPI_MULTIMODAL:
-    try:
-        # Force 7B variant for faster/cheaper image descriptions even if main proj_llm is larger
-        IMAGE_CAPTION_LLM = get_or_create_qwen_vl_llm(model_name="Qwen/Qwen2.5-VL-7B-Instruct-AWQ")
-    except Exception as e:
-        logger.warning(f"Failed to initialize 7B image caption model: {e}")
+IMAGE_CAPTION_LLM = proj_llm if (not USE_API_MODE and NONAPI_MULTIMODAL) else None
 
 def process_image(image_path: str) -> str:
-    """process_image(image_path: str) -> str
-
-    Convert an image at the given local path into a concise textual description
-    using the lightweight 7B Qwen multimodal model. Returns an error string if
-    the image can't be processed.
-    """
+    """Describe an image using the primary Qwen3-VL-30B-A3B-Instruct model."""
     import os
     if IMAGE_CAPTION_LLM is None:
         return "Image captioning model not available."
@@ -871,24 +812,9 @@ def execute_python_code(code: str) -> str:
         return f"Code execution failed: {str(e)}"
 
 def clean_response(response: str) -> str:
-    """Clean response by removing common prefixes and GPT-OSS internal reasoning"""
+    """Clean response by removing common prefixes before GAIA formatting."""
     response_clean = response.strip()
-    
-    # GPT-OSS specific cleaning - remove internal reasoning artifacts
-    gpt_oss_prefixes = [
-        "assistantfinalThought:",
-    ]
-    
-    # First clean GPT-OSS artifacts
-    for prefix in gpt_oss_prefixes:
-        if prefix.lower() in response_clean.lower():
-            # Find the position and extract everything after it
-            pos = response_clean.lower().find(prefix.lower())
-            if pos != -1:
-                response_clean = response_clean[pos + len(prefix):].strip()
-                break
-    
-    # Then clean common response prefixes
+
     prefixes_to_remove = [
         "FINAL ANSWER:", "Answer:", "The answer is:",
         "Based on my analysis,", "After reviewing,",
@@ -1207,137 +1133,18 @@ If you are asked for a comma separated list, apply the above rules depending of 
         }
 
 
-class TextOnlyGPTOSSAgent:
-    """Text-only GAIA agent (simplified).
-
-    NOTE: Formerly relied on GPTOSSWrapper; now uses a standard HuggingFaceLLM
-    (Qwen2.5-7B-Instruct) initialized in initialize_models(). The class name is
-    kept for backward compatibility; references to GPT-OSS specific tool-calling
-    have been removed.
-    """
-
-    def __init__(self):
-        if NONAPI_MULTIMODAL:
-            raise RuntimeError("TextOnlyGPTOSSAgent should be used only when NONAPI_MULTIMODAL is False (text-only mode).")
-
-        self.wrapper = proj_llm  # GPTOSSWrapper instance
-        self.dynamic_qe_manager = DynamicQueryEngineManager()  # manager builds its own index & tool
-
-        # Build tools (do NOT wrap via LlamaIndex agent layer)
-        self.web_tool_fn = make_enhanced_web_search_tool(self.dynamic_qe_manager)
-        rag_tool = self.dynamic_qe_manager.get_tool()
-
-        # Register tools with GPT-OSS wrapper (idempotent if re-created)
-        self.wrapper.add_tool(
-            name="enhanced_web_search",
-            func=self.web_tool_fn,
-            description="Search the web, extract textual content, and automatically add it to the dynamic knowledge base. Takes a natural language query string as input."
-        )
-        if rag_tool is not None:
-            # Provide a callable wrapper for query engine tool
-            def rag_query(query: str) -> str:
-                try:
-                    resp = rag_tool.query_engine.query(query)
-                    return str(getattr(resp, 'response', resp))
-                except Exception as e:
-                    return f"RAG query failed: {e}"
-            rag_query.__name__ = "dynamic_knowledge_query"
-            self.wrapper.add_tool(
-                name="dynamic_knowledge_query",
-                func=rag_query,
-                description="Query the current dynamic knowledge base (vector + reranker). Takes an information need in natural language as input."
-            )
-
-        # Add python code execution tool
-        self.wrapper.add_tool(
-            name="execute_python_code",
-            func=execute_python_code,
-            description="Execute Python code safely. Takes Python code as a string input and returns the result or any errors."
-        )
-
-        logger.info("TextOnlyGPTOSSAgent initialized with tools: %s", [schema['function']['name'] for schema in self.wrapper.tool_schemas])
-
-    # ---- GAIA file helpers (copied/adapted from EnhancedGAIAAgent without ReAct usage) ----
-    def download_gaia_file(self, task_id: str, api_url: str = "https://agents-course-unit4-scoring.hf.space") -> Optional[str]:
-        try:
-            response = requests.get(f"{api_url}/files/{task_id}", timeout=30)
-            response.raise_for_status()
-            content_disp = response.headers.get("content-disposition", "")
-            match = re.search(r'filename="(.+)"', content_disp)
-            if not match:
-                raise ValueError("Filename not found in response headers")
-            filename = match.group(1)
-            with open(filename, 'wb') as f:
-                f.write(response.content)
-            logger.info("Downloaded GAIA file %s", filename)
-            return os.path.abspath(filename)
-        except Exception as e:
-            logger.exception("Failed to download GAIA file %s: %s", task_id, e)
-            return None
-
-    def add_documents_to_knowledge_base(self, file_path: str):
-        try:
-            documents = read_and_parse_content(file_path)
-            if documents:
-                self.dynamic_qe_manager.add_documents(documents)
-                logger.info("Added %d docs from %s to knowledge base", len(documents), file_path)
-                return True
-        except Exception as e:
-            logger.exception("Failed adding documents: %s", e)
-        return False
-
-    def get_knowledge_base_stats(self):
-        return {
-            "total_documents": len(self.dynamic_qe_manager.documents),
-            "document_sources": [doc.metadata.get("source", "Unknown") for doc in self.dynamic_qe_manager.documents]
-        }
-
-    async def solve_gaia_question(self, question_data: Dict[str, Any]) -> str:
-        """Solve GAIA question using GPT-OSS native reasoning + tool loop."""
-        question = question_data.get("Question", "")
-        task_id = question_data.get("task_id", "")
-
-        file_path = None
-        if task_id:
-            file_path = self.download_gaia_file(task_id)
-            if file_path:
-                self.add_documents_to_knowledge_base(file_path)
-
-        gaia_format_instructions = (
-            "YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings.\n"
-            "If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise.\n"
-            "If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise.\n"
-            "If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string."
-        )
-
-        prompt = (
-            f"GAIA Task ID: {task_id}\n" if task_id else "" ) + \
-            f"Question: {question}\n" + \
-            (f"File processed and added to knowledge base: {file_path}\n" if file_path else "No additional files provided.\n") + \
-            "You are a capable reasoning model with tool access. Think step by step. " \
-            "Use enhanced_web_search for fresh info, dynamic_knowledge_query for stored context, and execute_python_code for calculations. " \
-            "Call tools ONLY with the format TOOL_CALL: tool_name(\"argument string\"). After gathering enough information, produce the final concise answer prefixed by FINAL ANSWER:.\n\n" + \
-            gaia_format_instructions
-
-        try:
-            raw_response = self.wrapper.solve(prompt, max_iterations=6, reasoning_effort="high")
-            return raw_response
-        except Exception as e:
-            logger.exception("Error in text-only GPT-OSS solve: %s", e)
-            return f"Error solving question: {e}"
-
 class GAIAAgent:
-    """Router that selects EnhancedGAIAAgent (multimodal) or TextOnlyGPTOSSAgent (text-only)
-    based on the `NONAPI_MULTIMODAL` flag and forwards the public API.
-    """
+    """Backwards-compatible wrapper that always instantiates the multimodal agent."""
+
     def __init__(self):
-        logger.info("Initializing GAIAAgent router (NONAPI_MULTIMODAL=%s)", NONAPI_MULTIMODAL)
-        if NONAPI_MULTIMODAL:
-            self._agent = EnhancedGAIAAgent()
-            self.mode = "multimodal"
-        else:
-            self._agent = TextOnlyGPTOSSAgent()
-            self.mode = "text-only"
+        logger.info("Initializing GAIAAgent (NONAPI_MULTIMODAL=%s)", NONAPI_MULTIMODAL)
+        if not NONAPI_MULTIMODAL:
+            raise RuntimeError(
+                "Text-only mode now lives in agent3.TextOnlyGptOssAgent. "
+                "Set NONAPI_MULTIMODAL=true or import the new agent."
+            )
+        self._agent = EnhancedGAIAAgent()
+        self.mode = "multimodal"
 
     async def solve_gaia_question(self, question_data: Dict[str, Any]) -> str:
         return await self._agent.solve_gaia_question(question_data)

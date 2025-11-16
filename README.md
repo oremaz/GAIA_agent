@@ -7,8 +7,9 @@ This repository provides a GAIA (Unit 4) agent implementation with two main tech
 This README (updated to reflect ONLY the code paths present in `agent.py` and `custom_models.py`) documents what is actually implemented, clarifies prior placeholder claims, and lists remaining gaps if you intend to use this as a full leaderboard submission template.
 
 ## Quick map
-- Kaggle (notebook): `hf-agents.ipynb` — uses `agent.py`, `custom_models.py`, `requirements.txt`, `appasync.py`.
-- Local / development: `agent2.py`, `app.py`, `requirements2.txt` — simplified local runner using smolagents/Gemini and Langfuse integration.
+- Kaggle / notebook: `hf-agents.ipynb` — uses the main LlamaIndex stack (`agent.py`, `custom_models.py`, `requirements.txt`, `appasync.py`).
+- Local / dev UI: `agent2.py`, `app.py`, `requirements2.txt` — simplified smolagents/Gemini runner (not covered in this doc).
+- **Text-only CLI**: `agent3.py` — lightweight GPT‑OSS + Qwen3 embedding workflow for CPU/GGUF environments.
 
 I read the following sources from this repository and the Unit4 hands-on page to create this README:
 - Web page: https://huggingface.co/learn/agents-course/unit4/hands-on (Unit4 hands-on description and API routes)
@@ -18,30 +19,28 @@ I read the following sources from this repository and the Unit4 hands-on page to
 
 The rest of this README documents how the code maps to the Unit4 challenge and how to run and validate the agent locally and on Kaggle.
 
-## Current capabilities (based on `agent.py` + `custom_models.py`)
-Implemented:
-1. Dual runtime modes selected by env vars:
-	- `USE_API_MODE=true` → Gemini (LLM + embedding) if Google key present, with fallback to local mode on failure.
-	- `USE_API_MODE=false` → Local models. Branching again on `NONAPI_MULTIMODAL`:
-	  * `NONAPI_MULTIMODAL=true` (multimodal local) loads a large Hugging Face model: `Qwen/Qwen3-30B-A3B-Instruct-2507` via `HuggingFaceLLM` plus Jina V4 embeddings; adds an optional lightweight captioning model (`Qwen/Qwen2.5-VL-7B-Instruct-AWQ`) only for image description.
-	  * `NONAPI_MULTIMODAL=false` (text-only local) uses a custom `GPTOSSWrapper` (model: `openai/gpt-oss-20b`) for both reasoning + code, and a `Qwen3GGUFEmbedding` (GGUF / llama.cpp fallback) for embeddings.
-2. Incremental multimodal RAG:
-	- Parsing: `MultimodalPDFReader` merges `SmartPDFLoader` (layout text) with `PyMuPDFReader` (images) — current implementation only appends image documents from PyMuPDF (text from SmartPDFLoader already loaded).
-	- Office docs auto-converted to PDF via LibreOffice (`soffice`) in `convert_to_pdf` (hard fail with explicit RuntimeError if absent).
-	- Audio/video handled with `VideoAudioReader` (non‑API) or `AssemblyAIAudioTranscriptReader` (API mode). Images become `Document` objects with binary bytes in metadata.
-3. Node pipeline: `UnstructuredElementNodeParser` → `RecursiveCharacterTextSplitter(4096, 512)` (or `SentenceSplitter` fallback) → dedup by SHA1 of normalized text.
-4. Vector store: attempts persistent Chroma (`duckdb+parquet` at `./chroma_db`) else falls back to in-memory `VectorStoreIndex` seamlessly.
-5. Reranking: dynamic `HybridReranker` chooses `jinaai/jina-reranker-m0` (multimodal) or `jinaai/jina-reranker-v2-base-multilingual` (text-only). Applied as node postprocessor.
-6. Dynamic knowledge growth: web search tool (`enhanced_web_search`) scrapes a top result (DuckDuckGo Search → first link via `ddgs`) using `BeautifulSoupWebReader` or `YoutubeTranscriptReader`, auto-inserts docs, and reuses the same index incrementally (`insert_nodes`).
-7. Safe Python execution: sandboxed `execute_python_code` with curated builtins + optional scientific libs if available (no filesystem/network escalation safeguards beyond import allowlist—treat as semi‑trusted, not fully sandboxed for multi-user).
-8. Tool-enabled agents:
-	- Multimodal branch: Two `ReActAgent`s (`external_knowledge_agent` + `code_execution_agent`) orchestrated by an `AgentWorkflow` (root = external knowledge). Tools: dynamic RAG query engine, web search, code exec, optional image captioning.
-	- Text-only branch: Custom iterative reasoning + tool loop inside `GPTOSSWrapper.solve` (regex extracts `TOOL_CALL:` directives) enabling web search, RAG queries, and code execution.
-9. Final answer normalization: `final_answer_tool` cleans model output and optionally re-prompts the main LLM to extract a GAIA-compliant concise answer (numbers / short strings / CSV list) using explicit format rules.
+## Current capabilities
 
-Optional / available but unused by default path choices:
-- `Qwen25VLMultiModal` (custom wrapper) exists in `custom_models.py` but is only invoked for the lightweight 7B captioning model via `get_or_create_qwen_vl_llm`, not for the main 30B reasoning LLM in current code.
-- `QwenCoderGGUFLLM` helper present but not wired into `initialize_models`.
+### 1. Runtime modes
+- `USE_API_MODE=true` → Gemini (LLM + embedding); falls back to local mode automatically on failures.
+- `USE_API_MODE=false` → Local models:
+  * `agent.py` (requires `NONAPI_MULTIMODAL=true`) loads the **new `Qwen/Qwen3-VL-30B-A3B-Instruct`** custom wrapper with NF4 int4 quantization plus `jinaai/jina-embeddings-v4`, and pairs it with `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` for the dedicated code executor agent.
+  * `agent3.py` provides the **text-only GPT-OSS route** (see “Text-only agent” below). Set `NONAPI_MULTIMODAL=false` only if you plan to drive `agent3.TextOnlyGptOssAgent`; `agent.py` now raises if you try to run without the multimodal stack.
+
+### 2. Retrieval / ingestion (shared with previous README)
+1. **Document ingestion** — `MultimodalPDFReader` (SmartPDFLoader + PyMuPDF) for PDFs; LibreOffice conversion for Office formats; audio/video Readers; plain image docs stored with binary in metadata.
+2. **Node pipeline** — `UnstructuredElementNodeParser` → `RecursiveCharacterTextSplitter(4096/512 overlap)` (SentenceSplitter fallback) → SHA1 dedup.
+3. **Vector store** — persistent `ChromaVectorStore` at `./chroma_db` with in-memory fallback.
+4. **Embeddings + reranker** — `jinaai/jina-embeddings-v4` (4-bit NF4) + `jinaai/jina-reranker-v2-base-multilingual` (quantized when CUDA available; llama.cpp GGUF fallback on CPU). The reranker exposes a helper for non–llama-index callers used by `agent3`.
+5. **Dynamic knowledge growth** — `enhanced_web_search_and_update` uses DuckDuckGo Search (DDGS) and `BeautifulSoupWebReader`/`YoutubeTranscriptReader`, automatically appending new docs to the current vector index.
+
+### 3. Tooling and orchestration
+- **Multimodal agent (`agent.py`)** — ReAct workflow with two sub-agents (knowledge + code). Tools include RAG query engine, web search, Python execution, and the Qwen3-VL image caption hook. Final answers are cleaned and reformatted via the same Qwen3-VL model inside `final_answer_tool`.
+- Code sub-agent specifically uses `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` via LlamaIndex’s `HuggingFaceLLM`, matching the upstream AWQ loading guidance.
+- **Text-only agent (`agent3.py`)** — Standalone pipeline using GPT‑OSS‑20B (transformers), `Qwen3GGUFEmbedding`, and the Jina reranker. It keeps a lightweight knowledge base (chunked GGUF embeddings), an integrated DDGS scraper, and a Python execution sandbox, all orchestrated through an iterative `TOOL_CALL:` loop similar to the old wrapper.
+
+### 4. Final answer handling
+- `final_answer_tool` still normalizes the response for GAIA rules. In text-only mode, `agent3` relies on prompt discipline plus the same regex cleanup logic from `agent.py`.
 
 ## Requirements and environment
 
@@ -59,7 +58,7 @@ Optional / available but unused by default path choices:
 
 Environment variables used by the code
 - `USE_API_MODE` (true/false) — when true the code prefers API/cloud models (Gemini). Default: false.
-- `NONAPI_MULTIMODAL` (true/false) — when false + non-API => text-only pipeline (GPT-OSS + Qwen3 GGUF embeddings). Default: true.
+- `NONAPI_MULTIMODAL` (true/false) — keep `true` for `agent.py`. Set to `false` only if you are instantiating `TextOnlyGptOssAgent` from `agent3.py`. Default: true.
 - `GOOGLE_API_KEY` — used for Gemini API routes (API mode).
 - `HUGGINGFACEHUB_API_TOKEN` / `HF_TOKEN` — used for HF Hub downloads where needed.
 - `LLAMA_CLOUD_API_KEY` — optional, used for Llama Cloud services like LlamaParse when available.
@@ -199,3 +198,27 @@ How to run locally (short checklist)
 - Image caption tool (optional 7B) → Yes (registered only if init succeeds).
 - Final answer normalization for GAIA format → Yes (`final_answer_tool`).
 - Full GAIA fetch/submit automation → Not yet (manual driver needed).
+
+## Text-only agent (`agent3.py`)
+
+`agent3.py` is the new text-only pipeline requested in the spec. Highlights:
+
+- **LLM**: `openai/gpt-oss-20b` via `transformers` (Harmony chat template + iterative tool loop).
+- **Embeddings / reranker**: `Qwen3GGUFEmbedding` (llama.cpp-backed GGUF download) and `jinaai/jina-reranker-v2-base-multilingual`. Both have CPU fallbacks, so this route can run fully offline.
+- **Knowledge base**: `SimpleKnowledgeBase` chunks every ingested document, stores embeddings in memory, and surfaces top passages both via cosine similarity and Jina reranking.
+- **Tools wired into GPT‑OSS**: DDGS-powered `enhanced_web_search`, RAG query, and `execute_python_code` sharing the same sandbox allowlist as `agent.py`.
+
+Usage example:
+
+```python
+import asyncio
+from agent3 import TextOnlyGptOssAgent
+
+agent = TextOnlyGptOssAgent()
+question = {"Question": "Who won the 2012 Nobel Prize in Literature?", "task_id": ""}
+print(asyncio.run(agent.solve_gaia_question(question)))
+```
+
+Tips:
+- Keep `NONAPI_MULTIMODAL=true` when running `agent.py`. Use `TextOnlyGptOssAgent` directly instead of toggling the env var.
+- First run may download GGUF models (Qwen3 embedding + GPT‑OSS weights); ensure you have enough disk space and set `HF_HOME` if necessary.

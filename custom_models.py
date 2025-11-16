@@ -1,21 +1,15 @@
-from typing import Optional, List, Any, ClassVar
+from typing import Optional, List, Any, Dict, Sequence
 import os
 from pydantic import Field, PrivateAttr
 from llama_index.core.llms import CustomLLM, CompletionResponse, CompletionResponseGen, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
-from transformers import Qwen2_5_VLForConditionalGeneration
-from transformers import AutoProcessor
+from llama_index.llms.huggingface import HuggingFaceLLM
+from transformers import AutoProcessor, TextIteratorStreamer, Qwen3VLMoeForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 import torch
-from typing import Any, List, Optional
 from llama_index.core.embeddings import BaseEmbedding
-from transformers import AutoModel, BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM
-import threading
-import logging
-import torch
-import re
-import json
-import re
+from llama_index.core.schema import ImageDocument
+from transformers import AutoModel, BitsAndBytesConfig
 import threading
 import logging
 
@@ -27,6 +21,27 @@ _logger = logging.getLogger(__name__)
 _EMBEDDER_CACHE = {}
 _RERANKER_CACHE = {}
 _LLM_CACHE = {}
+
+
+def _qwen_messages_to_prompt(messages):
+    prompt = ""
+    for message in messages:
+        role = getattr(message, "role", None) or message.get("role")
+        content = getattr(message, "content", None) or message.get("content", "")
+        if role == "system":
+            prompt += f"<|system|>\n{content}</s>\n"
+        elif role == "user":
+            prompt += f"<|user|>\n{content}</s>\n"
+        elif role == "assistant":
+            prompt += f"<|assistant|>\n{content}</s>\n"
+    if not prompt.startswith("<|system|>\n"):
+        prompt = "<|system|>\n</s>\n" + prompt
+    prompt += "<|assistant|>\n"
+    return prompt
+
+
+def _qwen_completion_to_prompt(completion):
+    return f"<|system|>\n</s>\n<|user|>\n{completion}</s>\n<|assistant|>\n"
 
 def _truncate_on_stop(text: str, stop: Optional[List[str]]) -> str:
     if not stop:
@@ -87,7 +102,7 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 
     Keyed by (model_name, top_n, device).
     """
-    key = (model_name or "jinaai/jina-reranker-m0", top_n, device)
+    key = (model_name or "jinaai/jina-reranker-v2-base-multilingual", top_n, device)
     inst = _RERANKER_CACHE.get(key)
     if inst is not None:
         return inst
@@ -125,16 +140,12 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 
 
 def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached Qwen25VLMultiModal or create one.
+    """Return cached Qwen3VLMultiModal or create one.
 
-    Qwen25VLMultiModal is the new multimodal wrapper replacing the deprecated
-    QwenVLCustomLLM. We keep the factory name for backward compatibility with
-    existing import sites (e.g. agent initialization) but change the created
-    class. Cached by (model_name, device).
+    Cached by (model_name, device). Defaults to the int4-friendly
+    Qwen/Qwen3-VL-30B-A3B-Instruct checkpoint described in the docs.
     """
-    # Avoid accessing Pydantic-model attributes at import time (AttributeError).
-    # Use the same default literal as defined in the class to form the cache key.
-    key = (model_name or "Qwen/Qwen2.5-VL-32B-Instruct-AWQ", device or "auto")
+    key = (model_name or "Qwen/Qwen3-VL-30B-A3B-Instruct", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -144,49 +155,7 @@ def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional
         if inst is not None:
             return inst
 
-    _logger.info("Creating Qwen25VLMultiModal for key=%s", key)
-    try:
-        before_alloc = None
-        try:
-            if torch.cuda.is_available():
-                before_alloc = torch.cuda.memory_allocated()
-        except Exception:
-            before_alloc = None
-
-        # Instantiate the multimodal model wrapper (loads weights immediately)
-        from_path_model_name = key[0]
-        inst = Qwen25VLMultiModal(model_id=from_path_model_name, device_map=device or "auto")
-        # record after-instantiation allocation (model still lazy until first call)
-        after_alloc = None
-        try:
-            if torch.cuda.is_available():
-                after_alloc = torch.cuda.memory_allocated()
-        except Exception:
-            after_alloc = None
-
-        _logger.info("Qwen25VLMultiModal created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
-    except Exception:
-        _logger.exception("Failed to create Qwen25VLMultiModal for key=%s", key)
-        raise
-
-    _LLM_CACHE[key] = inst
-    return inst
-
-
-def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: str = "cpu"):
-    """Return cached QwenCoderGGUFLLM or create one."""
-    # Use literal default to avoid Pydantic class attribute access at import
-    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", device)
-    inst = _LLM_CACHE.get(key)
-    if inst is not None:
-        return inst
-
-    with _CACHE_LOCK:
-        inst = _LLM_CACHE.get(key)
-        if inst is not None:
-            return inst
-
-        _logger.info("Creating QwenCoderGGUFLLM for key=%s", key)
+        _logger.info("Creating Qwen3VLMultiModal for key=%s", key)
         try:
             before_alloc = None
             try:
@@ -195,7 +164,7 @@ def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: 
             except Exception:
                 before_alloc = None
 
-            inst = QwenCoderGGUFLLM(model_name=key[0])
+            inst = Qwen3VLMultiModal(model_id=key[0], device_map=key[1])
 
             after_alloc = None
             try:
@@ -204,9 +173,14 @@ def get_or_create_qwen_coder_gguf_llm(model_name: Optional[str] = None, device: 
             except Exception:
                 after_alloc = None
 
-            _logger.info("QwenCoderGGUFLLM created for key=%s (mem_before=%s, mem_after=%s)", key, before_alloc, after_alloc)
+            _logger.info(
+                "Qwen3VLMultiModal created for key=%s (mem_before=%s, mem_after=%s)",
+                key,
+                before_alloc,
+                after_alloc,
+            )
         except Exception:
-            _logger.exception("Failed to create QwenCoderGGUFLLM for key=%s", key)
+            _logger.exception("Failed to create Qwen3VLMultiModal for key=%s", key)
             raise
 
         _LLM_CACHE[key] = inst
@@ -233,404 +207,53 @@ def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
         return inst
 
 
-# ---------------- GPT-OSS WRAPPER (top-level) ---------------- #
-class GPTOSSWrapper(CustomLLM):
-    model_name: str = Field(default="openai/gpt-oss-20b")
-    max_new_tokens: int = Field(default=512)
-    temperature: float = Field(default=0.2)
-    top_p: float = Field(default=0.95)
-    device: str = Field(default="auto")
-    tool_schemas: List[dict] = Field(default_factory=list)
-
-    _tokenizer: Any = PrivateAttr(default=None)
-    _model: Any = PrivateAttr(default=None)
-    _loaded: bool = PrivateAttr(default=False)
-    _lock: Any = PrivateAttr(default=None)
-    _tool_registry: Any = PrivateAttr(default=None)
-
-    def __init__(self, **data: Any):
-        super().__init__(**data)
-        try:
-            self._lock = threading.Lock()
-        except Exception:
-            self._lock = None
-        self._tool_registry = {}
-
-    @property
-    def metadata(self) -> LLMMetadata:  # type: ignore[override]
-        return LLMMetadata(
-            context_window=8192,
-            num_output=self.max_new_tokens,
-            model_name=self.model_name,
-            is_chat_model=False,
-            is_function_calling_model=False,
-        )
-
-    def _ensure_model(self):
-        if self._loaded:
-            return
-        lock = self._lock
-        if lock:
-            with lock:
-                if self._loaded:
-                    return
-                self._load()
-        else:
-            self._load()
-
-    def _load(self):
-        try:
-            _logger.info("Attempting to load GPT-OSS model: %s", self.model_name)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            
-            # Try loading with GPT-OSS optimizations first
-            try:
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype="auto",
-                    device_map="auto" if torch.cuda.is_available() else None,
-                    low_cpu_mem_usage=True,
-                )
-                _logger.info("GPT-OSS model loaded with auto settings")
-            except Exception as e:
-                _logger.warning("GPT-OSS auto loading failed (%s), trying fallback settings", e)
-                # Fallback to standard settings for older hardware
-                self._model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else None,
-                    low_cpu_mem_usage=True,
-                    trust_remote_code=True,
-                )
-                _logger.info("GPT-OSS model loaded with fallback settings (bfloat16)")
-            
-            self._loaded = True
-            _logger.info("GPTOSSWrapper loaded successfully: %s", self.model_name)
-            
-        except Exception as e:
-            _logger.warning("Failed to load GPT-OSS model %s (%s), falling back to Qwen2.5-7B-Instruct", self.model_name, e)
-            # Fallback to a reliable model when GPT-OSS is not available
-            _logger.exception("Failed to load both GPT-OSS and fallback model; using stub mode")
-            self._tokenizer = None
-            self._model = None
-            self._loaded = True
-
-    # Tool API
-    def add_tool(self, name: str, func: callable, description: str):
-        if name in self._tool_registry:
-            return
-        self._tool_registry[name] = {"func": func, "description": description}
-        self.tool_schemas.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {"input": {"type": "string"}},
-                    "required": ["input"],
-                },
-            },
-        })
-
-    def _generate(self, prompt: str) -> str:
-        self._ensure_model()
-        if self._model is None or self._tokenizer is None:
-            return "(stub) " + prompt[-120:]
-        toks = self._tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            toks = {k: v.to(self._model.device) for k, v in toks.items()}
-        with torch.no_grad():
-            out = self._model.generate(
-                **toks,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=True,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                pad_token_id=self._tokenizer.eos_token_id,
-            )
-        gen = self._tokenizer.decode(out[0][toks["input_ids"].shape[1]:], skip_special_tokens=True)
-        return gen.strip()
-
-    TOOL_CALL_RE: ClassVar[re.Pattern] = re.compile(r'TOOL_CALL:\s*([A-Za-z0-9_]+)\("([\s\S]*?)"\)')
-    JSON_TOOL_CALL_RE: ClassVar[re.Pattern] = re.compile(r'\{"query":\s*"([^"]+)"(?:,\s*"[^"]*":\s*[^}]*)?\}')
-
-    def _extract_calls(self, text: str):
-        # First try the standard TOOL_CALL format
-        calls = [(m.group(1), m.group(2)) for m in self.TOOL_CALL_RE.finditer(text)]
-        
-        # If no standard format found, try JSON-style tool calls
-        if not calls:
-            json_matches = list(self.JSON_TOOL_CALL_RE.finditer(text))
-            if json_matches:
-                # For JSON style, assume it's a web search tool call
-                for match in json_matches:
-                    query = match.group(1)
-                    calls.append(("enhanced_web_search", query))
-                    _logger.info("Extracted JSON-style tool call: enhanced_web_search('%s')", query)
-        
-        return calls
-
-    def _exec_calls(self, calls):
-        outputs = []
-        for name, arg in calls:
-            entry = self._tool_registry.get(name)
-            if not entry:
-                outputs.append(f"Tool {name} not found")
-                continue
-            try:
-                outputs.append(str(entry["func"](arg)))
-            except Exception as e:
-                outputs.append(f"Tool {name} error: {e}")
-        return outputs
-
-    def solve(self, question: str, max_iterations: int = 5, reasoning_effort: str = "medium") -> str:
-        """Solve a question using GPT-OSS with proper chat template, reasoning effort, and tool execution loop."""
-        self._ensure_model()
-        if self._model is None or self._tokenizer is None:
-            return f"(stub) {question[-120:]}"
-        
-        # Check if this is the actual GPT-OSS model or a fallback
-        is_gpt_oss = "gpt-oss" in self.model_name.lower()
-        
-        # For GPT-OSS, we need to use the iterative approach to handle tool calls
-        if is_gpt_oss and self._tool_registry:
-            return self._solve_with_tools(question, max_iterations, reasoning_effort)
-        else:
-            # Simple single-shot generation for non-GPT-OSS or no tools
-            return self._solve_simple(question, reasoning_effort)
-    
-    def _solve_simple(self, question: str, reasoning_effort: str) -> str:
-        """Simple single-shot generation without tool loop."""
-        is_gpt_oss = "gpt-oss" in self.model_name.lower()
-        
-        messages = [
-            {"role": "user", "content": question}
-        ]
-        
-        try:
-            # Try GPT-OSS specific features first if it's a GPT-OSS model
-            if is_gpt_oss:
-                try:
-                    inputs = self._tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                        return_dict=True,
-                        reasoning_effort=reasoning_effort
-                    )
-                    _logger.info("Using GPT-OSS chat template with reasoning_effort=%s", reasoning_effort)
-                except Exception as e:
-                    _logger.warning("GPT-OSS chat template with reasoning_effort failed: %s", e)
-                    # Fallback to standard chat template
-                    inputs = self._tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                        return_dict=True,
-                    )
-            else:
-                # For fallback models, use standard chat template
-                inputs = self._tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                )
-                _logger.info("Using standard chat template for fallback model")
-            
-            # Move to device
-            if torch.cuda.is_available() and hasattr(self._model, 'device'):
-                inputs = inputs.to(self._model.device)
-            
-            # Generate response with proper max_new_tokens
-            with torch.no_grad():
-                generated = self._model.generate(
-                    **inputs,
-                    max_new_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    do_sample=True,
-                    pad_token_id=self._tokenizer.eos_token_id if self._tokenizer.eos_token_id else self._tokenizer.pad_token_id
-                )
-            
-            # Decode only the new tokens
-            response = self._tokenizer.decode(
-                generated[0][inputs["input_ids"].shape[-1]:], 
-                skip_special_tokens=True
-            )
-            
-            return response.strip()
-            
-        except Exception as e:
-            # Fallback to simple generation if chat template fails
-            _logger.warning("Chat template failed, falling back to simple generation: %s", e)
-            return self._generate(f"USER: {question}\nASSISTANT:")
-
-    def _solve_with_tools(self, question: str, max_iterations: int, reasoning_effort: str) -> str:
-        """Iterative tool-calling solution for GPT-OSS with tools."""
-        history: List[str] = []
-        current_prompt = question
-        base_instructions = (
-            "You are a GAIA competition assistant. You MUST either: (1) call tools using the exact syntax "
-            "TOOL_CALL: tool_name(\"argument\") when you need external info or computation, or (2) output FINAL ANSWER: <answer>. "
-            "Available tools: " + ", ".join(self._tool_registry.keys()) + ". Use enhanced_web_search first for factual lookups if not already done. "
-            "Keep internal reasoning concise. Do NOT guess factual data without at least one search."
-        )
-        used_tools: set = set()
-        
-        for iteration in range(max_iterations):
-            _logger.info("GPT-OSS iteration %d/%d", iteration + 1, max_iterations)
-            
-            # Construct messages with a system style instruction and condensed history (truncate long)
-            recent_history = "\n\n".join(history[-3:])  # keep last 3 for context
-            composed_user = (
-                f"INSTRUCTIONS:\n{base_instructions}\n\nQUESTION: {question}\n" +
-                (f"RECENT HISTORY:\n{recent_history}\n" if recent_history else "") +
-                f"CURRENT PROMPT:\n{current_prompt}\n\nRespond with either tool calls or FINAL ANSWER."
-            )
-            messages = [{"role": "user", "content": composed_user}]
-            
-            try:
-                inputs = self._tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                    return_dict=True,
-                    reasoning_effort=reasoning_effort if iteration == 0 else "medium"  # Use high reasoning on first iteration
-                )
-                
-                if torch.cuda.is_available() and hasattr(self._model, 'device'):
-                    inputs = inputs.to(self._model.device)
-                
-                with torch.no_grad():
-                    generated = self._model.generate(
-                        **inputs,
-                        max_new_tokens=self.max_new_tokens,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        do_sample=True,
-                        pad_token_id=self._tokenizer.eos_token_id if self._tokenizer.eos_token_id else self._tokenizer.pad_token_id
-                    )
-                
-                response = self._tokenizer.decode(
-                    generated[0][inputs["input_ids"].shape[-1]:], 
-                    skip_special_tokens=True
-                ).strip()
-                
-                history.append(f"ITERATION {iteration + 1}: {response}")
-                _logger.info("Generated response: %s", response[:200] + "..." if len(response) > 200 else response)
-                
-                # Check for final answer
-                if "FINAL ANSWER:" in response:
-                    _logger.info("Found FINAL ANSWER in iteration %d", iteration + 1)
-                    return response
-                
-                # Extract and execute tool calls
-                tool_calls = self._extract_calls(response)
-                if tool_calls:
-                    _logger.info("Found %d tool calls: %s", len(tool_calls), [name for name, _ in tool_calls])
-                    tool_results = self._exec_calls(tool_calls)
-                    for name, _ in tool_calls:
-                        used_tools.add(name)
-                    
-                    # Build next prompt with tool results
-                    tool_context = "\n".join([
-                        f"TOOL_RESULT {i+1} ({tool_calls[i][0]}): {result}" 
-                        for i, result in enumerate(tool_results)
-                    ])
-                    
-                    current_prompt = (
-                        f"Incorporate these tool results to progress toward the final answer. "
-                        f"If sufficient information is available, produce 'FINAL ANSWER: <answer>' on next turn.\n"
-                        f"Previous reasoning:\n{response}\n\nTool results just obtained:\n{tool_context}"
-                    )
-                else:
-                    # No tool calls found. If we haven't used any tools yet and iteration == 0, force a reminder.
-                    if not used_tools and iteration == 0:
-                        _logger.info("Iteration 1 produced no tool call; forcing explicit search instruction.")
-                        current_prompt = (
-                            "You did not call any tool. You MUST perform at least one TOOL_CALL to enhanced_web_search "
-                            "before attempting a FINAL ANSWER. Generate a TOOL_CALL now to gather factual data."
-                        )
-                        continue
-                    # If nearing last iteration, instruct to finalize
-                    if iteration >= max_iterations - 2:
-                        current_prompt = (
-                            "Provide FINAL ANSWER now if possible. If still missing critical data, perform exactly one more TOOL_CALL."
-                        )
-                        continue
-                    # Otherwise encourage deeper reasoning/tool usage
-                    current_prompt = (
-                        "No tool call detected in your last response. If you already have all needed data, output 'FINAL ANSWER: <answer>'. "
-                        "Otherwise issue a TOOL_CALL now."
-                    )
-                    continue
-                    
-            except Exception as e:
-                _logger.exception("Error in iteration %d: %s", iteration + 1, e)
-                if history:
-                    return history[-1]
-                return f"Error in tool execution: {e}"
-        
-        # Max iterations reached
-        _logger.warning("Max iterations (%d) reached", max_iterations)
-        return history[-1] if history else f"Max iterations reached without final answer"
-
-    @llm_completion_callback()
-    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:  # type: ignore[override]
-        out = self._generate(prompt)
-        if stop:
-            for s in stop:
-                if s and s in out:
-                    out = out.split(s)[0]
-                    break
-        return CompletionResponse(text=out)
-
-    @llm_completion_callback()
-    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:  # type: ignore[override]
-        text = self.complete(prompt, stop=stop, **kwargs).text
-        def _gen():
-            acc = ""
-            for ch in text:
-                acc += ch
-                yield CompletionResponse(text=acc, delta=ch)
-        return _gen()
-
-
-def get_or_create_gpt_llm(model_name: Optional[str] = None, device: str = "auto") -> GPTOSSWrapper:
-    key = (model_name or "openai/gpt-oss-20b", device)
+def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached HuggingFaceLLM configured for Qwen2.5-Coder 3B AWQ."""
+    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct-AWQ", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
-        return inst  # type: ignore[return-value]
+        return inst
+
     with _CACHE_LOCK:
         inst = _LLM_CACHE.get(key)
         if inst is not None:
-            return inst  # type: ignore[return-value]
-        _logger.info("Creating GPTOSSWrapper for key=%s", key)
-        inst = GPTOSSWrapper(model_name=key[0], device=device)
+            return inst
+        _logger.info("Creating Qwen coder LLM for key=%s", key)
+        compute_dtype = torch.float16 if torch.cuda.is_available() else "auto"
+        model_kwargs = {
+            "torch_dtype": compute_dtype,
+            "device_map": key[1],
+        }
+        inst = HuggingFaceLLM(
+            model_name=key[0],
+            tokenizer_name=key[0],
+            context_window=32768,
+            max_new_tokens=1024,
+            model_kwargs=model_kwargs,
+            generate_kwargs={
+                "temperature": 0.1,
+                "top_p": 0.9,
+            },
+            messages_to_prompt=_qwen_messages_to_prompt,
+            completion_to_prompt=_qwen_completion_to_prompt,
+        )
         _LLM_CACHE[key] = inst
         return inst
 
-from typing import Any, Dict, List, Optional, Sequence
-import threading
-import torch
-from pydantic import Field, PrivateAttr
-from transformers import AutoProcessor, TextIteratorStreamer, Qwen2_5_VLForConditionalGeneration
-from qwen_vl_utils import process_vision_info
-from llama_index.core.llms import (
-    CustomLLM,
-    CompletionResponse,
-    CompletionResponseGen,
-    LLMMetadata,
-)
-from llama_index.core.llms.callbacks import llm_completion_callback
-from llama_index.core.schema import ImageDocument
 
-_DEFAULT_QWEN_VL = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
+_DEFAULT_QWEN_VL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
-class Qwen25VLMultiModal(CustomLLM):
-    # Config
+
+class Qwen3VLMultiModal(CustomLLM):
+    """CustomLLM wrapper for Qwen3-VL-30B-A3B-Instruct with int4 quantization.
+
+    The implementation mirrors the official Qwen3-VL documentation flow: prompts
+    are built via AutoProcessor.apply_chat_template and image inputs are
+    normalized through process_vision_info so llama-index can drive the model
+    seamlessly. We quantize to 4-bit NF4 via BitsAndBytes to satisfy the memory
+    constraints called out in the requirements.
+    """
+
     model_id: str = Field(default=_DEFAULT_QWEN_VL)
     max_new_tokens: int = Field(default=4096)
     temperature: float = Field(default=0.2)
@@ -641,61 +264,70 @@ class Qwen25VLMultiModal(CustomLLM):
     use_flash_attn2: bool = Field(default=False)
     max_input_tokens: int = Field(default=4096)
 
-    # Runtime (non-validés pydantic)
     _processor: Any = PrivateAttr(default=None)
     _model: Any = PrivateAttr(default=None)
-    # Lazy-load guards
     _hf_loaded: bool = PrivateAttr(default=False)
     _hf_lock: Any = PrivateAttr(default=None)
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
-        # Defer heavy HF init until first use. Prepare a lock for thread-safety.
         try:
             self._hf_lock = threading.Lock()
         except Exception:
             self._hf_lock = None
         self._hf_loaded = False
 
-    # ---- Métadonnées ----
     @property
     def metadata(self) -> LLMMetadata:
         return LLMMetadata(
             model_name=self.model_id,
-            context_window=8192,
+            context_window=256000,  # Qwen3-VL advertises 256K context
             num_output=self.max_new_tokens,
             is_chat_model=True,
             is_function_calling_model=False,
         )
 
-    # ---- Init HF ----
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+
     def _init_hf(self) -> None:
-        # Set allocator env to reduce fragmentation and allow expandable segments
+        """Load processor + Qwen3-VL model with 4-bit quantization."""
         try:
-            import os
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
         except Exception:
             pass
 
-        if self.min_pixels is not None or self.max_pixels is not None:
-            self._processor = AutoProcessor.from_pretrained(
-                self.model_id,
-                min_pixels=self.min_pixels,
-                max_pixels=self.max_pixels,
-            )
-        else:
-            self._processor = AutoProcessor.from_pretrained(self.model_id)
+        processor_kwargs: Dict[str, Any] = {}
+        if self.min_pixels is not None:
+            processor_kwargs["min_pixels"] = self.min_pixels
+        if self.max_pixels is not None:
+            processor_kwargs["max_pixels"] = self.max_pixels
+        self._processor = AutoProcessor.from_pretrained(self.model_id, **processor_kwargs)
 
-        # Prefer float16 on T4s and enable low_cpu_mem_usage/offload to reduce peak GPU memory
+        compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        quant_cfg = None
+        try:
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+        except Exception as exc:
+            _logger.warning("BitsAndBytes unavailable (%s); falling back to fp16 load for Qwen3-VL.", exc)
+
         model_kwargs: Dict[str, Any] = {
-            "torch_dtype": torch.float16,
             "device_map": self.device_map,
             "low_cpu_mem_usage": True,
+            "torch_dtype": compute_dtype,
+            "trust_remote_code": True,
         }
-        # Provide an offload folder when device_map may offload layers
+        if quant_cfg is not None:
+            model_kwargs["quantization_config"] = quant_cfg
+
         try:
-            import os
-            offload_folder = os.path.abspath("./offload_qwen_vl")
+            offload_folder = os.path.abspath("./offload_qwen3_vl")
             os.makedirs(offload_folder, exist_ok=True)
             model_kwargs["offload_folder"] = offload_folder
         except Exception:
@@ -704,13 +336,9 @@ class Qwen25VLMultiModal(CustomLLM):
         if self.use_flash_attn2:
             model_kwargs["attn_implementation"] = "flash_attention_2"
 
-        # Load model with transformers backing; allow HF to place weights across devices
-        self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_id, **model_kwargs
-        )
+        self._model = Qwen3VLMoeForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
 
     def _ensure_hf(self) -> None:
-        """Thread-safe lazy initializer for HF processor/model."""
         if getattr(self, "_hf_loaded", False):
             return
         lock = getattr(self, "_hf_lock", None)
@@ -719,7 +347,6 @@ class Qwen25VLMultiModal(CustomLLM):
         try:
             if getattr(self, "_hf_loaded", False):
                 return
-            # call the existing initializer which sets _processor/_model
             self._init_hf()
             self._hf_loaded = True
         finally:
@@ -730,187 +357,86 @@ class Qwen25VLMultiModal(CustomLLM):
                     pass
 
     def _force_batch_size_one(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Recursively ensure that any torch.Tensor in `inputs` has batch dim == 1.
-
-        This will slice the leading dimension to 1 when >1 and return the same
-        structure. It handles nested dicts/lists/tuples. Uses local import of
-        torch to avoid requiring a global import at module load time.
-        """
         import torch
 
         trimmed = False
 
-        def _slice_val(v):
+        def _slice_val(value):
             nonlocal trimmed
-            # Torch tensor: slice if leading dim > 1
-            if isinstance(v, torch.Tensor):
-                if v.dim() >= 1 and v.shape[0] > 1:
-                    try:
-                        nv = v[:1].contiguous()
-                    except Exception:
-                        nv = v[:1]
+            if isinstance(value, torch.Tensor):
+                if value.dim() >= 1 and value.shape[0] > 1:
                     trimmed = True
-                    return nv
-                return v
-
-            # Dict: recurse
-            if isinstance(v, dict):
-                out = {}
-                for kk, vv in v.items():
-                    out[kk] = _slice_val(vv)
-                return out
-
-            # List / Tuple: recurse preserving type when possible
-            if isinstance(v, (list, tuple)):
-                out_list = [_slice_val(x) for x in v]
-                return type(v)(out_list) if isinstance(v, tuple) else out_list
-
-            # Fallback: return as-is
-            return v
+                    return value[:1].contiguous()
+                return value
+            if isinstance(value, dict):
+                return {k: _slice_val(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                seq = [_slice_val(v) for v in value]
+                return type(value)(seq) if isinstance(value, tuple) else seq
+            return value
 
         out_inputs = {k: _slice_val(v) for k, v in inputs.items()}
         if trimmed:
-            try:
-                _logger.warning("Trimmed input batch dimension to 1 for inference to avoid OOM.")
-            except Exception:
-                pass
-        # Final safety check: ensure no tensor has batch_dim > 1
-        try:
-            for v in out_inputs.values():
-                # find any tensor in nested structure
-                def _check_any_tensor(x):
-                    import collections
-                    if isinstance(x, torch.Tensor):
-                        return x.dim() >= 1 and x.shape[0] > 1
-                    if isinstance(x, dict):
-                        return any(_check_any_tensor(y) for y in x.values())
-                    if isinstance(x, (list, tuple)):
-                        return any(_check_any_tensor(y) for y in x)
-                    return False
-
-                if _check_any_tensor(v):
-                    raise RuntimeError("Failed to enforce batch size 1 on model inputs")
-        except Exception:
-            # If safety check fails, raise so caller can observe and avoid silent OOMs
-            raise
-
+            _logger.warning("Trimmed input batch dimension to 1 for Qwen3-VL inference.")
         return out_inputs
-    
-    # ---- Helpers prompt/messages ----
-    def _coerce_messages(self, messages: List[Any]) -> List[dict]:
-        out: List[dict] = []
-        for m in messages:
-            if isinstance(m, dict):
-                out.append(dict(m))
-            else:
-                role = getattr(m, "role", "user")
-                content = getattr(m, "content", "")
-                out.append({"role": role, "content": content})
-        return out
-
-    def _attach_images_to_messages(
-        self, messages: List[dict], image_documents: Optional[Sequence[ImageDocument]]
-    ) -> List[dict]:
-        if not image_documents:
-            return messages
-        user_idx = None
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                user_idx = i
-                break
-        if user_idx is None:
-            messages.append({"role": "user", "content": []})
-            user_idx = len(messages) - 1
-        if isinstance(messages[user_idx].get("content"), str):
-            messages[user_idx]["content"] = [{"type": "text", "text": messages[user_idx]["content"]}]
-        for img in image_documents:
-            messages[user_idx]["content"].insert(
-                0, {"type": "image", "image": f"file://{img.image_path}"}
-            )
-        return messages
 
     def _build_user_messages(
         self, prompt: str, image_documents: Optional[Sequence[ImageDocument]]
     ) -> List[dict]:
-        msg: Dict[str, Any] = {"role": "user", "content": []}
+        message: Dict[str, Any] = {"role": "user", "content": []}
         if image_documents:
             for img in image_documents:
-                msg["content"].append({"type": "image", "image": f"file://{img.image_path}"})
-        msg["content"].append({"type": "text", "text": prompt})
-        return [msg]
+                message["content"].append({"type": "image", "image": f"file://{img.image_path}"})
+        message["content"].append({"type": "text", "text": prompt})
+        return [message]
 
     def _prepare_inputs_from_messages(self, messages: List[dict]) -> Dict[str, Any]:
-        # Ensure HF processor/model are ready
         self._ensure_hf()
-
-        prompt_text = self._processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        chat_text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
         inputs = self._processor(
-            text=[prompt_text],
+            text=[chat_text],
             images=image_inputs,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",
         )
 
-        # Truncate long input sequences to reduce attention memory (keep last tokens)
         try:
-            import torch
-            if "input_ids" in inputs and hasattr(inputs["input_ids"], "shape"):
-                seq_len = int(inputs["input_ids"].shape[1]) if inputs["input_ids"].dim() >= 2 else int(inputs["input_ids"].shape[0])
+            if "input_ids" in inputs:
+                seq_len = int(inputs["input_ids"].shape[-1])
                 if seq_len > int(self.max_input_tokens):
                     keep = int(self.max_input_tokens)
-                    _logger.warning("Truncating input token length %d -> %d to limit attention memory", seq_len, keep)
-                    # For each tensor with seq dim at position 1, slice to last `keep` tokens
-                    for k, v in list(inputs.items()):
-                        try:
-                            if isinstance(v, torch.Tensor) and v.dim() >= 2:
-                                inputs[k] = v[:, -keep:]
-                        except Exception:
-                            pass
+                    _logger.warning("Truncating Qwen3-VL input from %d to %d tokens", seq_len, keep)
+                    for key, tensor in list(inputs.items()):
+                        if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
+                            inputs[key] = tensor[:, -keep:]
         except Exception:
             pass
 
-        # Force batch size == 1 for inference (robust, recursive handling)
+        inputs = self._force_batch_size_one(inputs)
         try:
-            inputs = self._force_batch_size_one(inputs)
-        except Exception as e:
-            # Surface an explicit error rather than allowing a silent OOM inside HF generate
-            _logger.exception("Unable to enforce batch size 1 on inputs: %s", e)
-            raise
-
-        # Placement device (accéléré)
-        try:
-            inputs = {k: (v.to("cuda") if hasattr(v, "to") else v) for k, v in inputs.items()}
+            inputs = {k: (v.to(self._model.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         except Exception:
-            # keep original inputs if any device move fails
             pass
         return inputs
 
     def _decode_new_tokens(self, inputs: Dict[str, Any], generated_ids) -> str:
-        # Ensure processor available for decoding
         self._ensure_hf()
-
-        trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)]
-        texts = self._processor.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        # Garantir une chaîne (batch=1)
+        trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs["input_ids"], generated_ids)
+        ]
+        texts = self._processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         if isinstance(texts, list):
-            return texts if texts else ""
+            return texts[0] if texts else ""
         return texts or ""
 
     def _apply_stop(self, text: str, stop: Optional[List[str]]) -> str:
         if not stop or not text:
             return text
-        for s in stop:
-            if s and s in text:
-                return text.split(s, 1)
-        return text
+        return _truncate_on_stop(text, stop)
 
-    # ---- Non-streaming text ----
     @llm_completion_callback()
     def complete(
         self,
@@ -929,68 +455,12 @@ class Qwen25VLMultiModal(CustomLLM):
             use_cache=False,
         )
 
-        # Try to free cached memory and attempt generation with fallback on OOM
-        try:
-            import torch
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        except Exception:
-            pass
+        reserved = set(gen_kwargs.keys())
+        merged_inputs = {k: v for k, v in inputs.items() if k not in reserved}
+        out = self._model.generate(**merged_inputs, **gen_kwargs)
+        text = self._apply_stop(self._decode_new_tokens(inputs, out), stop)
+        return CompletionResponse(text=str(text))
 
-        # Attempt generate, retrying with lowered max_new_tokens on OOM
-        max_attempts = 3
-        attempt = 0
-        out = None
-        while attempt < max_attempts:
-            try:
-                # Temporarily turn off model KV cache to reduce memory (some HF models use config flag)
-                old_use_cache = None
-                try:
-                    old_use_cache = getattr(self._model.config, "use_cache", None)
-                    self._model.config.use_cache = False
-                except Exception:
-                    old_use_cache = None
-
-                # Avoid passing duplicate generation kwargs: remove any keys from
-                # inputs that are also present in gen_kwargs so we don't call
-                # generate() with the same keyword twice (causes TypeError).
-                reserved = set(gen_kwargs.keys())
-                merged_inputs = {k: v for k, v in inputs.items() if k not in reserved}
-                out = self._model.generate(**merged_inputs, **gen_kwargs)
-
-                try:
-                    if old_use_cache is not None:
-                        self._model.config.use_cache = old_use_cache
-                except Exception:
-                    pass
-                break
-            except RuntimeError as e:
-                msg = str(e)
-                if "out of memory" in msg.lower() or "cuda out of memory" in msg.lower():
-                    _logger.warning("Generation OOM attempt %d/%d, lowering max_new_tokens and retrying", attempt + 1, max_attempts)
-                    # halve token budget and retry
-                    gen_kwargs["max_new_tokens"] = max(8, gen_kwargs["max_new_tokens"] // 2)
-                    attempt += 1
-                    try:
-                        import torch
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    continue
-                raise
-
-        if out is None:
-            raise RuntimeError("Generation failed after retries due to OOM or other errors")
-
-        text = self._decode_new_tokens(inputs, out)
-        text = self._apply_stop(text, stop)
-        if not isinstance(text, str):
-            text = str(text)
-        return CompletionResponse(text=text)
-
-    # ---- Streaming (sync) ----
     @llm_completion_callback()
     def stream_complete(
         self,
@@ -1013,39 +483,27 @@ class Qwen25VLMultiModal(CustomLLM):
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        # Try to free cached memory before starting generation thread
-        try:
-            import torch
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-        except Exception:
-            pass
 
-        # Threaded generation: on OOM, we won't crash silently — the generate call
-        # inside the thread will either succeed or log warnings based on HF/torch.
-        # For threaded generation ensure we don't duplicate generation kwargs
         reserved = set(gen_kwargs.keys())
         merged_inputs = {k: v for k, v in inputs.items() if k not in reserved}
-        th = threading.Thread(
+        thread = threading.Thread(
             target=self._model.generate,
             kwargs={**merged_inputs, **gen_kwargs, "streamer": streamer},
             daemon=True,
         )
-        th.start()
+        thread.start()
 
         text_accum = ""
         for delta in streamer:
             text_accum += delta
             if stop and any(s and s in text_accum for s in stop):
-                text_trim = self._apply_stop(text_accum, stop)
-                yield CompletionResponse(text=text_trim, delta="")
+                trimmed = self._apply_stop(text_accum, stop)
+                yield CompletionResponse(text=trimmed, delta="")
                 break
             yield CompletionResponse(text=text_accum, delta=delta)
 
 
-
+# ---------------- Embedding / reranker helpers ---------------- #
 class Qwen3GGUFEmbedding(BaseEmbedding):
     """Wrapper to load a Qwen3 GGUF embedding model via llama.cpp or gguf loader.
 
@@ -1154,72 +612,6 @@ class Qwen3GGUFEmbedding(BaseEmbedding):
 # If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.
 # from llama_index.core.embeddings.base import BaseEmbedding
  
-# Lightweight GGUF / llama.cpp wrapper for Qwen2.5 Coder 3B (GGUF)
-class QwenCoderGGUFLLM(CustomLLM):
-    model_name: str = Field(default="Qwen/Qwen2.5-Coder-3B-Instruct-GGUF")
-    context_window: int = Field(default=8192)
-    num_output: int = Field(default=256)
-
-    _llm = PrivateAttr(default=None)
-
-    def __init__(self, model_name: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
-        if model_name:
-            self.model_name = model_name
-        self._gguf_path = None
-
-    def _ensure_llm(self):
-        if self._llm is not None:
-            return
-        from huggingface_hub import snapshot_download, list_repo_files, hf_hub_download
-        import glob, gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        files = list_repo_files(self.model_name)
-        candidates = [f for f in files if f.lower().endswith(('.gguf', '.bin'))]
-        fav = next((f for p in ["q4_k_m", "q4_k", "q4_0", "q4"] for f in candidates if p in f.lower()), None)
-        model_path = hf_hub_download(repo_id=self.model_name, filename=fav) if fav else None
-
-        if not model_path:
-            repo_dir = snapshot_download(repo_id=self.model_name, repo_type="model")
-            gguf_candidates = glob.glob(f"{repo_dir}/**/*.gguf", recursive=True)
-            if not gguf_candidates:
-                raise RuntimeError(f"No .gguf file found for {self.model_name}")
-            model_path = gguf_candidates[0]
-
-        from llama_cpp import Llama
-        self._llm = Llama(model_path=model_path)
-        self._gguf_path = model_path
-
-    @property
-    def metadata(self) -> LLMMetadata:
-        return LLMMetadata(context_window=self.context_window, num_output=self.num_output, model_name=self.model_name)
-
-    @llm_completion_callback()
-    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
-        if self._llm is None:
-            self._ensure_llm()
-        resp = self._llm.create(prompt=prompt, max_tokens=self.num_output)
-        text = ""
-        if isinstance(resp, dict) and resp.get("choices"):
-            choice = resp["choices"][0]
-            text = choice.get("text") or choice.get("message", {}).get("content", "")
-        elif hasattr(resp, "choices"):
-            choices = getattr(resp, "choices", None)
-            if choices and isinstance(choices, list):
-                text = str(choices[0])
-        text = _truncate_on_stop(text or "", stop)
-        return CompletionResponse(text=text)
-
-    @llm_completion_callback()
-    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:
-        resp = self.complete(prompt, stop=stop, **kwargs)
-        for ch in resp.text:
-            yield CompletionResponse(text=ch, delta=ch)
-
-
 class JinaEmbeddingsV4(BaseEmbedding):
     """
     Memory-constrained wrapper for jinaai/jina-embeddings-v4.
@@ -1455,7 +847,7 @@ class JinaMultimodalReranker:
     Supports text-to-text, text-to-image, image-to-text, and image-to-image reranking.
     """
     
-    def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "auto"):
+    def __init__(self, model_name: str = "jinaai/jina-reranker-v2-base-multilingual", top_n: int = 5, device: str = "auto"):
         self.model_name = model_name
         self.top_n = top_n
         self.device = device
@@ -1820,3 +1212,12 @@ class JinaMultimodalReranker:
         # For PDF or other documents with images, we might need special handling
         # For now, return None if we can't find a direct image path
         return None
+
+    def score_text_pairs(self, pairs: List[List[str]], max_length: int = 1024) -> List[float]:
+        """Utility helper for non-llama-index callers: score query/document text pairs."""
+        if not pairs:
+            return []
+        if not getattr(self, "_loaded", False):
+            self._load_model()
+            self._loaded = True
+        return self._model.compute_score(pairs, max_length=max_length, doc_type="text")

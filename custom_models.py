@@ -222,7 +222,6 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
         compute_dtype = torch.float16 if torch.cuda.is_available() else "auto"
         model_kwargs = {
             "torch_dtype": compute_dtype,
-            "device_map": key[1],
         }
         inst = HuggingFaceLLM(
             model_name=key[0],
@@ -236,6 +235,7 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
             },
             messages_to_prompt=_qwen_messages_to_prompt,
             completion_to_prompt=_qwen_completion_to_prompt,
+            device_map=key[1],
         )
         _LLM_CACHE[key] = inst
         return inst

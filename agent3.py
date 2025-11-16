@@ -269,7 +269,9 @@ class KnowledgeChunk:
 class SimpleKnowledgeBase:
     def __init__(self, max_chunks: int = 400):
         self.embedder = get_or_create_qwen3_gguf_embedding()
-        self.reranker = get_or_create_jina_reranker(device="cpu", top_n=5)
+        self.reranker = get_or_create_jina_reranker(
+            model_name="jinaai/jina-reranker-v3", device="cpu", top_n=5
+        )
         self.max_chunks = max_chunks
         self.chunks: List[KnowledgeChunk] = []
         self.sources: List[str] = []

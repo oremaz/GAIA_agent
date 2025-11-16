@@ -471,7 +471,7 @@ class DynamicQueryEngineManager:
         class HybridReranker:
             def __init__(self):
                 self.jina_reranker = get_or_create_jina_reranker(
-                    model_name="jinaai/jina-reranker-m0", top_n=5, device="cpu"
+                    model_name="jinaai/jina-reranker-m0", top_n=5, device="cuda:1"
                 )
 
             def postprocess_nodes(self, nodes, query_bundle):

@@ -102,7 +102,7 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 
     Keyed by (model_name, top_n, device).
     """
-    key = (model_name or "jinaai/jina-reranker-v2-base-multilingual", top_n, device)
+    key = (model_name or "jinaai/jina-reranker-m0", top_n, device)
     inst = _RERANKER_CACHE.get(key)
     if inst is not None:
         return inst
@@ -682,11 +682,13 @@ class JinaEmbeddingsV4(BaseEmbedding):
             )
 
             # Let HF place layers and offload automatically (prevents pinning on GPU:0)
+            target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
             self._model = AutoModel.from_pretrained(
                 self.model_name,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
-                device_map="auto",
+                device_map=target_device,
                 offload_folder=self.offload_folder,
                 torch_dtype=torch.float16,
                 quantization_config=bnb_cfg,
@@ -861,7 +863,7 @@ class JinaMultimodalReranker:
     Supports text-to-text, text-to-image, image-to-text, and image-to-image reranking.
     """
     
-    def __init__(self, model_name: str = "jinaai/jina-reranker-v2-base-multilingual", top_n: int = 5, device: str = "auto"):
+    def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "cpu"):
         self.model_name = model_name
         self.top_n = top_n
         self.device = device

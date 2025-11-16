@@ -2,9 +2,9 @@
 
 This repository offers a complete Unit 4 GAIA agent with three practical entry points:
 
-- **Multimodal RAG agent (`agent.py` + `custom_models.py`)** – LlamaIndex-based ReAct workflow that ingests local/web data, reranks with Jina models, and answers with Qwen3-VL plus a dedicated Qwen2.5 Coder LLM for code execution.
+- **Multimodal RAG agent (`agent.py` + `custom_models.py`)** – LlamaIndex-based ReAct workflow that ingests local/web data, reranks with Jina models, and answers with Qwen3-VL plus a dedicated Qwen2.5 Coder LLM for code execution. `initialize_models` compares the Gemini API path (`USE_API_MODE=true`) with the local Qwen stack (`USE_API_MODE=false`) so you can benchmark both approaches.
 - **Text-only agent (`agent3.py`)** – GPT‑OSS pipeline (GGUF embeddings + Jina reranker) designed for single-GPU runs (T4-class). Set `TEXT_ONLY=true` when running `appasync.py` to switch to this implementation automatically.
-- **smolagents/Gemini runner (`agent2.py`, `app.py`)** – Tool-first architecture for developers who prefer Gemini APIs and Langfuse observability. This README only summarizes it; see the source if you need that flow.
+- **smolagents/Gemini runner (`agent2.py`, `app.py`)** – Tool-first architecture for developers who prefer Gemini APIs and Langfuse observability.
 
 ## Components at a glance
 - `agent.py`: main multimodal GAIA agent wired through LlamaIndex.
@@ -13,7 +13,7 @@ This repository offers a complete Unit 4 GAIA agent with three practical entry p
 - `appasync.py`: Gradio runner that imports `GAIAAgent` unless `TEXT_ONLY=true`, in which case it instantiates the text-only agent.
 - `agent2.py` / `app.py`: smolagents workflow (Gemini + Langfuse logging).
 
-## Runtime modes
+## Runtime modes (used by `agent.py`, `agent3.py`, and `appasync.py`)
 | Mode | Env vars | LLMs | Notes |
 |------|----------|------|-------|
 | API (Gemini) | `USE_API_MODE=true` | `Gemini` LLM + `GeminiEmbedding` | Falls back to local mode if credentials missing. |
@@ -38,7 +38,7 @@ This repository offers a complete Unit 4 GAIA agent with three practical entry p
 1. Clone the repo and `pip install -r requirements.txt`.
 2. Set secrets (`HUGGINGFACEHUB_API_TOKEN`, `GOOGLE_API_KEY`, `LLAMA_CLOUD_API_KEY`) via Kaggle secrets.
 3. Choose `USE_API_MODE=true` for Gemini or `false` for local Qwen. Set `TEXT_ONLY=true` only if you plan to run the GPT‑OSS CLI agent instead of the multimodal pipeline.
-4. Execute the test cell (runs `python agent.py`) or launch the async Gradio app (`python appasync.py`).
+4. Execute the test cell (runs `python agent.py`) or launch the async Gradio app (`python appasync.py`). `agent2.py`/`app.py` rely on local servers and should be run on your own machine rather than within the Kaggle notebook.
 
 Hardware tips:
 - API mode is CPU-friendly.
@@ -50,7 +50,7 @@ Hardware tips:
 - `TEXT_ONLY` – when true, `appasync.py` imports `TextOnlyGptOssAgent` and ignores `USE_API_MODE`. Default: false.
 - `GOOGLE_API_KEY`, `HUGGINGFACEHUB_API_TOKEN`, `LLAMA_CLOUD_API_KEY` – optional credentials for external services.
 
-## smolagents workflow (`agent2.py`, `app.py`)
+## smolagents workflow (`agent2.py`, `app.py`) – run locally
 - Tool-first design: `WebSearchTool`, `UnifiedMultimodalTool`, `ChromaBM25HybridRetrieverTool`, `FinalAnswerTool`, etc.
 - Agents include a coder (`CodeAgent`) and a top-level `ToolCallingAgent` that routes to managed agents/tools.
 - Retrieval uses LangChain’s `EnsembleRetriever` to blend Chroma embeddings with BM25; `alpha=0.5` weights lexical vs dense matches.

@@ -23,7 +23,7 @@ bitsandbytes==0.47.0
 autoawq==0.2.9
 
 transformers==4.57.1
-tokenizers==0.21.4
+tokenizers==0.22.1
 safetensors==0.6.2
 accelerate==1.10.0
 peft==0.16.0

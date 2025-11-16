@@ -623,17 +623,29 @@ class DynamicQueryEngineManager:
 def search_and_extract_content_from_url(query: str) -> List[Document]:
     logger.info(f"[web] start search: {query}")
     url = None
-    try:
-        # Add a short timeout using DDGS context + our own watchdog
-        with DDGS() as ddg:
-            # DDGS has no built-in timeout; consider running in a thread with timeout or replacing with requests to a known endpoint when testing
-            results = list(ddg.text(query, max_results=1, backend="google"))
-        logger.info(f"[web] ddgs results: {len(results)}")
-        if results:
-            first = results[0]
-            url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
-    except Exception as e:
-        logger.warning(f"[web] ddgs failed: {e}")
+    ddgs_errors: List[str] = []
+    backend_attempts = [
+        ("google", {"backend": "google"}),
+        ("default", {}),
+    ]
+
+    for backend_name, backend_kwargs in backend_attempts:
+        try:
+            kwargs = {"max_results": 3}
+            kwargs.update(backend_kwargs)
+            with DDGS() as ddg:
+                results = list(ddg.text(query, **kwargs))
+            logger.info("[web] ddgs backend='%s' results: %d", backend_name, len(results))
+            if results:
+                first = results[0]
+                url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
+                if url:
+                    break
+        except Exception as e:
+            ddgs_errors.append(f"{backend_name}: {e}")
+            logger.warning(f"[web] ddgs failed (backend={backend_name}): {e}")
+    if not url and ddgs_errors:
+        logger.warning("[web] ddgs attempts exhausted: %s", "; ".join(ddgs_errors))
 
     if not url:
         logger.info("[web] no URL extracted (blocked/timeout/empty)")

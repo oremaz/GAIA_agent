@@ -208,8 +208,8 @@ def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
 
 
 def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached HuggingFaceLLM configured for Qwen2.5-Coder 3B AWQ."""
-    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct-AWQ", device or "auto")
+    """Return cached HuggingFaceLLM configured for Qwen2.5-Coder 3B with 4-bit quantization."""
+    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -219,10 +219,23 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
         if inst is not None:
             return inst
         _logger.info("Creating Qwen coder LLM for key=%s", key)
-        compute_dtype = torch.float16 if torch.cuda.is_available() else "auto"
+        compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        quant_config = None
+        try:
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
+        except Exception as exc:
+            _logger.warning("BitsAndBytes unavailable for Qwen coder (%s); loading in full precision.", exc)
         model_kwargs = {
             "torch_dtype": compute_dtype,
+            "device_map": key[1],
         }
+        if quant_config is not None:
+            model_kwargs["quantization_config"] = quant_config
         inst = HuggingFaceLLM(
             model_name=key[0],
             tokenizer_name=key[0],
@@ -235,7 +248,6 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
             },
             messages_to_prompt=_qwen_messages_to_prompt,
             completion_to_prompt=_qwen_completion_to_prompt,
-            device_map=key[1],
         )
         _LLM_CACHE[key] = inst
         return inst

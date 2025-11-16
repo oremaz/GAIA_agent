@@ -17,7 +17,7 @@ This repository offers a complete Unit 4 GAIA agent with three practical entry p
 | Mode | Env vars | LLMs | Notes |
 |------|----------|------|-------|
 | API (Gemini) | `USE_API_MODE=true` | `Gemini` LLM + `GeminiEmbedding` | Falls back to local mode if credentials missing. |
-| Local multimodal | `USE_API_MODE=false` | `Qwen/Qwen3-VL-30B-A3B-Instruct` + `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` | Default path in `agent.py`; image captioning reuses the same Qwen3-VL instance. |
+| Local multimodal | `USE_API_MODE=false` | `Qwen/Qwen3-VL-30B-A3B-Instruct` + `Qwen/Qwen2.5-Coder-3B-Instruct` (4-bit) | Default path in `agent.py`; image captioning reuses the same Qwen3-VL instance. |
 | Text-only CLI | `TEXT_ONLY=true` (for `appasync.py`) or import `TextOnlyGptOssAgent` directly | `openai/gpt-oss-20b` + `Qwen3GGUFEmbedding` | Requires one GPU (T4+). No llama-index dependency; dedicated knowledge base and reranker in `agent3.py`. |
 
 ## Multimodal pipeline (`agent.py`)

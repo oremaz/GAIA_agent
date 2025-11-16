@@ -24,8 +24,8 @@ The rest of this README documents how the code maps to the Unit4 challenge and h
 ### 1. Runtime modes
 - `USE_API_MODE=true` → Gemini (LLM + embedding); falls back to local mode automatically on failures.
 - `USE_API_MODE=false` → Local models:
-  * `agent.py` (requires `NONAPI_MULTIMODAL=true`) loads the **new `Qwen/Qwen3-VL-30B-A3B-Instruct`** custom wrapper with NF4 int4 quantization plus `jinaai/jina-embeddings-v4`, and pairs it with `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` for the dedicated code executor agent.
-  * `agent3.py` provides the **text-only GPT-OSS route** (see “Text-only agent” below). Set `NONAPI_MULTIMODAL=false` only if you plan to drive `agent3.TextOnlyGptOssAgent`; `agent.py` now raises if you try to run without the multimodal stack.
+  * `agent.py` loads the **new `Qwen/Qwen3-VL-30B-A3B-Instruct`** custom wrapper with NF4 int4 quantization plus `jinaai/jina-embeddings-v4`, and pairs it with `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` for the dedicated code executor agent.
+  * `agent3.py` provides the **text-only GPT-OSS route** (see “Text-only agent” below). Launch it directly when you need a lightweight GGUF workflow.
 
 ### 2. Retrieval / ingestion (shared with previous README)
 1. **Document ingestion** — `MultimodalPDFReader` (SmartPDFLoader + PyMuPDF) for PDFs; LibreOffice conversion for Office formats; audio/video Readers; plain image docs stored with binary in metadata.
@@ -58,7 +58,6 @@ The rest of this README documents how the code maps to the Unit4 challenge and h
 
 Environment variables used by the code
 - `USE_API_MODE` (true/false) — when true the code prefers API/cloud models (Gemini). Default: false.
-- `NONAPI_MULTIMODAL` (true/false) — keep `true` for `agent.py`. Set to `false` only if you are instantiating `TextOnlyGptOssAgent` from `agent3.py`. Default: true.
 - `GOOGLE_API_KEY` — used for Gemini API routes (API mode).
 - `HUGGINGFACEHUB_API_TOKEN` / `HF_TOKEN` — used for HF Hub downloads where needed.
 - `LLAMA_CLOUD_API_KEY` — optional, used for Llama Cloud services like LlamaParse when available.
@@ -68,14 +67,14 @@ Environment variables used by the code
 Main files involved: `hf-agents.ipynb` (runner), `agent.py` (main agent implementation), `custom_models.py` (local model wrappers), `appasync.py` (async Gradio variant). Key steps in the notebook:
 
 1. Clone the repository and install dependencies: the notebook runs `!pip install -r requirements.txt`.
-2. The notebook sets secrets for the environment (HF token, Gemini key, LLAMA_CLOUD_API_KEY) through Kaggle Secrets. The notebook then sets `USE_API_MODE` and `NONAPI_MULTIMODAL` environment variables.
+2. The notebook sets secrets for the environment (HF token, Gemini key, LLAMA_CLOUD_API_KEY) through Kaggle Secrets, and exports `USE_API_MODE` depending on whether you want Gemini or local Qwen models.
 3. Run the `agent.py` main or launch the Gradio UI using `appasync.py` — the notebook demonstrates both running the agent script and launching the UI.
 
 Key implementation notes (reflecting current code):
 - Model init (`initialize_models` in `agent.py`):
 	* API mode: Gemini LLM (`models/gemini-2.5-flash`) + `GeminiEmbedding` (document retrieval embedding).
-	* Non-API multimodal: `HuggingFaceLLM` wrapping `Qwen/Qwen3-30B-A3B-Instruct-2507` + `JinaEmbeddingsV4` (multimodal). 7B captioner (`Qwen2.5-VL-7B-Instruct-AWQ`) for image description only.
-	* Non-API text-only: `GPTOSSWrapper` (custom iterative tool loop) for `openai/gpt-oss-20b` + `Qwen3GGUFEmbedding` (GGUF / llama.cpp fallback). Same model reused as code LLM.
+	* Non-API multimodal: `HuggingFaceLLM` wrapping `Qwen/Qwen3-30B-A3B-Instruct-2507` + `JinaEmbeddingsV4` (multimodal) with `Qwen/Qwen2.5-Coder-3B-Instruct-AWQ` serving the dedicated code tool.
+	* Text-only users should launch `agent3.TextOnlyGptOssAgent` directly (see section below) rather than toggling an env var.
 - Ingestion: `read_and_parse_content` detects type; office docs converted via LibreOffice; PDFs go through `MultimodalPDFReader` (SmartPDFLoader text + PyMuPDF image docs). Audio handled differently API vs local. Images loaded as binary metadata.
 - Chunking: Semantic-first splitter (4096 / 512) with fallback.
 - Index: Chroma attempt with compatibility handling (different constructor signatures) → fallback to in-memory.
@@ -130,15 +129,15 @@ Below are concise architecture diagrams and component roles for each supported c
 - Reranking: `JinaMultimodalReranker` (CPU) if enabled.
 - Agent loop: ReAct-style `ReActAgent` / `AgentWorkflow` (LlamaIndex agent) handles step-by-step reasoning, tool calls and code execution via `code_execution_tool`.
 
-2) Non-API multimodal (Kaggle notebook, `USE_API_MODE=false`, `NONAPI_MULTIMODAL=true`)
+2) Non-API multimodal (Kaggle notebook, `USE_API_MODE=false`)
 - Core LLM: `HuggingFaceLLM` wrapping `Qwen/Qwen3-30B-A3B-Instruct-2507` (quantized). A separate lightweight `Qwen2.5-VL-7B-Instruct-AWQ` captioner may initialize for image → text descriptions.
 - Embeddings: `JinaEmbeddingsV4` (text / image / cross).
 - Others: (same as earlier list).
 
-3) Non-API text-only (Kaggle notebook, `USE_API_MODE=false`, `NONAPI_MULTIMODAL=false`)
-- Core & Code LLM: `GPTOSSWrapper` (iterative tool calling over `openai/gpt-oss-20b`).
-- Embeddings: `Qwen3GGUFEmbedding` (CPU, llama.cpp if available; zero-vector fallback otherwise).
-- Agent Loop: Iterative GPT-OSS tool loop: call tools for facts, then return FINAL ANSWER.
+3) Text-only CLI (`agent3.py`)
+- Core & Code LLM: `TextOnlyGptOssAgent` loads `openai/gpt-oss-20b` (Harmony chat template) via `transformers`.
+- Embeddings: `Qwen3GGUFEmbedding` (CPU, llama.cpp if available; zero-vector fallback otherwise) + Jina reranker helper.
+- Agent Loop: Custom iterative GPT-OSS tool loop with the same tool semantics (web search, RAG query, Python execution).
 
 4) Local smolagents flow (`agent2.py`, `app.py`) — tool-calling architecture
 - Model: smolagents `OpenAIServerModel` or `genai.Client` driven models (Gemini) via API key — this flow is oriented around API calls.
@@ -162,12 +161,12 @@ Small diagram:
 
 How to run the Kaggle notebook (short checklist)
 1. Open `hf-agents.ipynb` in Kaggle or your notebook environment.
-2. Run the cells in order: clone repo, pip install `requirements.txt`, set environment secrets (HF/Gemini/LLAMA_CLOUD keys) via Kaggle secrets, set `USE_API_MODE`/`NONAPI_MULTIMODAL` as needed.
+2. Run the cells in order: clone repo, pip install `requirements.txt`, set environment secrets (HF/Gemini/LLAMA_CLOUD keys) via Kaggle secrets, and choose `USE_API_MODE` (true for Gemini, false for local Qwen).
 3. Run the test cell that executes `python agent.py` or launch Gradio with `python appasync.py`.
 
 Notes about hardware on Kaggle
 - For non-API multimodal runs you will need 2  NVIDIA T4 GPUs.
-- For text-only (non-API) a single GPU (T4) is typically sufficient.
+- For text-only (non-API) runs using `agent3.py` a single GPU (T4) is typically sufficient.
 - API mode uses cloud models and is tolerant of CPU-only environments.
 
 ## How the Local flow works (`agent2.py`, `app.py`, `requirements2.txt`)
@@ -189,7 +188,7 @@ How to run locally (short checklist)
 
 
 ## Checklist (concise mapping to current code)
-- Environment mode switches (`USE_API_MODE`, `NONAPI_MULTIMODAL`) → Yes (`initialize_models`).
+- Environment mode switch (`USE_API_MODE`) → Yes (`initialize_models`).
 - Large local multimodal model (Qwen3 30B) or API Gemini → Yes.
 - Text-only local path with GPT-OSS + Qwen3 GGUF embeddings → Yes.
 - LibreOffice headless conversion (fail-fast) → Yes (`convert_to_pdf`).
@@ -220,5 +219,5 @@ print(asyncio.run(agent.solve_gaia_question(question)))
 ```
 
 Tips:
-- Keep `NONAPI_MULTIMODAL=true` when running `agent.py`. Use `TextOnlyGptOssAgent` directly instead of toggling the env var.
+- Use `agent.py` for multimodal work; call `TextOnlyGptOssAgent` directly when you need the lightweight GPT-OSS path.
 - First run may download GGUF models (Qwen3 embedding + GPT‑OSS weights); ensure you have enough disk space and set `HF_HOME` if necessary.

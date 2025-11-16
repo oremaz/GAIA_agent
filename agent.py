@@ -231,9 +231,8 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-# Use environment variables to determine API and multimodal modes
+# Use environment variables to determine API mode
 USE_API_MODE = os.environ.get("USE_API_MODE", "false").lower() == "true"
-NONAPI_MULTIMODAL = os.environ.get("NONAPI_MULTIMODAL", "true").lower() == "true"
 
 # Initialize models based on API mode and multimodal setting
 proj_llm, code_llm, embed_model = initialize_models(use_api_mode=USE_API_MODE)
@@ -247,7 +246,7 @@ logger.info(f"proj_llm model_name: {getattr(proj_llm, 'model_name', 'N/A')}")
 logger.info(f"embed_model type: {type(embed_model)}")
 
 
-IMAGE_CAPTION_LLM = proj_llm if (not USE_API_MODE and NONAPI_MULTIMODAL) else None
+IMAGE_CAPTION_LLM = proj_llm if not USE_API_MODE else None
 
 def process_image(image_path: str) -> str:
     """Describe an image using the primary Qwen3-VL-30B-A3B-Instruct model."""
@@ -415,14 +414,7 @@ def read_and_parse_content(input_path: str) -> List[Document]:
     if file_extension in readers_map:
         loader = readers_map[file_extension]
         try:
-            # In text-only (non-multimodal) mode, prefer SmartPDFLoader only for PDFs
-            if file_extension == '.pdf' and not (not USE_API_MODE and NONAPI_MULTIMODAL is False):
-                # multimodal or API mode => use multimodal reader which can extract images
-                documents = loader.load_data(input_path)
-            else:
-                # text-only pipeline: use SmartPDFLoader to avoid any image extraction
-                smart = SmartPDFLoader()
-                documents = smart.load_data(input_path)
+            documents = loader.load_data(input_path)
         except Exception as e:
             return [Document(text=f"Error loading file with reader: {e}")]
     else:
@@ -478,8 +470,9 @@ class DynamicQueryEngineManager:
     def _build_hybrid_reranker(self):
         class HybridReranker:
             def __init__(self):
-                preferred = "jinaai/jina-reranker-m0" if NONAPI_MULTIMODAL else "jinaai/jina-reranker-v2-base-multilingual"
-                self.jina_reranker = get_or_create_jina_reranker(model_name=preferred, top_n=5, device="cpu")
+                self.jina_reranker = get_or_create_jina_reranker(
+                    model_name="jinaai/jina-reranker-m0", top_n=5, device="cpu"
+                )
 
             def postprocess_nodes(self, nodes, query_bundle):
                 try:
@@ -1137,12 +1130,7 @@ class GAIAAgent:
     """Backwards-compatible wrapper that always instantiates the multimodal agent."""
 
     def __init__(self):
-        logger.info("Initializing GAIAAgent (NONAPI_MULTIMODAL=%s)", NONAPI_MULTIMODAL)
-        if not NONAPI_MULTIMODAL:
-            raise RuntimeError(
-                "Text-only mode now lives in agent3.TextOnlyGptOssAgent. "
-                "Set NONAPI_MULTIMODAL=true or import the new agent."
-            )
+        logger.info("Initializing GAIAAgent (multimodal)")
         self._agent = EnhancedGAIAAgent()
         self.mode = "multimodal"
 

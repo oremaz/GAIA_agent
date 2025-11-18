@@ -4,7 +4,7 @@ import base64
 from typing import Dict, Any, List
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
+from langchain_community.vectorstores import Chroma
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from smolagents import CodeAgent, OpenAIServerModel, Tool, ToolCallingAgent
@@ -45,6 +45,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import os
 import mimetypes
 from typing import Dict, Any
+from ddgs import DDGS
 
 agent_type = "ToolAgent"
 
@@ -81,7 +82,7 @@ Answer:"""
 
     try:
         formatting_response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-pro-preview",
             contents=[format_prompt]
         )
         answer = formatting_response.text.strip()
@@ -203,12 +204,6 @@ class WebSearchTool(Tool):
     def __init__(self, max_results=10, **kwargs):
         super().__init__()
         self.max_results = max_results
-        try:
-            from duckduckgo_search import DDGS
-        except ImportError as e:
-            raise ImportError(
-                "You must install package `duckduckgo_search` to run this tool: for instance run `pip install duckduckgo-search`."
-            ) from e
         self.ddgs = DDGS(**kwargs)
 
     def _perform_search(self, query: str):
@@ -448,7 +443,7 @@ class UnifiedMultimodalTool(Tool):
         uploaded_file = self.client.files.upload(file=file_path)
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-pro-preview",
             contents=[prompt, uploaded_file]
         )
         
@@ -471,7 +466,7 @@ class UnifiedMultimodalTool(Tool):
         ]
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3-pro-preview",
             contents=contents
         )
         
@@ -580,7 +575,7 @@ class GAIAAgent:
 
         # Initialize Gemini 2.5 model
         self.model = OpenAIServerModel(
-            model_id="gemini-2.5-flash",
+            model_id="gemini-3-pro-preview",
             api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
             api_key=gemini_api_key,
             temperature=0.0, 
@@ -1023,4 +1018,3 @@ if __name__ == "__main__":
                                     )
     answer = agent.solve_gaia_question(question_data)
     print(f"Answer: {answer}")
-

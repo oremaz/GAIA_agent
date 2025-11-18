@@ -59,9 +59,6 @@ from llama_index.readers.file import (
 from llama_index.readers.smart_pdf_loader import SmartPDFLoader
 import weave
 from ddgs import DDGS
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import json
-
 
 class MultimodalPDFReader:
     """Reader that combines SmartPDFLoader (layout-aware text/tables) with

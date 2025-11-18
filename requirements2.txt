@@ -37,3 +37,4 @@ python-pptx
 pypdf
 openpyxl
 chromadb
+ddgs

@@ -1,74 +1,161 @@
-# GAIA Agent — Final Assignment Template
+# Conversational AI Agent
 
-This repository offers a complete Unit 4 GAIA agent with three practical entry points:
+Production-grade conversational AI agent with a Streamlit UI, LlamaIndex-based multi-agent workflows, and a smolagents tool-calling runner. This repository focuses on multimodal reasoning (text, images, audio, video), document-grounded answers, and configurable provider/model choices.
 
-- **Multimodal RAG agent (`agent.py` + `custom_models.py`)** – LlamaIndex-based ReAct workflow that ingests local/web data, reranks with Jina models, and answers with Qwen3-VL plus a dedicated Qwen2.5 Coder LLM for code execution. `initialize_models` compares the Gemini API path (`USE_API_MODE=true`) with the local Qwen stack (`USE_API_MODE=false`) so you can benchmark both approaches.
-- **Text-only agent (`agent3.py`)** – GPT‑OSS pipeline (GGUF embeddings + Jina reranker) designed for single-GPU runs (T4-class). Set `TEXT_ONLY=true` when running `appasync.py` to switch to this implementation automatically.
-- **smolagents/Gemini runner (`agent2.py`, `app.py`)** – Tool-first architecture for developers who prefer Gemini APIs and Langfuse observability.
+## What is implemented
 
-## Components at a glance
-- `agent.py`: main multimodal GAIA agent wired through LlamaIndex.
-- `custom_models.py`: cached loaders for Jina embeddings/reranker, Qwen3-VL multimodal wrapper, and the Qwen2.5 coder LLM.
-- `agent3.py`: standalone GPT‑OSS–based agent with its own knowledge base and tool loop.
-- `appasync.py`: Gradio runner that imports `GAIAAgent` unless `TEXT_ONLY=true`, in which case it instantiates the text-only agent.
-- `agent2.py` / `app.py`: smolagents workflow (Gemini + Langfuse logging).
+### 1) LlamaIndex conversational agent (`agent.py`)
+- **Multi-agent workflow** (`ReActAgent` + `AgentWorkflow`) with a research agent and optional specialized agents (code execution, image analysis, media analysis, image generation/editing).
+- **Modes**:
+  - **API mode**: Gemini or OpenAI (selected per chat in the UI). Uses Jina embeddings for any indexing.
+  - **Local mode**: Qwen or Ministral suites with specialized models (text, vision, audio/video, code, optional image generation/editing if diffusers are available).
+- **Document handling**:
+  - Docling for PDFs, Office files, and HTML.
+  - CSV/Excel/JSON/text readers for structured data.
+  - Images/audio/video processed through the active multimodal LLM in local mode.
+- **Web search RAG**:
+  - DDGS search + content extraction.
+  - Temporary in-memory `VectorStoreIndex` with hierarchical chunking and Jina reranking.
+- **Code execution** with a restricted global namespace.
+- **Structured answer extraction** via Pydantic `LLMTextCompletionProgram`.
 
-## Runtime modes (used by `agent.py`, `agent3.py`, and `appasync.py`)
-| Mode | Env vars | LLMs | Notes |
-|------|----------|------|-------|
-| API (Gemini) | `USE_API_MODE=true` | `Gemini` LLM + `GeminiEmbedding` | Falls back to local mode if credentials missing. |
-| Local multimodal | `USE_API_MODE=false` | `Qwen/Qwen3-VL-30B-A3B-Instruct` + `Qwen/Qwen2.5-Coder-3B-Instruct` (4-bit) | Default path in `agent.py`; image captioning reuses the same Qwen3-VL instance. |
-| Text-only CLI | `TEXT_ONLY=true` (for `appasync.py`) or import `TextOnlyGptOssAgent` directly | `openai/gpt-oss-20b` + `Qwen3GGUFEmbedding` | Requires one GPU (T4+). No llama-index dependency; dedicated knowledge base and reranker in `agent3.py`. |
+### 2) smolagents GAIA runner (`agent2.py`)
+- **smolagents agent** built on `CodeAgent` with:
+  - Web search (DuckDuckGo), page visiting, YouTube transcript, Python interpreter, and optional multimodal tool.
+  - Optional MCP tool collections (filesystem, GitHub, Brave Search, Slack, Postgres, PubMed).
+- **Used for the Hugging Face GAIA challenge** as the final assignment for the AI Agent course.
+- Supports **Gemini** and **OpenAI** via `OpenAIServerModel`.
+- Optional multimodal tool:
+  - **Gemini**: images/audio/video via Gemini SDK.
+  - **OpenAI**: images via Responses API; audio/video via transcription models.
+- **Document loading** in memory (Docling-first). If Docling fails, the document is skipped.
+- **GAIA task files**: documents are injected into the prompt via Docling; media files are passed as file paths with explicit tool instructions to call `multimodal_processor`.
 
-## Multimodal pipeline (`agent.py`)
-1. **Document ingestion** – `MultimodalPDFReader` combines `SmartPDFLoader` (layout text) with `PyMuPDFReader` (images). Office docs auto-convert to PDF via LibreOffice. Audio/video readers switch between AssemblyAI and `VideoAudioReader` depending on API mode.
-2. **Chunking** – `UnstructuredElementNodeParser` followed by `RecursiveCharacterTextSplitter(4096/512)` or `SentenceSplitter` fallback. Dedup via SHA‑1 hashes on normalized text.
-3. **Index & embeddings** – Attempts persistent `ChromaVectorStore` (`./chroma_db`) with graceful fallback to in-memory. Embeddings come from `jinaai/jina-embeddings-v4` (4‑bit NF4) and reranking via `jinaai/jina-reranker-v2-base-multilingual` (quantized on CUDA, GGUF fallback on CPU).
-4. **Dynamic updates** – `enhanced_web_search_and_update` (DuckDuckGo Search via DDGS + BeautifulSoup/Youtube reader) inserts new documents and rebuilds the query tool incrementally.
-5. **Agents & tools** – Two LlamaIndex `ReActAgent`s (knowledge + code) orchestrated by `AgentWorkflow`. Tools include the RAG query engine, web search, safe Python execution (`execute_python_code` with a curated builtins set), and image captioning through Qwen3-VL. The code agent explicitly uses the Qwen2.5 coder model for deterministic scripting.
-6. **Final answer formatting** – `final_answer_tool` strips boilerplate and (optionally) re-prompts the main LLM to emit GAIA-compliant concise answers.
+### 3) Streamlit UI (`app.py`)
+- Per-chat configuration (framework, mode, provider, model, and specialized features).
+- Session persistence to `.chat_sessions`.
+- LlamaIndex local mode: conversation stores with cached sources you can link into a chat.
+- Prompt media uploaders for LlamaIndex (API + local) and smolagents (multimodal tool).
+- API-mode document injection (full content inserted into prompt memory).
 
-## Text-only pipeline (`agent3.py`)
-- **Model stack** – GPT‑OSS‑20B (Harmony chat template) for reasoning, `Qwen3GGUFEmbedding` for vectorization (llama.cpp-backed GGUF download), and the same Jina reranker logic exposed as `score_text_pairs`.
-- **Knowledge base** – `SimpleKnowledgeBase` chunks every ingested file (supports txt/json/csv/pdf/docx) and stores embeddings in memory (`KnowledgeChunk`). Retrieval combines cosine similarity with reranker scores.
-- **Tools** – DDGS web search scraper, knowledge query, and the same Python execution sandbox. `GptOssReasoner` implements the iterative `TOOL_CALL: name("...")` loop.
-- **API** – `TextOnlyGptOssAgent.solve_gaia_question` remains async to match the multimodal interface, even though its inner operations are synchronous today.
+### 4) Utilities
+- `utils/vector_store.py`: Chroma-based conversation stores plus a shared library cache, all using Jina embeddings.
+- `utils/session_manager.py`: session persistence (messages, metadata, agent config).
+- `utils/document_processor.py`: Docling-driven file parsing + web/YT helpers.
+- `mcp_connectors.py`: MCP server registration and loader helpers.
 
-## Running the Kaggle notebook (`hf-agents.ipynb`)
-1. Clone the repo and `pip install -r requirements.txt`.
-2. Set secrets (`HUGGINGFACEHUB_API_TOKEN`, `GOOGLE_API_KEY`, `LLAMA_CLOUD_API_KEY`) via Kaggle secrets.
-3. Choose `USE_API_MODE=true` for Gemini or `false` for local Qwen. Set `TEXT_ONLY=true` only if you plan to run the GPT‑OSS CLI agent instead of the multimodal pipeline.
-4. Execute the test cell (runs `python agent.py`) or launch the async Gradio app (`python appasync.py`). `agent2.py`/`app.py` rely on local servers and should be run on your own machine rather than within the Kaggle notebook.
+## How it works
 
-Hardware tips:
-- API mode is CPU-friendly.
-- Local multimodal runs are tuned for a single A100 40 GB (enough headroom for Qwen3-VL + coder).
-- Text-only runs generally need one T4 (GGUF on CPU runs but is significantly slower).
+### LlamaIndex local mode
+- Uses **Jina embeddings** and **Chroma** conversation stores.
+- Hierarchical chunking (`HierarchicalNodeParser`) and leaf-node indexing.
+- Optional specialized agents for code, media analysis, image generation/editing.
+- Chat uploads are indexed into Chroma and tracked in the shared library cache.
 
-## Environment variables
-- `USE_API_MODE` – switch between Gemini (true) and local Qwen models (false). Default: false.
-- `TEXT_ONLY` – when true, `appasync.py` imports `TextOnlyGptOssAgent` and ignores `USE_API_MODE`. Default: false.
-- `GOOGLE_API_KEY`, `HUGGINGFACEHUB_API_TOKEN`, `LLAMA_CLOUD_API_KEY` – optional credentials for external services.
+### LlamaIndex API mode
+- Uses **Gemini/OpenAI** for reasoning.
+- Document uploads are inserted as full text into prompt memory (no vector store).
 
-## smolagents workflow (`agent2.py`, `app.py`) – run locally
-- Tool-first design: `WebSearchTool`, `UnifiedMultimodalTool`, `ChromaBM25HybridRetrieverTool`, `FinalAnswerTool`, etc.
-- Agents include a coder (`CodeAgent`) and a top-level `ToolCallingAgent` that routes to managed agents/tools.
-- Retrieval uses LangChain’s `EnsembleRetriever` to blend Chroma embeddings with BM25; `alpha=0.5` weights lexical vs dense matches.
-- Observability via Langfuse/OpenTelemetry (`_setup_langfuse_observability`).
-- Use this path when you prefer Gemini APIs or Langfuse instrumentation; otherwise `agent.py` is the default for leaderboard-style evaluations.
+### smolagents
+- CodeAgent-based assistant designed for tool-heavy tasks.
+- API only; no local-mode execution.
+- MCP tools can be enabled per chat.
 
-## Engineering notes
-- Incremental updates use `insert_nodes` to avoid rebuilding the entire index; SHA‑1 dedup prevents repeated web content explosion.
-- The reranker lazily loads (and uses GGUF fallback) to keep cold-start memory low, at the cost of first-query latency.
-- Safe-code execution is intentionally permissive for local analytics—add further sandboxing before exposing it publicly.
-- `appasync.py` runs Gradio in queue mode (`demo.queue().launch(...)`) so long-running async calls don’t block concurrent users.
+## Best practices
 
-## Checklist (current coverage)
-- Environment switches (`USE_API_MODE`, `TEXT_ONLY`) → Yes.
-- Large local multimodal stack (Qwen3-VL + Qwen2.5 coder) → Yes.
-- Text-only GGUF path (`agent3.py`) → Yes.
-- LibreOffice conversion / SmartPDFLoader ingestion → Yes.
-- Semantic chunking (4096/512) and reranking → Yes.
-- Web search ingestion + incremental KB → Yes.
-- GAIA final-answer formatting → Yes.
-- Full GAIA submission automation → Manual driver (the provided apps fetch/submit but automation scripts are not included).
+- **Local multi-agent workflows** are GPU-intensive. For Qwen 30B + vision + code models, plan for **L4-class GPU or better**.
+- **Smaller local stacks**: Qwen 4B text-only is the most GPU-friendly option.
+- **LlamaIndex local mode** is best for large document sets and offline workflows.
+- **API mode** is best for quick setup and long-context analysis without local hardware requirements.
+
+## Getting started
+
+### Install dependencies
+Use your existing environment and install with:
+```
+pip install -r requirements.txt
+```
+
+### Run the app
+```
+streamlit run app.py
+```
+The UI opens at `http://localhost:8501`.
+
+## Using the Streamlit UI
+
+### Create a chat
+1. Click **New Chat** in the sidebar.
+2. Choose:
+   - **Framework**: `llamaindex` or `smolagents`.
+   - **Mode**: `API` or `Local` (smolagents requires API).
+   - **Provider/Model** and specialized feature toggles.
+3. Click **Create Chat**.
+
+### Upload documents
+- **Local LlamaIndex**: documents are indexed into a per-chat vector store and cached in the shared library.
+- **API mode**: full document content is added to prompt memory.
+
+### Multimodal attachments
+- **LlamaIndex**: use **Prompt Media** to attach images/audio/video to the next prompt (local audio/video requires Media Analysis enabled).
+- **smolagents**: use **Prompt media (multimodal)** to attach images/audio/video for the next prompt; the model is instructed to call `multimodal_processor`.
+- PDFs and office docs should be uploaded via the document upload sections (chat files), not prompt media.
+
+## Configuration
+
+### Environment variables
+**Core keys**:
+```
+export GOOGLE_API_KEY="your-google-api-key"
+export OPENAI_API_KEY="your-openai-api-key"
+```
+
+**Langfuse**:
+```
+export LANGFUSE_SECRET_KEY="your-langfuse-secret-key"
+export LANGFUSE_PUBLIC_KEY="your-langfuse-public-key"
+export LANGFUSE_HOST="https://cloud.langfuse.com"
+```
+
+**MCP servers (optional)**:
+```
+export GITHUB_PERSONAL_ACCESS_TOKEN="your-github-token"
+export BRAVE_API_KEY="your-brave-api-key"
+export SLACK_BOT_TOKEN="your-slack-bot-token"
+export POSTGRES_CONNECTION_STRING="your-postgres-uri"
+```
+
+**OpenAI transcription model (optional)**:
+```
+export OPENAI_TRANSCRIBE_MODEL="gpt-4o-mini-transcribe"
+```
+
+### Local model selection
+You can override local models using:
+```
+export LOCAL_MODEL_ID="Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+```
+
+### Streamlit settings
+Configured in `.streamlit/config.toml` (port, theme, uploads, logging).
+
+## Repository structure
+
+- `agent.py`: LlamaIndex multi-agent conversational runtime (local and API modes).
+- `agent2.py`: smolagents tool-calling agent (used for HF GAIA challenge).
+- `custom_models.py`: cached model wrappers (Qwen, Ministral, Devstral, Jina embeddings/reranker, API clients).
+- `app.py`: Streamlit UI entry point.
+- `utils/`: session management, vector store manager, document processing.
+- `mcp_connectors.py`: MCP server definitions and loader.
+
+## Notes
+- **Embeddings are always Jina** (API and local).
+- **Vector stores are only used for LlamaIndex local mode**.
+- **smolagents has no local mode**.
+
+## Troubleshooting
+
+- **Model errors**: confirm GPU memory and correct model IDs.
+- **API failures**: verify the API keys are set.
+- **Docling errors**: validate file type and ensure docling dependencies are installed.
+- **MCP tools not loading**: verify required environment variables for each server.

@@ -1,8 +1,51 @@
-# Ignore VS Code and editor history folders
-.history/
-.env
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 
-# Ignore audio and spreadsheet files
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+.history/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Application data
+chroma_db/
+.chat_sessions/
+offload*/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Data files
 *.mp3
 *.xlsx
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints

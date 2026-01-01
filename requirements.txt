@@ -1,89 +1,78 @@
-gradio==5.32.1
-gradio-client==1.10.2
-httpx==0.28.1
-safehttpx==0.1.6
-ruff==0.11.12
-pydantic==2.11.7
-starlette==0.47.2
-tomlkit==0.13.3
-aiofiles==24.1.0
-anyio==4.10.0
-jinja2==3.1.6
-markupsafe==3.0.2
-orjson==3.11.2
-typing-extensions==4.12.2
-uvicorn==0.35.0
+# ============================================================================
+# Core Frameworks (Corrected Names)
+# ============================================================================
+llama-index
+smolagents
+langchain
+langchain-community
 
-torch==2.8.0
-torchvision==0.23.0
-torchaudio==2.8.0
-sentence-transformers==5.1.0
-huggingface-hub==0.34.4
-bitsandbytes==0.47.0
-autoawq==0.2.9
+# ============================================================================
+# LLM Providers & API Clients
+# ============================================================================
+google-genai
+openai
 
-transformers==4.57.1
-tokenizers==0.22.1
-safetensors==0.6.2
-accelerate==1.10.0
-peft==0.16.0
+# ============================================================================
+# Unified Embeddings & Vector Store (Jina Only)
+# ============================================================================
+numpy<2
+sentence-transformers       
+chromadb             
+llama-index-vector-stores-chroma
 
-llama-index==0.13.2
-llama-index-core==0.13.2
-llama-index-llms-huggingface==0.6.0
-llama-index-embeddings-huggingface==0.6.0
-llama-index-tools-arxiv==0.4.0
-llama-index-readers-file==0.5.0
-llama-index-readers-web==0.5.0
-llama-index-readers-youtube-transcript==0.4.0
-llama-index-readers-json==0.4.0
-llama-index-readers-assemblyai==0.4.0
-llama-index-readers-smart-pdf-loader==0.4.0
-llama-index-llms-gemini==0.6.0
-llama-index-embeddings-gemini==0.4.0
-llama-index-llms-vllm==0.6.0
-llama-cloud-services==0.6.54
-llama-index-vector-stores-chroma == 0.5.1
+# ============================================================================
+# Document & Web Processing (Minimalist & Efficient)
+# ============================================================================
+docling              
+llama-index-readers-docling
+llama-index-readers-file 
+llama-index-readers-web  
+html2text 
+pypdf               
+pandas
+openpyxl                    
+duckduckgo-search  
+ddgs 
+youtube-transcript-api      
+llama-index-readers-youtube-transcript
+matplotlib
+seaborn
+scikit-learn
+scipy
+beautifulsoup4
+pyyaml
+tqdm
 
-pymupdf==1.22.0
-pypdf==5.9.0
-python-docx==1.2.0
-openpyxl==3.1.5
-pandas==2.2.3
-Pillow==10.4.0
-beautifulsoup4==4.12.3
-lxml==5.4.0
-unstructured==0.18.13
-python-multipart==0.0.20
+# ============================================================================
+# MCP & Tools
+# ============================================================================
+mcp               
 
-qwen-vl-utils==0.0.11
-
-pydub==0.25.1
-speechrecognition==3.14.3
-ffmpeg-python==0.2.0
-
-requests==2.32.3
-trafilatura==2.0.0
-arxiv==2.2.0
-
+# ============================================================================
+# UI & Observability
+# ============================================================================
+streamlit
+watchdog
+pillow
+python-multipart
+langfuse
 weave
-kernels
+openinference-instrumentation-smolagents
 
-numpy==1.26.4
-scipy==1.16.1
-matplotlib==3.10.5
-seaborn==0.13.2
-plotly==6.3.0
-scikit-learn==1.7.1
-xgboost==3.0.4
-lightgbm==4.6.0
-statsmodels==0.14.5
-opencv-python==4.11.0.86
-nltk==3.9.1
-pytz==2025.2
-tqdm==4.66.4
-sympy==1.14.0
-ddgs==9.5.2
+# ============================================================================
+# Infrastructure
+# ============================================================================
+transformers
+accelerate
+einops
+sentencepiece
+nest-asyncio                
+requests
+python-dotenv
+pydantic
 
-chromadb
-llama-cpp-python
+# ============================================================================
+# Diffusion Models & Audio
+# ============================================================================
+diffusers
+soundfile

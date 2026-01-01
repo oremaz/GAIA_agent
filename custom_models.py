@@ -1,17 +1,54 @@
-from typing import Optional, List, Any, Dict, Sequence
+from typing import Optional, List, Any, Dict, Sequence, Union
 import os
+import warnings
+import base64
+import mimetypes
 from pydantic import Field, PrivateAttr
+from pydantic.warnings import UnsupportedFieldAttributeWarning
+# Silence LlamaIndex's validate_default Field warning during import.
+warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+
 from llama_index.core.llms import CustomLLM, CompletionResponse, CompletionResponseGen, LLMMetadata
 from llama_index.core.llms.callbacks import llm_completion_callback
-from llama_index.llms.huggingface import HuggingFaceLLM
-from transformers import AutoProcessor, TextIteratorStreamer, Qwen3VLMoeForConditionalGeneration
-from qwen_vl_utils import process_vision_info
+from transformers import (
+    AutoModel,
+    AutoProcessor,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TextIteratorStreamer,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLMoeForConditionalGeneration,
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeProcessor,
+    BitsAndBytesConfig,
+)
+from transformers import Mistral3ForConditionalGeneration
+
+try:
+    from transformers import MistralCommonBackend
+except Exception:
+    MistralCommonBackend = None
 import torch
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.schema import ImageDocument
-from transformers import AutoModel, BitsAndBytesConfig
 import threading
 import logging
+import numpy as np
+from PIL import Image
+
+# API clients
+from google import genai
+from openai import OpenAI
+
+# Diffusion models (optional - may fail on some platforms like macOS with torch.xpu issues)
+try:
+    from diffusers import DiffusionPipeline, QwenImageEditPlusPipeline
+    import soundfile as sf
+    DIFFUSERS_AVAILABLE = True
+except (ImportError, AttributeError) as e:
+    DIFFUSERS_AVAILABLE = False
+    DiffusionPipeline, QwenImageEditPlusPipeline, sf  = None, None, None
+    logging.getLogger(__name__).warning(f"Diffusers not available: {e}")
 
 # Lock to prevent races when creating cached instances concurrently
 _CACHE_LOCK = threading.Lock()
@@ -21,27 +58,8 @@ _logger = logging.getLogger(__name__)
 _EMBEDDER_CACHE = {}
 _RERANKER_CACHE = {}
 _LLM_CACHE = {}
-
-
-def _qwen_messages_to_prompt(messages):
-    prompt = ""
-    for message in messages:
-        role = getattr(message, "role", None) or message.get("role")
-        content = getattr(message, "content", None) or message.get("content", "")
-        if role == "system":
-            prompt += f"<|system|>\n{content}</s>\n"
-        elif role == "user":
-            prompt += f"<|user|>\n{content}</s>\n"
-        elif role == "assistant":
-            prompt += f"<|assistant|>\n{content}</s>\n"
-    if not prompt.startswith("<|system|>\n"):
-        prompt = "<|system|>\n</s>\n" + prompt
-    prompt += "<|assistant|>\n"
-    return prompt
-
-
-def _qwen_completion_to_prompt(completion):
-    return f"<|system|>\n</s>\n<|user|>\n{completion}</s>\n<|assistant|>\n"
+_MINISTRAL_CACHE = {}
+_API_CLIENT_CACHE = {}
 
 def _truncate_on_stop(text: str, stop: Optional[List[str]]) -> str:
     if not stop:
@@ -186,30 +204,57 @@ def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional
         _LLM_CACHE[key] = inst
         return inst
 
+def get_or_create_ministral_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached MinistralMultiModal or create one.
 
-def get_or_create_qwen3_gguf_embedding(model_name: Optional[str] = None):
-    """Return cached Qwen3GGUFEmbedding or create one."""
-    key = (model_name or "Qwen/Qwen3-Embedding-0.6B-GGUF",)
-    inst = _EMBEDDER_CACHE.get(key)
+    Defaults to Ministral-3-8B-Instruct-2512.
+    """
+    key = (model_name or "mistralai/Ministral-3-8B-Instruct-2512", device or "auto")
+    inst = _MINISTRAL_CACHE.get(key)
     if inst is not None:
         return inst
+
     with _CACHE_LOCK:
-        inst = _EMBEDDER_CACHE.get(key)
+        inst = _MINISTRAL_CACHE.get(key)
         if inst is not None:
             return inst
-        _logger.info("Creating Qwen3GGUFEmbedding for key=%s", key)
+
+        _logger.info("Creating MinistralMultiModal for key=%s", key)
         try:
-            inst = Qwen3GGUFEmbedding(model_name=key[0])
+            before_alloc = None
+            if torch.cuda.is_available():
+                try:
+                    before_alloc = torch.cuda.memory_allocated()
+                except Exception:
+                    pass
+
+            inst = MinistralMultiModal(model_id=key[0], device_map=key[1])
+
+            after_alloc = None
+            if torch.cuda.is_available():
+                try:
+                    after_alloc = torch.cuda.memory_allocated()
+                except Exception:
+                    pass
+
+            _logger.info(
+                "MinistralMultiModal created (mem_before=%s, mem_after=%s)",
+                before_alloc, after_alloc
+            )
         except Exception:
-            _logger.exception("Failed to create Qwen3GGUFEmbedding for key=%s", key)
+            _logger.exception("Failed to create MinistralMultiModal for key=%s", key)
             raise
-        _EMBEDDER_CACHE[key] = inst
+
+        _MINISTRAL_CACHE[key] = inst
         return inst
 
-
-def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached HuggingFaceLLM configured for Qwen2.5-Coder 3B with 4-bit quantization."""
-    key = (model_name or "Qwen/Qwen2.5-Coder-3B-Instruct", device or "auto")
+def get_or_create_devstral_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached Devstral LLM configured for agentic software engineering tasks.
+    
+    Uses Mistral3ForConditionalGeneration with Devstral-Small-2-24B-Instruct-2512.
+    This model excels at using tools, exploring codebases, and editing multiple files.
+    """
+    key = (model_name or "mistralai/Devstral-Small-2-24B-Instruct-2512", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
         return inst
@@ -218,52 +263,278 @@ def get_or_create_qwen_coder_llm(model_name: Optional[str] = None, device: Optio
         inst = _LLM_CACHE.get(key)
         if inst is not None:
             return inst
-        _logger.info("Creating Qwen coder LLM for key=%s", key)
-        compute_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        quant_config = None
+        
+        _logger.info("Creating Devstral LLM for key=%s", key)
         try:
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype,
+            before_alloc = None
+            if torch.cuda.is_available():
+                try:
+                    before_alloc = torch.cuda.memory_allocated()
+                except Exception:
+                    pass
+
+            inst = DevstralLLM(model_id=key[0], device_map=key[1])
+
+            after_alloc = None
+            if torch.cuda.is_available():
+                try:
+                    after_alloc = torch.cuda.memory_allocated()
+                except Exception:
+                    pass
+
+            _logger.info(
+                "DevstralLLM created for key=%s (mem_before=%s, mem_after=%s)",
+                key,
+                before_alloc,
+                after_alloc,
             )
-        except Exception as exc:
-            _logger.warning("BitsAndBytes unavailable for Qwen coder (%s); loading in full precision.", exc)
-        model_kwargs = {
-            "torch_dtype": compute_dtype,
-        }
-        if quant_config is not None:
-            model_kwargs["quantization_config"] = quant_config
-        inst = HuggingFaceLLM(
-            model_name=key[0],
-            tokenizer_name=key[0],
-            context_window=32768,
-            max_new_tokens=1024,
-            model_kwargs=model_kwargs,
-            generate_kwargs={
-                "temperature": 0.1,
-                "top_p": 0.9,
-            },
-            messages_to_prompt=_qwen_messages_to_prompt,
-            completion_to_prompt=_qwen_completion_to_prompt,
-            device_map=key[1],
-        )
+        except Exception:
+            _logger.exception("Failed to create DevstralLLM for key=%s", key)
+            raise
+
         _LLM_CACHE[key] = inst
         return inst
 
+def unload_model_from_gpu(model):
+    """Unload a model from GPU to CPU and clear cache."""
+    try:
+        if hasattr(model, '_model') and model._model is not None:
+            _logger.info("Unloading model from GPU to CPU")
+            model._model.to('cpu')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        return True
+    except Exception as e:
+        _logger.warning(f"Failed to unload model: {e}")
+        return False
+
+
+def reload_model_to_gpu(model):
+    """Reload a model from CPU to GPU."""
+    try:
+        if hasattr(model, '_model') and model._model is not None:
+            _logger.info("Reloading model to GPU")
+            device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+            model._model.to(device)
+        return True
+    except Exception as e:
+        _logger.warning(f"Failed to reload model: {e}")
+        return False
+
+
 
 _DEFAULT_QWEN_VL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+
+
+class DevstralLLM(CustomLLM):
+    """CustomLLM wrapper for Devstral-Small-2-24B-Instruct-2512 using Mistral3ForConditionalGeneration.
+
+    Optimized for agentic software engineering tasks including tool use, code exploration, and multi-file editing.
+    Model is in FP8 format by default - no additional quantization applied.
+    """
+
+    model_id: str = Field(default="mistralai/Devstral-Small-2-24B-Instruct-2512")
+    max_new_tokens: int = Field(default=2048)
+    temperature: float = Field(default=0.15)
+    top_p: float = Field(default=0.9)
+    device_map: str = Field(default="auto")
+    use_flash_attn2: bool = Field(default=False)
+    max_input_tokens: int = Field(default=32768)
+
+    _tokenizer: Any = PrivateAttr(default=None)
+    _model: Any = PrivateAttr(default=None)
+    _hf_loaded: bool = PrivateAttr(default=False)
+    _hf_lock: Any = PrivateAttr(default=None)
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        try:
+            self._hf_lock = threading.Lock()
+        except Exception:
+            self._hf_lock = None
+        self._hf_loaded = False
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=32768,
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=True,
+        )
+
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+
+    def _init_hf(self) -> None:
+        """Load tokenizer + Devstral model. No quantization - model is already FP8."""
+        try:
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
+        except Exception:
+            pass
+
+        if MistralCommonBackend is None:
+            raise RuntimeError("MistralCommonBackend not available; Mistral models cannot be initialized.")
+
+        self._tokenizer = MistralCommonBackend.from_pretrained(self.model_id)
+
+        # Model kwargs - no quantization for FP8 model
+        model_kwargs = {
+            "device_map": self.device_map,
+            "torch_dtype": "auto",
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
+
+        try:
+            offload_folder = os.path.abspath("./offload_devstral")
+            os.makedirs(offload_folder, exist_ok=True)
+            model_kwargs["offload_folder"] = offload_folder
+        except Exception:
+            pass
+
+        if self.use_flash_attn2:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        self._model = Mistral3ForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
+        self._model.eval()
+
+    def _ensure_hf(self) -> None:
+        if getattr(self, "_hf_loaded", False):
+            return
+        lock = getattr(self, "_hf_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            if getattr(self, "_hf_loaded", False):
+                return
+            self._init_hf()
+            self._hf_loaded = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+    def _truncate_input(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Truncate input to max_input_tokens"""
+        if input_ids.shape[-1] > self.max_input_tokens:
+            _logger.warning(
+                "Truncating Devstral input from %d to %d tokens",
+                input_ids.shape[-1], self.max_input_tokens
+            )
+            return input_ids[:, -self.max_input_tokens:]
+        return input_ids
+
+    @llm_completion_callback()
+    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
+        self._ensure_hf()
+
+        # Build messages using Mistral format
+        messages = [{"role": "user", "content": prompt}]
+
+        # Tokenize using apply_chat_template
+        tokenized = self._tokenizer.apply_chat_template(
+            conversation=messages,
+            tools=kwargs.get("tools"),
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+        input_ids = tokenized["input_ids"]
+        if input_ids.shape[-1] > self.max_input_tokens:
+            input_ids = self._truncate_input(input_ids)
+
+        try:
+            input_ids = input_ids.to(self._model.device)
+        except Exception:
+            pass
+
+        # Generate
+        gen_kwargs = dict(
+            max_new_tokens=min(int(kwargs.get("max_new_tokens", self.max_new_tokens)), self.max_new_tokens),
+            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
+            temperature=kwargs.get("temperature", self.temperature) or 0.15,
+            top_p=kwargs.get("top_p", self.top_p),
+        )
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(input_ids, **gen_kwargs)
+
+        # Decode only new tokens
+        new_tokens = output_ids[0][len(tokenized["input_ids"][0]):]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        if stop:
+            text = _truncate_on_stop(text, stop)
+
+        return CompletionResponse(text=text.strip())
+
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:
+        self._ensure_hf()
+
+        # Build messages
+        messages = [{"role": "user", "content": prompt}]
+
+        # Tokenize
+        tokenized = self._tokenizer.apply_chat_template(
+            conversation=messages,
+            tools=kwargs.get("tools"),
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+        input_ids = tokenized["input_ids"]
+        if input_ids.shape[-1] > self.max_input_tokens:
+            input_ids = self._truncate_input(input_ids)
+
+        try:
+            input_ids = input_ids.to(self._model.device)
+        except Exception:
+            pass
+
+        gen_kwargs = dict(
+            max_new_tokens=min(int(kwargs.get("max_new_tokens", self.max_new_tokens)), self.max_new_tokens),
+            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
+            temperature=kwargs.get("temperature", self.temperature) or 0.15,
+            top_p=kwargs.get("top_p", self.top_p),
+        )
+
+        streamer = TextIteratorStreamer(
+            self._tokenizer.tokenizer if hasattr(self._tokenizer, "tokenizer") else self._tokenizer,
+            skip_special_tokens=True,
+            skip_prompt=True,
+        )
+
+        thread = threading.Thread(
+            target=self._model.generate,
+            kwargs={"input_ids": input_ids, **gen_kwargs, "streamer": streamer},
+            daemon=True,
+        )
+        thread.start()
+
+        text_accum = ""
+        for delta in streamer:
+            text_accum += delta
+            if stop and any(s and s in text_accum for s in stop):
+                trimmed = _truncate_on_stop(text_accum, stop)
+                yield CompletionResponse(text=trimmed, delta="")
+                break
+            yield CompletionResponse(text=text_accum, delta=delta)
 
 
 class Qwen3VLMultiModal(CustomLLM):
     """CustomLLM wrapper for Qwen3-VL-30B-A3B-Instruct with int4 quantization.
 
     The implementation mirrors the official Qwen3-VL documentation flow: prompts
-    are built via AutoProcessor.apply_chat_template and image inputs are
-    normalized through process_vision_info so llama-index can drive the model
-    seamlessly. We quantize to 4-bit NF4 via BitsAndBytes to satisfy the memory
-    constraints called out in the requirements.
+    are built via AutoProcessor.apply_chat_template with tokenized inputs so
+    llama-index can drive the model seamlessly. We quantize to 4-bit NF4 via
+    BitsAndBytes to satisfy the memory constraints called out in the requirements.
     """
 
     model_id: str = Field(default=_DEFAULT_QWEN_VL)
@@ -348,7 +619,12 @@ class Qwen3VLMultiModal(CustomLLM):
         if self.use_flash_attn2:
             model_kwargs["attn_implementation"] = "flash_attention_2"
 
-        self._model = Qwen3VLMoeForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
+        model_cls = Qwen3VLMoeForConditionalGeneration if self._is_moe_model() else Qwen3VLForConditionalGeneration
+        self._model = model_cls.from_pretrained(self.model_id, **model_kwargs)
+
+    def _is_moe_model(self) -> bool:
+        model_id = (self.model_id or "").lower()
+        return "a3b" in model_id or "moe" in model_id
 
     def _ensure_hf(self) -> None:
         if getattr(self, "_hf_loaded", False):
@@ -369,7 +645,6 @@ class Qwen3VLMultiModal(CustomLLM):
                     pass
 
     def _force_batch_size_one(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
-        import torch
 
         trimmed = False
 
@@ -398,21 +673,29 @@ class Qwen3VLMultiModal(CustomLLM):
         message: Dict[str, Any] = {"role": "user", "content": []}
         if image_documents:
             for img in image_documents:
-                message["content"].append({"type": "image", "image": f"file://{img.image_path}"})
+                # Check extension to decide if it's image or video
+                ext = os.path.splitext(img.image_path)[1].lower()
+                if ext in ['.mp4', '.mkv', '.mov', '.avi']:
+                    message["content"].append({"type": "video", "video": f"file://{img.image_path}"})
+                else:
+                    message["content"].append({"type": "image", "image": f"file://{img.image_path}"})
         message["content"].append({"type": "text", "text": prompt})
         return [message]
 
     def _prepare_inputs_from_messages(self, messages: List[dict]) -> Dict[str, Any]:
         self._ensure_hf()
-        chat_text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = self._processor(
-            text=[chat_text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
+        inputs = self._processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
             return_tensors="pt",
         )
+        if not isinstance(inputs, dict):
+            try:
+                inputs = dict(inputs)
+            except Exception:
+                pass
 
         try:
             if "input_ids" in inputs:
@@ -516,114 +799,7 @@ class Qwen3VLMultiModal(CustomLLM):
 
 
 # ---------------- Embedding / reranker helpers ---------------- #
-class Qwen3GGUFEmbedding(BaseEmbedding):
-    """Wrapper to load a Qwen3 GGUF embedding model via llama.cpp or gguf loader.
 
-    This class exposes the same interface used in the repo: _get_query_embedding/_get_text_embedding
-    and a generic _embed() method that returns list[list[float]]. It prefers llama_cpp Llama.embed when
-    available and falls back to a lightweight subprocess-based llama.cpp call if needed.
-    """
-    model_name: str = Field(default="Qwen/Qwen3-Embedding-0.6B-GGUF")
-    _llama = PrivateAttr(default=None)
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        # Prefer llama_cpp Llama if available
-        try:
-            from llama_cpp import Llama
-            # For GGUF local file usage one would pass model_path, but HF hub download is left to user
-            # We'll initialize lazily in _embed to keep constructor cheap
-            self._llama = None
-        except Exception:
-            self._llama = None
-
-    @classmethod
-    def class_name(cls) -> str:
-        return "qwen3_gguf"
-
-    def _ensure_llama(self):
-        if self._llama is None:
-            try:
-                from huggingface_hub import hf_hub_download
-                # Attempt to download the GGUF file from HF repo if present
-                repo_id = self.model_name
-                # try common gguf filename
-                gguf_file = None
-                from huggingface_hub import list_repo_files
-                files = list_repo_files(repo_id)
-                # Collect candidate gguf/bin files and prefer q4_k_m (then q4_k, q4_0, q4)
-                candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
-                if candidates:
-                    pref_order = ["q4_k_m", "q4_k", "q4_0", "q4"]
-                    chosen = None
-                    for p in pref_order:
-                        for f in candidates:
-                            if p in f.lower():
-                                chosen = f
-                                break
-                        if chosen:
-                            break
-                    if not chosen:
-                        chosen = candidates[0]
-                    path = hf_hub_download(repo_id=repo_id, filename=chosen)
-                    from llama_cpp import Llama
-                    self._llama = Llama(model_path=path)
-            except Exception:
-                self._llama = None
-
-    def _embed(self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None, **kwargs) -> List[List[float]]:
-        self._ensure_llama()
-        if self._llama is not None:
-            # llama_cpp exposes embed
-            flat = []
-            for t in texts:
-                try:
-                    res = self._llama.embed(t)
-                    if isinstance(res, dict) and 'data' in res:
-                        flat.append(list(res['data'][0].get('embedding', [])))
-                    elif isinstance(res, list):
-                        flat.append(list(res[0]))
-                    else:
-                        flat.append([0.0])
-                except Exception:
-                    flat.append([0.0])
-            return flat
-        else:
-            # Last resort: return zero vectors matching a small dimension
-            return [[0.0] * 384 for _ in texts]
-
-    def _get_query_embedding(self, query: str, image_path: Optional[str] = None) -> List[float]:
-        return self._embed([query])[0]
-
-    def _get_text_embedding(self, text: str, image_path: Optional[str] = None) -> List[float]:
-        return self._embed([text])[0]
-
-    # Added plural sync variant expected by some BaseEmbedding utilities
-    def _get_text_embeddings(
-        self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None
-    ) -> List[List[float]]:
-        return self._embed(texts)
-
-    # ---- Async wrappers (BaseEmbedding declares async abstract methods) ----
-    async def _aget_query_embedding(
-        self, query: str, image_path: Optional[str] = None
-    ) -> List[float]:
-        return self._get_query_embedding(query, image_path)
-
-    async def _aget_text_embedding(
-        self, text: str, image_path: Optional[str] = None
-    ) -> List[float]:
-        return self._get_text_embedding(text, image_path)
-
-    async def _aget_text_embeddings(
-        self, texts: List[str], image_paths: Optional[List[Optional[str]]] = None
-    ) -> List[List[float]]:
-        return self._get_text_embeddings(texts, image_paths)
-
-
-# If BaseEmbedding is from LlamaIndex or your own base, import it accordingly.
-# from llama_index.core.embeddings.base import BaseEmbedding
- 
 class JinaEmbeddingsV4(BaseEmbedding):
     """
     Memory-constrained wrapper for jinaai/jina-embeddings-v4.
@@ -666,13 +842,6 @@ class JinaEmbeddingsV4(BaseEmbedding):
 
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
             os.makedirs(self.offload_folder, exist_ok=True)
-
-            from transformers import AutoModel, AutoProcessor
-            # BitsAndBytesConfig is available via transformers when bitsandbytes is installed
-            try:
-                from transformers import BitsAndBytesConfig
-            except Exception:
-                from bitsandbytes import BitsAndBytesConfig  # fallback import
 
             bnb_cfg = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -731,7 +900,6 @@ class JinaEmbeddingsV4(BaseEmbedding):
         - max_length capped (queries vs passages)
         - optional truncate_dim to reduce output dimensionality
         """
-        from PIL import Image
 
         try:
             self._ensure_model()
@@ -756,10 +924,6 @@ class JinaEmbeddingsV4(BaseEmbedding):
         def _to_list_vector(arr):
             if isinstance(arr, torch.Tensor):
                 arr = arr.detach().cpu().numpy()
-            try:
-                import numpy as np
-            except Exception:
-                np = None
             if np is not None and isinstance(arr, np.ndarray):
                 # possible shapes: (N, D), (N, M, D), (D,)
                 if arr.ndim == 3:
@@ -873,8 +1037,6 @@ class JinaMultimodalReranker:
     def _load_model(self):
         """Load the Jina reranker model"""
         try:
-            from transformers import AutoModel, BitsAndBytesConfig
-            import torch
 
             # Determine target device. Prefer cuda:1 when multiple GPUs exist,
             # otherwise fall back to cuda:0. If no CUDA, use CPU.
@@ -921,173 +1083,19 @@ class JinaMultimodalReranker:
                         device_map=device_map,
                     )
             else:
-                # For CPU targets, prefer a GGUF (llama.cpp) runtime if available
-                # so we avoid heavy PyTorch CPU model loading. Try HF GGUF repo then llama_cpp.
-                from huggingface_hub import list_repo_files, hf_hub_download
-                # Try to find a gguf file in the companion repo (common naming convention)
-                repo_id = f"{self.model_name}-GGUF" if not self.model_name.endswith("-GGUF") else self.model_name
-                files = list_repo_files(repo_id)
-                gguf_candidates = [f for f in files if f.lower().endswith('.gguf') or f.lower().endswith('.bin')]
-                if gguf_candidates:
-                    gguf_file = gguf_candidates[0]
-                    gguf_path = hf_hub_download(repo_id=repo_id, filename=gguf_file)
-                    try:
-                        from llama_cpp import Llama
-
-                        llm = Llama(model_path=gguf_path)
-
-                        class _GGUFFallbackWrapper:
-                            """Robust wrapper exposing compute_score(pairs, ...) using embeddings from llama_cpp.
-
-                            Features:
-                            - Attempts a single batched embedding call where supported.
-                            - Normalizes multiple possible embedding return shapes.
-                            - Validates embedding dimensions and returns 0.0 for invalid pairs.
-                            """
-                            def __init__(self, llm_obj):
-                                self._llm = llm_obj
-                                # Mirror a minimal PyTorch model surface so callers can .to()/.eval()
-                                self.device = 'cpu'
-
-                            def to(self, device):
-                                """No-op device move for GGUF wrapper. Records device string."""
-                                try:
-                                    # normalize device string
-                                    if isinstance(device, str):
-                                        self.device = device
-                                    else:
-                                        self.device = str(device)
-                                except Exception:
-                                    self.device = 'cpu'
-                                return self
-
-                            def eval(self):
-                                """No-op eval (keeps parity with torch models)."""
-                                return self
-
-                            def _call_embed(self, texts: List[str]) -> List[List[float]]:
-                                """Return a list of embedding vectors for the input texts.
-
-                                Tries a batched API first, falls back to per-text calls.
-                                Normalizes possible return formats.
-                                """
-                                embeddings: List[List[float]] = []
-
-                                # Try batched call first
-                                try:
-                                    # llama_cpp Llama.embed accepts a single string or a list
-                                    res = self._llm.embed(texts)
-                                    # Normalize response shapes
-                                    # Possible forms: {'data': [{'embedding': [...]}, ...]} or list of embeddings
-                                    if isinstance(res, dict) and 'data' in res:
-                                        for item in res['data']:
-                                            if isinstance(item, dict) and 'embedding' in item:
-                                                embeddings.append(list(item['embedding']))
-                                            else:
-                                                # Unexpected item -> try to coerce
-                                                try:
-                                                    embeddings.append(list(item))
-                                                except Exception:
-                                                    embeddings.append([0.0])
-                                    elif isinstance(res, list):
-                                        # Assume list of embeddings or list of dicts
-                                        for item in res:
-                                            if isinstance(item, dict) and 'embedding' in item:
-                                                embeddings.append(list(item['embedding']))
-                                            else:
-                                                try:
-                                                    embeddings.append(list(item))
-                                                except Exception:
-                                                    embeddings.append([0.0])
-                                    else:
-                                        # Single embedding returned for whole batch
-                                        try:
-                                            embeddings = [list(res)] * len(texts)
-                                        except Exception:
-                                            embeddings = [[0.0] for _ in texts]
-                                    # If result length mismatches, fall back to per-text
-                                    if len(embeddings) != len(texts):
-                                        raise RuntimeError("Batch embed length mismatch")
-                                    return embeddings
-                                except Exception:
-                                    # Fall back to per-text embedding calls
-                                    embeddings = []
-                                    for t in texts:
-                                        try:
-                                            r = self._llm.embed(t)
-                                            if isinstance(r, dict) and 'data' in r:
-                                                emb = r['data'][0].get('embedding')
-                                                embeddings.append(list(emb) if emb is not None else [0.0])
-                                            elif isinstance(r, list):
-                                                embeddings.append(list(r[0]) if r and isinstance(r[0], (list, tuple)) else list(r))
-                                            else:
-                                                embeddings.append(list(r) if hasattr(r, '__iter__') else [0.0])
-                                        except Exception:
-                                            embeddings.append([0.0])
-                                    return embeddings
-
-                            def compute_score(self, pairs, max_length=1024, doc_type="text"):
-                                # pairs: list of [query, doc_text]
-                                if not pairs:
-                                    return []
-
-                                # Build flattened list for embeddings requests: [q0, d0, q1, d1, ...]
-                                texts: List[str] = []
-                                for q, d in pairs:
-                                    texts.append(q if isinstance(q, str) else str(q))
-                                    texts.append(d if isinstance(d, str) else str(d))
-
-                                embeddings = self._call_embed(texts)
-
-                                # Compute cosine similarity for each pair with validation
-                                scores: List[float] = []
-                                import math
-                                for i in range(0, len(embeddings), 2):
-                                    try:
-                                        qv = embeddings[i]
-                                        dv = embeddings[i + 1]
-                                    except Exception:
-                                        scores.append(0.0)
-                                        continue
-
-                                    # Validate numeric vectors
-                                    if not qv or not dv or len(qv) != len(dv):
-                                        scores.append(0.0)
-                                        continue
-
-                                    # Compute dot and norms robustly
-                                    try:
-                                        dot = 0.0
-                                        nq = 0.0
-                                        nd = 0.0
-                                        for a, b in zip(qv, dv):
-                                            fa = float(a)
-                                            fb = float(b)
-                                            dot += fa * fb
-                                            nq += fa * fa
-                                            nd += fb * fb
-                                        if nq <= 0 or nd <= 0:
-                                            scores.append(0.0)
-                                            continue
-                                        scores.append(dot / (math.sqrt(nq) * math.sqrt(nd) + 1e-12))
-                                    except Exception:
-                                        scores.append(0.0)
-
-                                return scores
-                        self._model = _GGUFFallbackWrapper(llm)
-                        print(f"Loaded GGUF reranker via llama_cpp from {repo_id} using file {gguf_file}")
-                    except Exception as e:
-                        print(f"llama_cpp GGUF init failed: {e}. Falling back to PyTorch CPU model.")
-                        # Fall through to PyTorch CPU load below
-                        raise
-                else:
-                    # No gguf file found -- raise to trigger the PyTorch fallback
-                    raise RuntimeError("No GGUF candidate found in HF repo")
+                # For CPU targets, use regular PyTorch load
+                self._model = AutoModel.from_pretrained(
+                    self.model_name,
+                    torch_dtype="auto",
+                    trust_remote_code=True,
+                    device_map=device_map,
+                )
             # If device_map is 'cpu', ensure model is on CPU. Otherwise device_map already placed weights.
-            if device_map == 'cpu':
+            if device_map == 'cpu' and hasattr(self._model, 'to'):
                 self._model.to('cpu')
 
-            self._model.eval()
+            if hasattr(self._model, 'eval'):
+                self._model.eval()
             print(f"Loaded Jina reranker model: {self.model_name} on {target_dev}")
             
         except Exception as e:
@@ -1253,3 +1261,1069 @@ class JinaMultimodalReranker:
             self._load_model()
             self._loaded = True
         return self._model.compute_score(pairs, max_length=max_length, doc_type="text")
+
+# ============================================================================
+# Ministral-3 Support (Mistral AI)
+# ============================================================================
+
+_MINISTRAL_CACHE = {}
+
+class MinistralMultiModal(CustomLLM):
+    """CustomLLM wrapper for Mistral Ministral-3 series (3B/8B/14B) in native FP8.
+
+    Supports:
+    - mistralai/Ministral-3-3B-Instruct-2512
+    - mistralai/Ministral-3-8B-Instruct-2512
+    - mistralai/Ministral-3-14B-Instruct-2512
+
+    Mirrors Qwen3VLMultiModal implementation pattern.
+    """
+
+    model_id: str = Field(default="mistralai/Ministral-3-8B-Instruct-2512")
+    max_new_tokens: int = Field(default=2048)
+    temperature: float = Field(default=0.7)
+    top_p: float = Field(default=0.95)
+    top_k: int = Field(default=50)
+    device_map: str = Field(default="auto")
+    use_flash_attn2: bool = Field(default=False)
+    max_input_tokens: int = Field(default=8192)
+
+    _tokenizer: Any = PrivateAttr(default=None)
+    _model: Any = PrivateAttr(default=None)
+    _hf_loaded: bool = PrivateAttr(default=False)
+    _hf_lock: Any = PrivateAttr(default=None)
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        try:
+            self._hf_lock = threading.Lock()
+        except Exception:
+            self._hf_lock = None
+        self._hf_loaded = False
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=32768,
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=False,
+        )
+
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+
+    def _init_hf(self) -> None:
+        """Load tokenizer + Ministral-3 model in native FP8"""
+
+        try:
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
+        except Exception:
+            pass
+
+        if MistralCommonBackend is None:
+            raise RuntimeError("MistralCommonBackend not available; Mistral models cannot be initialized.")
+
+        self._tokenizer = MistralCommonBackend.from_pretrained(self.model_id)
+
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+
+        # Quantization disabled by default - Ministral models already in FP8 format
+        # quant_cfg = None
+        # try:
+        #     quant_cfg = BitsAndBytesConfig(
+        #         load_in_4bit=True,
+        #         bnb_4bit_quant_type="nf4",
+        #         bnb_4bit_use_double_quant=True,
+        #         bnb_4bit_compute_dtype=torch.bfloat16,
+        #     )
+        # except Exception as exc:
+        #     _logger.warning("BitsAndBytes unavailable (%s); using fp16", exc)
+
+        model_kwargs: Dict[str, Any] = {
+            "device_map": self.device_map,
+            "low_cpu_mem_usage": True,
+            "torch_dtype": "auto",
+            "trust_remote_code": True,
+        }
+
+        # No quantization config added - using native FP8 format
+        # if quant_cfg is not None:
+        #     model_kwargs["quantization_config"] = quant_cfg
+
+        try:
+            offload_folder = os.path.abspath("./offload_ministral")
+            os.makedirs(offload_folder, exist_ok=True)
+            model_kwargs["offload_folder"] = offload_folder
+        except Exception:
+            pass
+
+        if self.use_flash_attn2:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        self._model = Mistral3ForConditionalGeneration.from_pretrained(self.model_id, **model_kwargs)
+        self._model.eval()
+
+    def _ensure_hf(self) -> None:
+        if getattr(self, "_hf_loaded", False):
+            return
+        lock = getattr(self, "_hf_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            if getattr(self, "_hf_loaded", False):
+                return
+            self._init_hf()
+            self._hf_loaded = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+    def _truncate_input(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Truncate input to max_input_tokens"""
+        if input_ids.shape[-1] > self.max_input_tokens:
+            _logger.warning(
+                "Truncating Ministral input from %d to %d tokens",
+                input_ids.shape[-1], self.max_input_tokens
+            )
+            return input_ids[:, -self.max_input_tokens:]
+        return input_ids
+
+    @llm_completion_callback()
+    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
+        self._ensure_hf()
+
+        messages = [{"role": "user", "content": prompt}]
+        inputs = self._tokenizer.apply_chat_template(
+            conversation=messages,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+        try:
+            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        except Exception:
+            pass
+
+        if "input_ids" in inputs:
+            inputs["input_ids"] = self._truncate_input(inputs["input_ids"])
+        if "attention_mask" in inputs:
+            inputs["attention_mask"] = inputs["attention_mask"][:, -self.max_input_tokens:]
+
+        # Generate
+        gen_kwargs = dict(
+            max_new_tokens=min(int(kwargs.get("max_new_tokens", self.max_new_tokens)), self.max_new_tokens),
+            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
+            temperature=kwargs.get("temperature", self.temperature) or 0.7,
+            top_p=kwargs.get("top_p", self.top_p),
+            top_k=self.top_k,
+            pad_token_id=self._tokenizer.pad_token_id,
+            eos_token_id=self._tokenizer.eos_token_id,
+        )
+
+        with torch.inference_mode():
+            output_ids = self._model.generate(**inputs, **gen_kwargs)
+
+        start = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+        new_tokens = output_ids[0][start:]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        if stop:
+            text = _truncate_on_stop(text, stop)
+
+        return CompletionResponse(text=text.strip())
+
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:
+        self._ensure_hf()
+
+        messages = [{"role": "user", "content": prompt}]
+        inputs = self._tokenizer.apply_chat_template(
+            conversation=messages,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+        try:
+            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+        except Exception:
+            pass
+
+        if "input_ids" in inputs:
+            inputs["input_ids"] = self._truncate_input(inputs["input_ids"])
+        if "attention_mask" in inputs:
+            inputs["attention_mask"] = inputs["attention_mask"][:, -self.max_input_tokens:]
+
+        gen_kwargs = dict(
+            max_new_tokens=min(int(kwargs.get("max_new_tokens", self.max_new_tokens)), self.max_new_tokens),
+            do_sample=(kwargs.get("temperature", self.temperature) or 0.0) > 0.0,
+            temperature=kwargs.get("temperature", self.temperature) or 0.7,
+            top_p=kwargs.get("top_p", self.top_p),
+            top_k=self.top_k,
+            pad_token_id=self._tokenizer.pad_token_id,
+            eos_token_id=self._tokenizer.eos_token_id,
+        )
+
+        tokenizer_ref = self._tokenizer.tokenizer if hasattr(self._tokenizer, "tokenizer") else self._tokenizer
+        streamer = TextIteratorStreamer(
+            tokenizer_ref, skip_special_tokens=True, skip_prompt=True
+        )
+
+        thread = threading.Thread(
+            target=self._model.generate,
+            kwargs={**inputs, **gen_kwargs, "streamer": streamer},
+            daemon=True,
+        )
+        thread.start()
+
+        text_accum = ""
+        for delta in streamer:
+            text_accum += delta
+            if stop and any(s and s in text_accum for s in stop):
+                trimmed = _truncate_on_stop(text_accum, stop)
+                yield CompletionResponse(text=trimmed, delta="")
+                break
+            yield CompletionResponse(text=text_accum, delta=delta)
+# This file contains new model classes to add to custom_models.py
+# Copy these classes to the end of custom_models.py
+
+# ============================================================================
+# API-based LLM Clients (Gemini, OpenAI)
+# ============================================================================
+
+class GeminiMultimodalLLM(CustomLLM):
+    """Native Gemini API client with multimodal support (text, image, audio, video)."""
+    
+    model_id: str = Field(default="gemini-3-pro-preview")
+    max_new_tokens: int = Field(default=16000)
+    temperature: float = Field(default=0.6)
+    top_p: float = Field(default=0.95)
+    top_k: int = Field(default=20)
+    api_key: Optional[str] = Field(default=None)
+    
+    _client: Any = PrivateAttr(default=None)
+    _previous_interaction_id: Optional[str] = PrivateAttr(default=None)
+    
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        
+        api_key = self.api_key or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY not found in environment")
+        
+        self._client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+        self._previous_interaction_id = None
+    
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=1000000,  # Gemini 3 supports 1M context
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=True,
+        )
+    
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+    
+    def _infer_interaction_type(self, mime_type: str) -> str:
+        """Map mime type to Gemini Interactions input type."""
+        if mime_type.startswith("image/"):
+            return "image"
+        if mime_type.startswith("audio/"):
+            return "audio"
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type == "application/pdf":
+            return "document"
+        return "document"
+
+    def _prepare_interaction_input(
+        self,
+        prompt: str,
+        image_documents: Optional[List[ImageDocument]] = None,
+        **kwargs
+    ) -> List[Dict[str, Any]]:
+        """Prepare Interactions input with text and optional media."""
+        inputs: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+
+        if image_documents:
+            for img_doc in image_documents:
+                file_path = img_doc.image_path
+                file_size = os.path.getsize(file_path)
+                mime_type, _ = mimetypes.guess_type(file_path)
+                mime_type = mime_type or "application/octet-stream"
+                input_type = self._infer_interaction_type(mime_type)
+
+                # Use Files API for large files (>20MB)
+                if file_size > 20 * 1024 * 1024:
+                    uploaded_file = self._client.files.upload(file=file_path)
+                    inputs.append({
+                        "type": input_type,
+                        "uri": uploaded_file.uri,
+                    })
+                else:
+                    with open(file_path, "rb") as f:
+                        encoded = base64.b64encode(f.read()).decode("utf-8")
+                    inputs.append({
+                        "type": input_type,
+                        "data": encoded,
+                        "mime_type": mime_type,
+                    })
+
+        return inputs
+
+    def _extract_text(self, interaction: Any) -> str:
+        outputs = getattr(interaction, "outputs", None) or []
+        for output in reversed(outputs):
+            text = getattr(output, "text", None)
+            if text:
+                return text.strip()
+            if isinstance(output, dict):
+                text = output.get("text")
+                if text:
+                    return text.strip()
+        return ""
+    
+    @llm_completion_callback()
+    def complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponse:
+        inputs = self._prepare_interaction_input(prompt, image_documents, **kwargs)
+
+        generation_config = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_output_tokens": self.max_new_tokens,
+        }
+
+        interaction = self._client.interactions.create(
+            model=self.model_id,
+            input=inputs,
+            previous_interaction_id=self._previous_interaction_id,
+            generation_config=generation_config,
+        )
+
+        self._previous_interaction_id = getattr(interaction, "id", None)
+        text = self._extract_text(interaction)
+        return CompletionResponse(text=text)
+    
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponseGen:
+        inputs = self._prepare_interaction_input(prompt, image_documents, **kwargs)
+
+        generation_config = {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_output_tokens": self.max_new_tokens,
+        }
+
+        interaction = self._client.interactions.create(
+            model=self.model_id,
+            input=inputs,
+            previous_interaction_id=self._previous_interaction_id,
+            generation_config=generation_config,
+        )
+
+        # Interactions streaming isn't integrated here yet; return full response.
+        self._previous_interaction_id = getattr(interaction, "id", None)
+        text = self._extract_text(interaction)
+        yield CompletionResponse(text=text, delta=text)
+
+
+class OpenAIMultimodalLLM(CustomLLM):
+    """Native OpenAI API client with multimodal support."""
+    
+    model_id: str = Field(default="gpt-4o")
+    max_new_tokens: int = Field(default=4096)
+    temperature: float = Field(default=0.7)
+    api_key: Optional[str] = Field(default=None)
+    
+    _client: Any = PrivateAttr(default=None)
+    _conversation_id: Optional[str] = PrivateAttr(default=None)
+    
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        
+        api_key = self.api_key or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY not found in environment")
+        
+        self._client = OpenAI(api_key=api_key)
+        self._conversation_id = None
+    
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=128000,
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=True,
+        )
+    
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+    
+    def _ensure_conversation_id(self) -> Optional[str]:
+        if self._conversation_id:
+            return self._conversation_id
+
+        try:
+            convo = self._client.conversations.create()
+        except Exception:
+            return None
+
+        convo_id = getattr(convo, "id", None)
+        if convo_id:
+            self._conversation_id = convo_id
+        return self._conversation_id
+
+    def _prepare_input(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None) -> List[Dict]:
+        """Prepare Responses API input with text and optional images."""
+        content = [{"type": "input_text", "text": prompt}]
+
+        if image_documents:
+            for img_doc in image_documents:
+                file_path = img_doc.image_path
+
+                with open(file_path, "rb") as f:
+                    image_data = base64.b64encode(f.read()).decode("utf-8")
+
+                mime_type, _ = mimetypes.guess_type(file_path)
+                mime_type = mime_type or "image/jpeg"
+
+                content.append({
+                    "type": "input_image",
+                    "image_url": f"data:{mime_type};base64,{image_data}",
+                })
+
+        return [{"role": "user", "content": content}]
+
+    def _extract_response_text(self, response: Any) -> str:
+        text = getattr(response, "output_text", None)
+        if text:
+            return text.strip()
+
+        output = getattr(response, "output", None) or getattr(response, "outputs", None) or []
+        for item in output:
+            content = getattr(item, "content", None) if not isinstance(item, dict) else item.get("content")
+            if not content:
+                continue
+            for part in content:
+                part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                if part_type in ("output_text", "text"):
+                    text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                    if text:
+                        return text.strip()
+        return ""
+    
+    @llm_completion_callback()
+    def complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponse:
+        payload = self._prepare_input(prompt, image_documents)
+        convo_id = self._ensure_conversation_id()
+
+        response_kwargs = {
+            "model": self.model_id,
+            "input": payload,
+            "max_output_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+        }
+        if convo_id:
+            response_kwargs["conversation"] = convo_id
+
+        response = self._client.responses.create(**response_kwargs)
+
+        text = self._extract_response_text(response)
+        return CompletionResponse(text=text)
+    
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponseGen:
+        payload = self._prepare_input(prompt, image_documents)
+        convo_id = self._ensure_conversation_id()
+
+        response_kwargs = {
+            "model": self.model_id,
+            "input": payload,
+            "max_output_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+        }
+        if convo_id:
+            response_kwargs["conversation"] = convo_id
+
+        response = self._client.responses.create(**response_kwargs)
+
+        text = self._extract_response_text(response)
+        yield CompletionResponse(text=text, delta=text)
+
+
+# ============================================================================
+# Qwen3 Text-only Models (No VL)
+# ============================================================================
+
+class Qwen3TextLLM(CustomLLM):
+    """Qwen3 text-only models (4B and 30B FP8 variants) without vision capabilities."""
+    
+    model_id: str = Field(default="Qwen/Qwen3-4B-Instruct-2507-FP8")
+    max_new_tokens: int = Field(default=16384)
+    temperature: float = Field(default=0.6)
+    top_p: float = Field(default=0.95)
+    device_map: str = Field(default="auto")
+    max_input_tokens: int = Field(default=32768)
+    
+    _tokenizer: Any = PrivateAttr(default=None)
+    _model: Any = PrivateAttr(default=None)
+    _hf_loaded: bool = PrivateAttr(default=False)
+    _hf_lock: Any = PrivateAttr(default=None)
+    
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        try:
+            self._hf_lock = threading.Lock()
+        except Exception:
+            self._hf_lock = None
+        self._hf_loaded = False
+    
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=32768,
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=False,
+        )
+    
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+    
+    def _init_hf(self) -> None:
+        """Load tokenizer + model. Models are already in FP8, no quantization needed."""
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model_id,
+            trust_remote_code=True
+        )
+        
+        # Model is already FP8, load with auto dtype
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            torch_dtype="auto",
+            device_map=self.device_map,
+            trust_remote_code=True
+        )
+        self._model.eval()
+    
+    def _ensure_hf(self) -> None:
+        if getattr(self, "_hf_loaded", False):
+            return
+        lock = getattr(self, "_hf_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            if getattr(self, "_hf_loaded", False):
+                return
+            self._init_hf()
+            self._hf_loaded = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+    
+    @llm_completion_callback()
+    def complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponse:
+        self._ensure_hf()
+        
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        
+        generated_ids = self._model.generate(
+            **model_inputs,
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            top_p=self.top_p,
+        )
+        
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        content = self._tokenizer.decode(output_ids, skip_special_tokens=True)
+        
+        if stop:
+            content = _truncate_on_stop(content, stop)
+        
+        return CompletionResponse(text=content.strip())
+    
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> CompletionResponseGen:
+        self._ensure_hf()
+        
+        messages = [{"role": "user", "content": prompt}]
+        text = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        model_inputs = self._tokenizer([text], return_tensors="pt").to(self._model.device)
+        
+        streamer = TextIteratorStreamer(
+            self._tokenizer,
+            skip_special_tokens=True,
+            skip_prompt=True,
+        )
+        
+        thread = threading.Thread(
+            target=self._model.generate,
+            kwargs={
+                **model_inputs,
+                "max_new_tokens": self.max_new_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "streamer": streamer
+            },
+            daemon=True,
+        )
+        thread.start()
+        
+        text_accum = ""
+        for delta in streamer:
+            text_accum += delta
+            if stop and any(s and s in text_accum for s in stop):
+                trimmed = _truncate_on_stop(text_accum, stop)
+                yield CompletionResponse(text=trimmed, delta="")
+                break
+            yield CompletionResponse(text=text_accum, delta=delta)
+
+
+# ============================================================================
+# Qwen3-Omni for Audio/Video + Text
+# ============================================================================
+
+class Qwen3OmniMultiModal(CustomLLM):
+    """Qwen3-Omni-30B-A3B-Instruct for audio, video, and text processing."""
+    
+    model_id: str = Field(default="Qwen/Qwen3-Omni-30B-A3B-Instruct")
+    max_new_tokens: int = Field(default=4096)
+    temperature: float = Field(default=0.2)
+    top_p: float = Field(default=0.95)
+    device_map: str = Field(default="auto")
+    use_flash_attn2: bool = Field(default=False)
+    use_audio_in_video: bool = Field(default=True)
+    speaker: str = Field(default="Ethan")
+    
+    _processor: Any = PrivateAttr(default=None)
+    _model: Any = PrivateAttr(default=None)
+    _hf_loaded: bool = PrivateAttr(default=False)
+    _hf_lock: Any = PrivateAttr(default=None)
+    
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        try:
+            self._hf_lock = threading.Lock()
+        except Exception:
+            self._hf_lock = None
+        self._hf_loaded = False
+    
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            model_name=self.model_id,
+            context_window=32768,
+            num_output=self.max_new_tokens,
+            is_chat_model=True,
+            is_function_calling_model=False,
+        )
+    
+    @property
+    def model_name(self) -> str:
+        return self.model_id
+    
+    def _init_hf(self) -> None:
+        """Load processor + Qwen3-Omni model."""
+        model_kwargs = {
+            "dtype": "auto",
+            "device_map": self.device_map,
+        }
+        
+        if self.use_flash_attn2:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+        
+        self._model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+            self.model_id,
+            **model_kwargs
+        )
+        
+        self._processor = Qwen3OmniMoeProcessor.from_pretrained(self.model_id)
+        self._model.eval()
+    
+    def _ensure_hf(self) -> None:
+        if getattr(self, "_hf_loaded", False):
+            return
+        lock = getattr(self, "_hf_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            if getattr(self, "_hf_loaded", False):
+                return
+            self._init_hf()
+            self._hf_loaded = True
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+    
+    def _prepare_conversation(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None) -> List[Dict]:
+        """Prepare conversation with text, images, audio, and video."""
+        content = [{"type": "text", "text": prompt}]
+        
+        if image_documents:
+            for img_doc in image_documents:
+                file_path = img_doc.image_path
+                mime_type, _ = mimetypes.guess_type(file_path)
+                
+                if mime_type and mime_type.startswith("image/"):
+                    content.append({"type": "image", "image": file_path})
+                elif mime_type and mime_type.startswith("audio/"):
+                    content.append({"type": "audio", "audio": file_path})
+                elif mime_type and mime_type.startswith("video/"):
+                    content.append({"type": "video", "video": file_path})
+        
+        return [{"role": "user", "content": content}]
+    
+    @llm_completion_callback()
+    def complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponse:
+        self._ensure_hf()
+        
+        try:
+            from qwen_omni_utils import process_mm_info
+        except ImportError:
+            _logger.warning("qwen_omni_utils not available, multimodal features may be limited")
+            # Fallback to text-only processing
+            return CompletionResponse(text="Qwen Omni utils not available. Please install qwen_omni_utils.")
+        
+        conversation = self._prepare_conversation(prompt, image_documents)
+        
+        text = self._processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=self.use_audio_in_video)
+        
+        inputs = self._processor(
+            text=text,
+            audio=audios,
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
+            use_audio_in_video=self.use_audio_in_video
+        )
+        inputs = inputs.to(self._model.device).to(self._model.dtype)
+        
+        text_ids, audio = self._model.generate(
+            **inputs,
+            speaker=self.speaker,
+            thinker_return_dict_in_generate=True,
+            use_audio_in_video=self.use_audio_in_video
+        )
+        
+        output_text = self._processor.batch_decode(
+            text_ids.sequences[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+        
+        # Optionally save audio output if available
+        if audio is not None:
+            try:
+                sf.write(
+                    "omni_output.wav",
+                    audio.reshape(-1).detach().cpu().numpy(),
+                    samplerate=24000,
+                )
+                _logger.info("Audio output saved to omni_output.wav")
+            except Exception as e:
+                _logger.warning(f"Failed to save audio output: {e}")
+        
+        return CompletionResponse(text=output_text.strip())
+    
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None, **kwargs: Any) -> CompletionResponseGen:
+        # Omni model doesn't support streaming well, return full response
+        response = self.complete(prompt, image_documents, **kwargs)
+        yield CompletionResponse(text=response.text, delta=response.text)
+
+
+# ============================================================================
+# Image Generation with Qwen-Image-2512
+# ============================================================================
+
+class QwenImageGenerator:
+    """Image generation using Qwen-Image-2512 diffusion model."""
+    
+    def __init__(self, model_name: str = "Qwen/Qwen-Image-2512"):
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError("Diffusers library not available")
+        self.model_name = model_name
+        self.pipe = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    
+    def _ensure_pipeline(self):
+        """Lazy load the pipeline."""
+        if self.pipe is None:
+            _logger.info(f"Loading image generation pipeline: {self.model_name}")
+            self.pipe = DiffusionPipeline.from_pretrained(
+                self.model_name,
+                torch_dtype=self.torch_dtype
+            ).to(self.device)
+    
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str = "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲。",
+        aspect_ratio: str = "16:9",
+        num_inference_steps: int = 50,
+        true_cfg_scale: float = 4.0,
+        seed: Optional[int] = None,
+        output_path: str = "generated_image.png"
+    ) -> str:
+        """Generate image from text prompt."""
+        self._ensure_pipeline()
+        
+        aspect_ratios = {
+            "1:1": (1328, 1328),
+            "16:9": (1664, 928),
+            "9:16": (928, 1664),
+            "4:3": (1472, 1104),
+            "3:4": (1104, 1472),
+            "3:2": (1584, 1056),
+            "2:3": (1056, 1584),
+        }
+        
+        width, height = aspect_ratios.get(aspect_ratio, (1664, 928))
+        
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+        
+        image = self.pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            true_cfg_scale=true_cfg_scale,
+            generator=generator
+        ).images[0]
+        
+        image.save(output_path)
+        _logger.info(f"Image saved to {output_path}")
+        
+        return output_path
+
+
+# ============================================================================
+# Image Editing with Qwen-Image-Edit-2511
+# ============================================================================
+
+class QwenImageEditor:
+    """Image editing using Qwen-Image-Edit-2511."""
+    
+    def __init__(self, model_name: str = "Qwen/Qwen-Image-Edit-2511"):
+        if not DIFFUSERS_AVAILABLE:
+            raise RuntimeError("Diffusers library not available")
+        self.model_name = model_name
+        self.pipeline = None
+        self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    
+    def _ensure_pipeline(self):
+        """Lazy load the pipeline."""
+        if self.pipeline is None:
+            _logger.info(f"Loading image editing pipeline: {self.model_name}")
+            self.pipeline = QwenImageEditPlusPipeline.from_pretrained(
+                self.model_name,
+                torch_dtype=self.torch_dtype
+            )
+            self.pipeline.to('cuda' if torch.cuda.is_available() else 'cpu')
+            self.pipeline.set_progress_bar_config(disable=None)
+    
+    def edit(
+        self,
+        image_paths: Union[str, List[str]],
+        prompt: str,
+        negative_prompt: str = " ",
+        num_inference_steps: int = 40,
+        guidance_scale: float = 1.0,
+        true_cfg_scale: float = 4.0,
+        seed: int = 0,
+        output_path: str = "edited_image.png"
+    ) -> str:
+        """Edit image(s) based on text prompt."""
+        self._ensure_pipeline()
+        
+        # Load images
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
+        
+        images = [Image.open(path) for path in image_paths]
+        
+        inputs = {
+            "image": images,
+            "prompt": prompt,
+            "generator": torch.manual_seed(seed),
+            "true_cfg_scale": true_cfg_scale,
+            "negative_prompt": negative_prompt,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "num_images_per_prompt": 1,
+        }
+        
+        with torch.inference_mode():
+            output = self.pipeline(**inputs)
+            output_image = output.images[0]
+            output_image.save(output_path)
+        
+        _logger.info(f"Edited image saved to {output_path}")
+        return output_path
+
+
+# ============================================================================
+# Getter functions for new models
+# ============================================================================
+
+def get_or_create_qwen3_text_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached Qwen3TextLLM or create one."""
+    key = (model_name or "Qwen/Qwen3-4B-Instruct-2507-FP8", device or "auto")
+    inst = _LLM_CACHE.get(key)
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        inst = _LLM_CACHE.get(key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating Qwen3TextLLM for key=%s", key)
+        inst = Qwen3TextLLM(model_id=key[0], device_map=key[1])
+        _LLM_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_qwen3_omni_llm(model_name: Optional[str] = None, device: Optional[str] = None):
+    """Return cached Qwen3OmniMultiModal or create one."""
+    key = (model_name or "Qwen/Qwen3-Omni-30B-A3B-Instruct", device or "auto")
+    inst = _LLM_CACHE.get(key)
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        inst = _LLM_CACHE.get(key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating Qwen3OmniMultiModal for key=%s", key)
+        inst = Qwen3OmniMultiModal(model_id=key[0], device_map=key[1])
+        _LLM_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_gemini_llm(
+    model_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    """Return cached GeminiMultimodalLLM or create one."""
+    key = (model_name or "gemini-3-pro-preview", api_key or os.environ.get("GOOGLE_API_KEY"), session_id)
+    inst = _API_CLIENT_CACHE.get(key)
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        inst = _API_CLIENT_CACHE.get(key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating GeminiMultimodalLLM for key=%s", key[0])
+        inst = GeminiMultimodalLLM(model_id=key[0], api_key=key[1])
+        _API_CLIENT_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_openai_llm(
+    model_name: Optional[str] = None,
+    api_key: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    """Return cached OpenAIMultimodalLLM or create one."""
+    key = (model_name or "gpt-4o", api_key or os.environ.get("OPENAI_API_KEY"), session_id)
+    inst = _API_CLIENT_CACHE.get(key)
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        inst = _API_CLIENT_CACHE.get(key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating OpenAIMultimodalLLM for key=%s", key[0])
+        inst = OpenAIMultimodalLLM(model_id=key[0], api_key=key[1])
+        _API_CLIENT_CACHE[key] = inst
+        return inst
+
+
+def get_or_create_image_generator(model_name: Optional[str] = None):
+    """Return cached QwenImageGenerator or create one."""
+    if not DIFFUSERS_AVAILABLE:
+        raise RuntimeError("Diffusers library not available. Cannot create image generator.")
+    
+    key = model_name or "Qwen/Qwen-Image-2512"
+    inst = _API_CLIENT_CACHE.get(("img_gen", key))
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        cache_key = ("img_gen", key)
+        inst = _API_CLIENT_CACHE.get(cache_key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating QwenImageGenerator for model=%s", key)
+        inst = QwenImageGenerator(model_name=key)
+        _API_CLIENT_CACHE[cache_key] = inst
+        return inst
+
+
+def get_or_create_image_editor(model_name: Optional[str] = None):
+    """Return cached QwenImageEditor or create one."""
+    if not DIFFUSERS_AVAILABLE:
+        raise RuntimeError("Diffusers library not available. Cannot create image editor.")
+    
+    key = model_name or "Qwen/Qwen-Image-Edit-2511"
+    inst = _API_CLIENT_CACHE.get(("img_edit", key))
+    if inst is not None:
+        return inst
+    
+    with _CACHE_LOCK:
+        cache_key = ("img_edit", key)
+        inst = _API_CLIENT_CACHE.get(cache_key)
+        if inst is not None:
+            return inst
+        
+        _logger.info("Creating QwenImageEditor for model=%s", key)
+        inst = QwenImageEditor(model_name=key)
+        _API_CLIENT_CACHE[cache_key] = inst
+        return inst

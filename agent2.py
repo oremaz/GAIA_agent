@@ -1,14 +1,14 @@
 import os
 import requests
 import base64
-from typing import Dict, Any, List
-from langchain.docstore.document import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
-from smolagents import CodeAgent, OpenAIServerModel, Tool, ToolCallingAgent
-from smolagents import PythonInterpreterTool
+import re
+import mimetypes
+import logging
+import sys
+from typing import Dict, Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
+from smolagents import CodeAgent, OpenAIServerModel, Tool, tool
 
 # Langfuse observability imports
 from opentelemetry.sdk.trace import TracerProvider
@@ -16,87 +16,93 @@ from openinference.instrumentation.smolagents import SmolagentsInstrumentor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry import trace
-from langfuse import Langfuse
-from smolagents import PythonInterpreterTool
 
-
-import requests
 from markdownify import markdownify
 from requests.exceptions import RequestException
-from smolagents import tool
-import re
-import mimetypes
-import tempfile
-import subprocess
-import shutil
-
-import pandas as pd
-from docx import Document as DocxDocument
-from pptx import Presentation
-import pypdf
 
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-
-from smolagents import Tool
 from google import genai
 from google.genai import types
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import os
-import mimetypes
-from typing import Dict, Any
+from openai import OpenAI
 from ddgs import DDGS
 
-agent_type = "ToolAgent"
+_GENAI_CLIENT = None
+_OPENAI_CLIENT = None
+_FORMAT_PROVIDER = None
+_FORMAT_MODEL_NAME = None
+logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+# Send logs to stdout so they show up in notebooks/terminals.
+root_logger = logging.getLogger()
+if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    sh.setLevel(logging.INFO)
+    root_logger.addHandler(sh)
+root_logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
 
-
-# use GoogleGenerativeAIEmbeddings from langchain_google_genai
-
-def llm_reformat(response: str, question: str, type: str = "number") -> str:
+def llm_reformat(response: str, question: str) -> str:
     """
-    Use LLM to extract ONLY the number from the response, using the question context to ensure the correct number is chosen.
+    Use LLM to extract the exact answer from the response using the same prompt format as agent.py.
     """
-    if type != "number":
-        return response  # Only process if type is number
+    format_prompt = f"""Extract the exact answer from the response below.
 
-    format_prompt = f"""Given the following question and response, extract ONLY the number that directly answers the question, following GAIA formatting rules.
-
-
-Examples:
-Question: "How many papers were published in total?"
-Response: "The analysis shows 156 papers were published in total."
-Answer: 156
-
-Question: "How many stars are there?"
-Response: "There are approximately 3.14e+8 stars."
-Answer: 3.14e+8
-
-Now, given:
+Now extract the exact answer:
 Question: {question}
 Response: {response}
 
-Extract ONLY the number that answers the question:
-Answer:"""
+Provide your reasoning, then the exact answer."""
 
     try:
-        formatting_response = client.models.generate_content(
-            model="gemini-3-pro-preview",
+        def _extract_final(text: str) -> str:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                return text.strip()
+            last = lines[-1]
+            for prefix in ("Answer:", "Final answer:", "FINAL ANSWER:"):
+                if last.startswith(prefix):
+                    last = last[len(prefix):].strip()
+            return last
+
+        provider = _FORMAT_PROVIDER or "gemini"
+        model_name = _FORMAT_MODEL_NAME or "gemini-3-pro-preview"
+
+        if provider == "openai":
+            global _OPENAI_CLIENT
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                return response
+            if _OPENAI_CLIENT is None:
+                _OPENAI_CLIENT = OpenAI(api_key=api_key)
+
+            completion = _OPENAI_CLIENT.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": format_prompt}],
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            return _extract_final(text) if text else response
+
+        global _GENAI_CLIENT
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            return response
+        if _GENAI_CLIENT is None:
+            _GENAI_CLIENT = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+
+        formatting_response = _GENAI_CLIENT.models.generate_content(
+            model=model_name,
             contents=[format_prompt]
         )
-        answer = formatting_response.text.strip()
-        # Remove any accidental prefix
-        if "Answer:" in answer:
-            answer = answer.split("Answer:")[-1].strip()
-        return answer
+        text = (formatting_response.text or "").strip()
+        return _extract_final(text) if text else response
     except Exception as e:
-        print(f"LLM reformatting failed: {e}")
+        logger.warning("LLM reformatting failed: %s", e)
         return response
     
 class FinalAnswerTool(Tool):
     name = "final_answer"
-    description = "Provides a final answer to the given problem with automatic formatting based on question keywords."
+    description = "Provides a final answer to the given problem with optional formatting."
     inputs = {
         "answer": {
             "type": "any", 
@@ -109,57 +115,16 @@ class FinalAnswerTool(Tool):
         }
     }
     output_type = "any"
-    
-    def __init__(self):
-        super().__init__()
-        self.keywords = {
-            "how many": "number",
-            "how much": "number", 
-            "count": "number",
-            "total": "number",
-            "sum": "number",
-            "average": "number",
-            "median": "number",
-            "percentage": "number",
-            "number" : "string",
-        }
-    
-    def _detect_keyword(self, question: str) -> str:
-        """Detect which keyword pattern matches the question."""
-        question_lower = question.lower().strip()
-        
-        for keyword, format_type in self.keywords.items():
-            if keyword in question_lower:
-                return format_type
-        
-        return "string"  # Default format
-    
-    def _format_answer(self, answer: Any, format_type: str, original_question) -> Any:
-        """Format the answer based on the detected keyword type."""
-        print(f"Detected format type: {format_type} for question: {original_question}")
-        if format_type == "number":
-            # Try to extract/convert to number
-            if isinstance(answer, (int, float)):
-                return answer
-            elif isinstance(answer, str):
-                # Extract first number from string
-                answer2 = llm_reformat(answer, original_question, type="number")
-                return answer2 if answer2 else answer
-        return answer
-    
+
     def forward(self, answer: Any, original_question: str = "") -> Any:
-        """Process the answer with automatic formatting based on question keywords."""
-        
+        """Return the answer, optionally normalized using the LLM."""
         if not original_question:
             return answer
-        
-        # Detect the expected format from the question
-        format_type = self._detect_keyword(original_question)
-        
-        # Format the answer accordingly
-        formatted_answer = self._format_answer(answer, format_type, original_question)
-        
-        return formatted_answer
+        if isinstance(answer, (int, float)):
+            return answer
+        if isinstance(answer, str):
+            return llm_reformat(answer, original_question)
+        return answer
 
 @tool
 def get_youtube_transcript(youtube_url: str) -> str:
@@ -173,21 +138,27 @@ def get_youtube_transcript(youtube_url: str) -> str:
         The transcript text if available, or an error message if not.
     """
     try:
-        from youtube_transcript_api._api import YouTubeTranscriptApi
+        from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
-        import re
-        # Extract video ID from URL
-        match = re.search(r"(?:v=|youtu.be/)([\w-]{11})", youtube_url)
-        if not match:
-            return "Could not extract video ID from the provided URL."
-        video_id = match.group(1)
-        # Fetch transcript
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        # Combine transcript text
-        transcript_text = " ".join([entry['text'] for entry in transcript])
+
+        video_id = None
+        if "youtube" in youtube_url or "youtu.be" in youtube_url:
+            match = re.search(r"(?:v=|youtu.be/)([\w-]{11})", youtube_url)
+            if match:
+                video_id = match.group(1)
+        else:
+            if re.fullmatch(r"[\w-]{11}", youtube_url.strip()):
+                video_id = youtube_url.strip()
+
+        if not video_id:
+            return "Could not extract a valid YouTube video ID."
+
+        ytt_api = YouTubeTranscriptApi()
+        fetched_transcript = ytt_api.fetch(video_id)
+        transcript_text = " ".join([snippet.text for snippet in fetched_transcript])
         return transcript_text
     except ImportError:
-        return "You must install the 'youtube-transcript-api' package to use this tool. Try: pip install youtube-transcript-api."
+        return "Install 'youtube-transcript-api' to use this tool: pip install youtube-transcript-api."
     except TranscriptsDisabled:
         return "Transcripts are disabled for this video."
     except NoTranscriptFound:
@@ -219,12 +190,12 @@ class WebSearchTool(Tool):
                 future = executor.submit(self._perform_search, query)
                 results = future.result(timeout=30)  # 30 second timeout
             except TimeoutError:
-                print("First search attempt timed out after 30 seconds, retrying...")
+                logger.warning("First search attempt timed out after 30 seconds, retrying...")
                 results = []
         
         # Retry if no results or timeout occurred
         if len(results) == 0:
-            print("Retrying search...")
+            logger.info("Retrying search...")
             with ThreadPoolExecutor(max_workers=1) as executor:
                 try:
                     future = executor.submit(self._perform_search, query)
@@ -278,6 +249,8 @@ class UnifiedMultimodalTool(Tool):
     Unified tool for processing audio, video, and image files.
     Supports transcription, analysis, content extraction, captioning, and cross-modal tasks.
     Handles common formats: mp3, wav, m4a, mp4, avi, mov, jpg, png, gif, etc.
+    OpenAI mode uses Responses API for images and the Audio Transcriptions endpoint for audio/video.
+    NOTE: PDFs are NOT supported by this tool (use Docling for PDF processing).
     """
     
     # Required: Define inputs attribute
@@ -306,9 +279,18 @@ class UnifiedMultimodalTool(Tool):
     # Required: Define output type
     output_type = "string"
     
-    def __init__(self, api_key: str):
+    def __init__(self, provider: str, model_name: str, api_key: str):
         super().__init__()
-        self.client = genai.Client(api_key=api_key)
+        self.provider = provider
+        self.model_name = model_name
+        self.transcription_model = self._select_transcription_model()
+
+        if provider == "gemini":
+            self.client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+        elif provider == "openai":
+            self.client = OpenAI(api_key=api_key)
+        else:
+            raise ValueError(f"Unsupported provider for multimodal tool: {provider}")
         # Initialize mimetypes for better detection
         mimetypes.init()
         
@@ -331,18 +313,27 @@ class UnifiedMultimodalTool(Tool):
             if modality == "auto":
                 modality = self._detect_modality(file_path)
             
-            # Check file size for upload method selection
-            file_size = os.path.getsize(file_path)
-            use_files_api = file_size > 20 * 1024 * 1024  # 20MB threshold
+            # Reject PDFs - they should use Docling
+            if modality in ['pdf', 'unsupported']:
+                return f"Error: PDF files are not supported by this tool. Please use Docling for PDF processing."
             
             # Generate appropriate prompt based on task and modality
             prompt = self._generate_prompt(task, modality, additional_context)
-            
-            # Process file
+
+            if self.provider == "openai":
+                if modality == "image":
+                    return self._process_openai_image(file_path, prompt)
+                if modality in {"audio", "video"}:
+                    return self._process_openai_audio(file_path)
+                return f"Unsupported modality for OpenAI: {modality}"
+
+            # Gemini flow
+            file_size = os.path.getsize(file_path)
+            use_files_api = file_size > 20 * 1024 * 1024  # 20MB threshold
+
             if use_files_api:
-                return self._process_with_files_api(file_path, prompt)
-            else:
-                return self._process_inline(file_path, prompt)
+                return self._process_with_files_api(file_path, prompt, modality)
+            return self._process_inline(file_path, prompt, modality)
                 
         except Exception as e:
             return f"Error processing {modality} file: {str(e)}"
@@ -350,7 +341,7 @@ class UnifiedMultimodalTool(Tool):
     def _detect_modality(self, file_path: str) -> str:
         """Auto-detect file modality using mimetypes.guess_type()"""
         # Use mimetypes.guess_type for reliable MIME type detection
-        mime_type, encoding = mimetypes.guess_type(file_path)
+        mime_type, _ = mimetypes.guess_type(file_path)
         
         if mime_type:
             if mime_type.startswith('audio/'):
@@ -359,6 +350,9 @@ class UnifiedMultimodalTool(Tool):
                 return 'video'
             elif mime_type.startswith('image/'):
                 return 'image'
+            elif mime_type == 'application/pdf':
+                # PDFs are not supported - should use Docling
+                return 'unsupported'
         
         # Fallback to extension-based detection if MIME type is unknown
         ext = file_path.lower().split('.')[-1]
@@ -372,6 +366,9 @@ class UnifiedMultimodalTool(Tool):
             return 'video'
         elif ext in image_exts:
             return 'image'
+        elif ext == 'pdf':
+            # PDFs are not supported - should use Docling
+            return 'unsupported'
         else:
             return 'unknown'
     
@@ -390,7 +387,8 @@ class UnifiedMultimodalTool(Tool):
             'webm': 'video/webm',
             'flac': 'audio/flac',
             'ogg': 'audio/ogg',
-            'webp': 'image/webp'
+            'webp': 'image/webp',
+            'pdf': 'application/pdf'
         }
         
         return fallback_mappings.get(ext, 'application/octet-stream')
@@ -402,32 +400,32 @@ class UnifiedMultimodalTool(Tool):
             'analyze': {
                 'audio': 'Analyze this audio file. Describe the content, identify sounds, speech, music, and any notable audio characteristics.',
                 'video': 'Analyze this video comprehensively. Describe visual content, actions, audio elements, and their relationship.',
-                'image': 'Analyze this image in detail. Describe objects, scenes, text, colors, composition, and any notable features.'
+                'image': 'Analyze this image in detail. Describe objects, scenes, text, colors, composition, and any notable features.',
             },
             'transcribe': {
                 'audio': 'Transcribe all speech in this audio file accurately. Include speaker changes if multiple speakers.',
                 'video': 'Transcribe all speech and dialogue in this video. Note visual context when relevant.',
-                'image': 'Extract and transcribe any text visible in this image using OCR.'
+                'image': 'Extract and transcribe any text visible in this image using OCR.',
             },
             'extract': {
                 'audio': 'Extract key information, topics, or specific content from this audio.',
                 'video': 'Extract key visual and audio information from this video.',
-                'image': 'Extract all text, objects, and important visual elements from this image.'
+                'image': 'Extract all text, objects, and important visual elements from this image.',
             },
             'caption': {
                 'audio': 'Generate descriptive captions for this audio content.',
                 'video': 'Generate detailed captions describing both visual and audio elements of this video.',
-                'image': 'Generate a comprehensive caption describing this image.'
+                'image': 'Generate a comprehensive caption describing this image.',
             },
             'summarize': {
                 'audio': 'Provide a concise summary of the main points in this audio.',
                 'video': 'Summarize the key visual and audio content of this video.',
-                'image': 'Summarize the main elements and content of this image.'
+                'image': 'Summarize the main elements and content of this image.',
             },
             'search': {
                 'audio': 'Make this audio content searchable by extracting keywords, topics, and semantic information.',
                 'video': 'Extract searchable content from both visual and audio elements of this video.',
-                'image': 'Extract searchable keywords and descriptions from this image.'
+                'image': 'Extract searchable keywords and descriptions from this image.',
             }
         }
         
@@ -438,39 +436,137 @@ class UnifiedMultimodalTool(Tool):
             
         return prompt
     
-    def _process_with_files_api(self, file_path: str, prompt: str) -> str:
+    def _get_media_resolution(self, modality: str) -> Optional[Dict[str, str]]:
+        """Get recommended media resolution based on modality"""
+        if modality == 'image':
+            return {"level": "media_resolution_high"}
+        elif modality == 'video':
+            return {"level": "media_resolution_low"}
+        # PDFs are not supported by this tool
+        return None
+
+    def _process_with_files_api(self, file_path: str, prompt: str, modality: str) -> str:
         """Process large files using Files API"""
         uploaded_file = self.client.files.upload(file=file_path)
         
+        resolution = self._get_media_resolution(modality)
+        
+        # Create content with media resolution if applicable
+        if resolution:
+            contents = [
+                types.Content(
+                    parts=[
+                        types.Part(text=prompt),
+                        types.Part(
+                            file_data=types.FileData(
+                                file_uri=uploaded_file.uri,
+                                mime_type=uploaded_file.mime_type
+                            ),
+                            media_resolution=resolution
+                        )
+                    ]
+                )
+            ]
+        else:
+            contents = [prompt, uploaded_file]
+
         response = self.client.models.generate_content(
-            model="gemini-3-pro-preview",
-            contents=[prompt, uploaded_file]
+            model=self.model_name,
+            contents=contents
         )
         
         return response.text
     
-    def _process_inline(self, file_path: str, prompt: str) -> str:
+    def _process_inline(self, file_path: str, prompt: str, modality: str) -> str:
         """Process smaller files inline"""
         with open(file_path, "rb") as f:
             file_data = f.read()
         
         mime_type = self._get_mime_type(file_path)
+        resolution = self._get_media_resolution(modality)
         
-        # Correct way to create parts in the new SDK
-        contents = [
-            prompt,  # Text can be passed directly
-            types.Part.from_bytes(
-                data=file_data,
-                mime_type=mime_type
-            )
-        ]
+        # Correct way to create parts in the new SDK with media resolution
+        if resolution:
+            contents = [
+                types.Content(
+                    parts=[
+                        types.Part(text=prompt),
+                        types.Part(
+                            inline_data=types.Blob(
+                                data=file_data,
+                                mime_type=mime_type
+                            ),
+                            media_resolution=resolution
+                        )
+                    ]
+                )
+            ]
+        else:
+            contents = [
+                prompt,
+                types.Part.from_bytes(
+                    data=file_data,
+                    mime_type=mime_type
+                )
+            ]
         
         response = self.client.models.generate_content(
-            model="gemini-3-pro-preview",
+            model=self.model_name,
             contents=contents
         )
-        
+
         return response.text
+
+    def _select_transcription_model(self) -> str:
+        """Choose an OpenAI transcription model with optional diarization support."""
+        env_model = os.environ.get("OPENAI_TRANSCRIBE_MODEL")
+        if env_model:
+            return env_model
+        return "gpt-4o-mini-transcribe"
+
+    def _process_openai_image(self, file_path: str, prompt: str) -> str:
+        """Process image with OpenAI Responses API using file uploads."""
+        with open(file_path, "rb") as f:
+            result = self.client.files.create(
+                file=f,
+                purpose="vision",
+            )
+        image_part = {"type": "input_image", "file_id": result.id}
+
+        response = self.client.responses.create(
+            model=self.model_name,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    image_part,
+                ],
+            }],
+        )
+        return (response.output_text or "").strip()
+
+    def _process_openai_audio(self, file_path: str) -> str:
+        """Process audio/video with OpenAI transcriptions."""
+        ext = os.path.splitext(file_path)[1].lower()
+        allowed_exts = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
+        if ext not in allowed_exts:
+            return "Unsupported file type for OpenAI transcription."
+
+        file_size = os.path.getsize(file_path)
+        if file_size > 25 * 1024 * 1024:
+            return "OpenAI transcription file size limit is 25 MB."
+
+        with open(file_path, "rb") as f:
+            transcription = self.client.audio.transcriptions.create(
+                model=self.transcription_model,
+                file=f,
+            )
+
+        transcript_text = getattr(transcription, "text", None)
+        if not transcript_text:
+            transcript_text = str(transcription)
+
+        return transcript_text.strip()
 
     def get_file_info(self, file_path: str) -> Dict[str, str]:
         """Get detailed file information including MIME type and modality"""
@@ -487,128 +583,158 @@ class UnifiedMultimodalTool(Tool):
             'processing_method': 'Files API' if file_size > 20 * 1024 * 1024 else 'Inline'
         }
 
-class ChromaBM25HybridRetrieverTool(Tool):
+def initialize_llm_model(
+    provider: str = "gemini",
+    model_name: Optional[str] = None,
+    temperature: float = 0.7,
+    **kwargs
+) -> Any:
     """
-    Chroma + BM25 hybrid retriever tool.
-    Uses Chroma for dense vector similarity and BM25 for lexical matching.
+    Initialize LLM model from various providers for smolagents
+
+    Args:
+        provider: "gemini" or "openai"
+        model_name: Specific model name (required)
+        temperature: Sampling temperature
+        **kwargs: Additional model-specific parameters
+
+    Returns:
+        Initialized model instance compatible with smolagents
     """
-    name = "chroma_bm25_hybrid_retriever"
-    description = "Retrieves relevant document sections using Chroma (dense) and BM25 (lexical)."
-    inputs = {
-        "query": {
-            "type": "string",
-            "description": "The search query to find relevant document sections.",
+    # Provider configuration
+    config = {
+        "gemini": {
+            "env_var": "GOOGLE_API_KEY",
+            "api_base": "https://generativelanguage.googleapis.com/v1beta/openai/"
+        },
+        "openai": {
+            "env_var": "OPENAI_API_KEY",
+            "api_base": None  # Uses OpenAI default
         }
     }
-    output_type = "string"
+    
+    if provider not in config:
+        raise ValueError(f"Unknown provider: {provider}. Choose from: {', '.join(config.keys())}")
+    
+    if not model_name:
+        raise ValueError(f"model_name is required for provider '{provider}'")
+    
+    # Get API key
+    api_key = os.environ.get(config[provider]["env_var"])
+    if not api_key:
+        raise ValueError(f"{config[provider]['env_var']} not found in environment")
+    
+    # Prepare kwargs
+    model_kwargs = dict(kwargs)
+    api_base = model_kwargs.pop("api_base", config[provider]["api_base"])
+    top_p = model_kwargs.pop("top_p", 1.0)
+    
+    # Setup client kwargs
+    client_kwargs = model_kwargs.pop("client_kwargs", {}) or {}
+    client_kwargs.setdefault("timeout", 60)
+    client_kwargs.setdefault("max_retries", 2)
+    
+    # Gemini: let the API default tool behavior unless explicitly set
+    
+    # Build arguments
+    init_args = {
+        "model_id": model_name,
+        "api_key": api_key,
+        "client_kwargs": client_kwargs,
+        "temperature": temperature,
+        **model_kwargs
+    }
+    
+    # Add api_base if specified
+    if api_base:
+        init_args["api_base"] = api_base
+        
+    model = OpenAIServerModel(**init_args)
+    global _FORMAT_PROVIDER, _FORMAT_MODEL_NAME
+    _FORMAT_PROVIDER = provider
+    _FORMAT_MODEL_NAME = model_name
+    return model
 
-    def __init__(self, chroma: Chroma = None, bm25 = None, top_k: int = 5, alpha: float = 0.5, **kwargs):
-        """alpha: weight for dense (Chroma) scores. Final score = alpha * dense + (1-alpha) * lexical"""
-        super().__init__(**kwargs)
-        self.chroma = chroma
-        self.bm25 = bm25
-        self.top_k = top_k
-        self.alpha = float(alpha)
-        # Build an EnsembleRetriever from the provided retrievers. Assume both retrievers are available.
-        chroma_retriever = None
-        bm25_retriever = None
-        if self.chroma:
-            try:
-                # Chroma provides an as_retriever helper
-                chroma_retriever = self.chroma.as_retriever(search_kwargs={"k": self.top_k})
-            except Exception:
-                # fallback to using similarity methods via a small adapter (not needed per user instruction)
-                chroma_retriever = None
-
-        if self.bm25:
-            bm25_retriever = self.bm25
-
-        # Create EnsembleRetriever with weights: dense (chroma) weight = alpha, lexical (bm25) weight = 1-alpha
-        retrievers = [r for r in (chroma_retriever, bm25_retriever) if r is not None]
-        weights = []
-        if chroma_retriever is not None:
-            weights.append(self.alpha)
-        if bm25_retriever is not None:
-            weights.append(1.0 - self.alpha)
-
-        # Construct the ensemble retriever
-        self.ensemble = EnsembleRetriever(retrievers=retrievers, weights=weights) if retrievers else None
-
-    def _doc_uid(self, d: Document):
-        if d.metadata and isinstance(d.metadata, dict):
-            return (d.metadata.get('source'), d.page_content[:200])
-        return ('', d.page_content[:200])
-
-    def forward(self, query: str) -> str:
-        if not self.ensemble:
-            return "No documents loaded for retrieval."
-
-        assert isinstance(query, str), "Your search query must be a string"
-
-        # Use EnsembleRetriever to get relevant documents. Slice to top_k to keep behaviour consistent.
-        docs = self.ensemble.get_relevant_documents(query)
-        if not docs:
-            return "No relevant documents found."
-
-        results = docs[: self.top_k]
-
-        return "\nRetrieved documents:\n" + "".join([
-            f"\n\n===== Document {str(i)} =====\n" + doc.page_content
-            for i, doc in enumerate(results)
-        ])
 
 class GAIAAgent:
     """
     GAIA agent using smolagents with Gemini 2.0 Flash and Langfuse observability
     """
 
-    def __init__(self, user_id: str = None, session_id: str = None):
-        """Initialize the agent with Gemini 2.0 Flash, tools, and Langfuse observability"""
+    def __init__(
+        self,
+        user_id: str = None,
+        session_id: str = None,
+        provider: str = "gemini",
+        model_name: Optional[str] = None,
+        mcp_servers: Optional[List[str]] = None
+    ):
+        """
+        Initialize the agent with configurable LLM provider and MCP tools
 
-        # Get API keys
-        gemini_api_key = os.environ.get("GOOGLE_API_KEY")
-        if not gemini_api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable not found")
+        Args:
+            user_id: User identifier for tracking
+            session_id: Session identifier for tracking
+            provider: LLM provider ("gemini", "openai")
+            model_name: Specific model name (uses defaults if None)
+            mcp_servers: List of MCP server names to load
+        """
 
         # Initialize Langfuse observability
         self._setup_langfuse_observability()
 
-        # Initialize Gemini 2.5 model
-        self.model = OpenAIServerModel(
-            model_id="gemini-3-pro-preview",
-            api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
-            api_key=gemini_api_key,
-            temperature=0.0, 
-            top_p=1.0,
-        )
+        # Initialize LLM model
+        self.model = initialize_llm_model(provider=provider, model_name=model_name, temperature=0.0)
 
         # Store user and session IDs for tracking
         self.user_id = user_id or "gaia-user"
         self.session_id = session_id or "gaia-session"
 
+        # Initialize multimodal tool (optional)
+        google_api_key = os.environ.get("GOOGLE_API_KEY")
+        if provider == "gemini":
+            api_key = os.environ.get("GOOGLE_API_KEY")
+        else:
+            api_key = os.environ.get("OPENAI_API_KEY")
 
-        # Add a hard coded list of key words in the question and expected format of the answer
-        # This is used to help the agent understand the question and expected answer format
+        if api_key:
+            self.multimodal_tool = UnifiedMultimodalTool(
+                provider=provider,
+                model_name=model_name or self.model.model_id,
+                api_key=api_key
+            )
+        else:
+            self.multimodal_tool = None
+            logger.warning("Multimodal tool disabled; missing API key for provider %s.", provider)
 
-        # GAIA system prompt from the leaderboard
-        self.system_prompt = f"""You are a general AI assistant. I will ask you a question. Report your thoughts. 
+        # GAIA system prompt
+        self.system_prompt = """You are a general AI assistant. I will ask you a question. Report your thoughts. 
                 IMPORTANT:
-                - In the last step of your reasoning, if you think your reasoning is not able to answer the question, answer the question directy with your internal reasoning, without using the BM25 retriever tool or the visit_webpage tool.
+                - In the last step of your reasoning, if you think your reasoning is not able to answer the question, answer the question directly with your internal reasoning, without using the visit_webpage tool.
                 - Finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.
                 """
 
-    # Initialize retriever tool (will be updated when documents are loaded)
-        self.retriever_tool = ChromaBM25HybridRetrieverTool()
+        # Load MCP tools if specified
+        self.mcp_tools = []
+        if mcp_servers:
+            from mcp_connectors import load_multiple_mcp_servers
+            mcp_collections = load_multiple_mcp_servers(mcp_servers, trust_remote_code=True)
+            for collection in mcp_collections:
+                self.mcp_tools.extend(collection.tools)
+            logger.info("Loaded %s MCP tools from %s servers", len(self.mcp_tools), len(mcp_collections))
 
         # Create the agent
         self.agent = None
         self._create_agent()
 
         # Initialize Langfuse client
-        self.langfuse = Langfuse()
-
-        from langfuse import get_client
-        self.langfuse = get_client()  # ✅ Use get_client() for v3
+        self.langfuse = None
+        self.last_trace_id = None
+        try:
+            from langfuse import Langfuse
+            self.langfuse = Langfuse()
+        except Exception as e:
+            logger.warning("Langfuse client unavailable: %s", e)
 
     def _setup_langfuse_observability(self):
         """Set up Langfuse observability with OpenTelemetry"""
@@ -617,7 +743,7 @@ class GAIAAgent:
         langfuse_secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
         
         if not langfuse_public_key or not langfuse_secret_key:
-            print("Warning: LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY not found. Observability will be limited.")
+            logger.warning("LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY not found. Observability will be limited.")
             return
 
         # Set up Langfuse environment variables
@@ -645,196 +771,99 @@ class GAIAAgent:
 
     def _create_agent(self):
         """Create the CodeAgent with tools"""
-        if agent_type == "ToolAgent":
-            # Create a ToolCallingAgent if using tool calling
+        base_tools = [
+            WebSearchTool(),
+            visit_webpage,
+            FinalAnswerTool()
+        ]
 
-            coder_agent = CodeAgent(
-                name = "coder_agent",
-                tools=[
-                    PythonInterpreterTool(),
-                    FinalAnswerTool()],
-                model=self.model,
-                description="You are a highly skilled coding specialist agent. Your mission is to solve programming, mathematical, and analytical problems end-to-end.",
-                max_steps=5,
-                additional_authorized_imports=[
-                    "math",             # basic calculations
-                    "statistics",       # common numeric helpers
-                    "itertools",        # safe functional helpers
-                    "datetime",         # date handling
-                    "random",           # simple randomness (no os access)
-                    "re",               # regular expressions
-                    "json",             # serialisation / parsing
-                ]
-            )
-            retriever_agent = ToolCallingAgent(
-                name = "retriever_agent",
-                tools=[self.retriever_tool],
-                model=self.model,
-                description="You are a specialized document retrieval agent. Your mission is to retrieve relevant parts of documents based on user queries.",
-                max_steps=5
-            )
-            self.agent = ToolCallingAgent(
-                tools=[
-                    WebSearchTool(),
-                    visit_webpage,  # Custom tool for visiting webpages
-                    FinalAnswerTool(),
-                    get_youtube_transcript, 
-                    UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
-                model=self.model,
-                description=self.system_prompt,
-                max_steps=6, 
-                managed_agents = [coder_agent, retriever_agent])
-        else : 
-            self.agent = CodeAgent(
-                tools= [
-                    WebSearchTool(),
-                    visit_webpage,  # Custom tool for visiting webpages
-                    self.retriever_tool,
-                    get_youtube_transcript,
-                    PythonInterpreterTool(),
-                    FinalAnswerTool(), 
-                    UnifiedMultimodalTool(api_key=os.environ.get("GOOGLE_API_KEY"))],
-                model=self.model,
-                description=self.system_prompt, 
-                max_steps=5, 
-                additional_authorized_imports = [
-        "math",             # basic calculations
-        "statistics",       # common numeric helpers
-        "itertools",        # safe functional helpers
-        "datetime",         # date handling
-        "random",           # simple randomness (no os access)
-        "re",               # regular expressions
-        "json",             # serialisation / parsing
-    ]       )
+        if self.multimodal_tool is not None:
+            base_tools.append(self.multimodal_tool)
 
+        all_tools = base_tools + self.mcp_tools
 
-    def load_documents_from_file(self, file_path: str):
-        """Load and process text documents for BM25+Chroma retrieval, or return raw content for media files.
+        self.agent = CodeAgent(
+            tools=all_tools,
+            model=self.model,
+            additional_authorized_imports=[
+                "math", "statistics", "itertools", "datetime",
+                "random", "re", "json", "csv", "os", "sys",
+                "collections", "functools", "pathlib",
+                "numpy", "pandas", "matplotlib", "seaborn",
+                "scipy", "sklearn", "requests", "bs4",
+                "PIL", "yaml", "tqdm"
+            ],
+            max_steps=6
+        )
 
-        Handles common office formats (xlsx, xls, csv, docx, doc, pptx, ppt, pdf) and falls back to LibreOffice
-        conversion for legacy binaries. Extracted text is chunked, embedded with Google embeddings, stored in
-        Chroma (if available) and a BM25 retriever is created for lexical matches. The hybrid retriever is
-        attached to the agent (`ChromaBM25HybridRetrieverTool`) and the agent is recreated so tools are updated.
-        """
+    def _log_run_trace(self, prompt: str, response: str) -> Optional[str]:
+        """Log input/output to Langfuse and return trace_id if available."""
+        if not self.langfuse:
+            return None
+
+        metadata = {
+            "provider": getattr(self.model, "provider", None),
+            "model_id": getattr(self.model, "model_id", None),
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+        }
+
         try:
-            # Lazy optional imports
-
-            mime_type, _ = mimetypes.guess_type(file_path)
-            if mime_type is None:
-                mime_type = ""
-            print(f"Detected MIME type: {mime_type} for file {file_path}")
-
-            # Binary media -> return bytes
-            if mime_type.startswith("image") or mime_type.startswith("video") or mime_type.startswith("audio"):
-                with open(file_path, "rb") as f:
-                    return f.read()
-
-            ext = os.path.splitext(file_path)[1].lower()
-            text = None
-
-            # Spreadsheets
-            if ext in {".csv", ".xls", ".xlsx"}:
-                if pd is None:
-                    raise RuntimeError("pandas is required to parse spreadsheets. Install with `pip install pandas openpyxl xlrd`.")
-                if ext == ".csv":
-                    df = pd.read_csv(file_path)
-                    text = df.to_csv(index=False)
-                else:
-                    sheets = pd.read_excel(file_path, sheet_name=None)
-                    parts = []
-                    for sheet_name, df in sheets.items():
-                        parts.append(f"--- Sheet: {sheet_name} ---")
-                        parts.append(df.to_csv(index=False))
-                    text = "\n".join(parts)
-                    print(text)
-
-            # Word documents
-            elif ext in {".docx"}:
-                doc = DocxDocument(file_path)
-                paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-                text = "\n\n".join(paragraphs)
-
-            # PowerPoint
-            elif ext in {".pptx"}:
-                pres = Presentation(file_path)
-                slides_text = []
-                for i, slide in enumerate(pres.slides):
-                    slide_text_parts = []
-                    for shape in slide.shapes:
-                        if hasattr(shape, "text") and shape.text:
-                            slide_text_parts.append(shape.text)
-                    slides_text.append(f"--- Slide {i+1} ---\n" + "\n".join(slide_text_parts))
-                text = "\n\n".join(slides_text)
-
-            # Legacy Office binary (.doc, .ppt) or when above parsers unavailable: convert to PDF using LibreOffice
-            elif ext in {".doc", ".ppt"}:
-                soffice = shutil.which("soffice") or shutil.which("libreoffice")
-                if not soffice:
-                    raise RuntimeError("LibreOffice (`soffice`) is required to convert legacy Office files. Install LibreOffice or convert to PDF manually.")
-                outdir = tempfile.mkdtemp()
-                subprocess.run([soffice, "--headless", "--convert-to", "pdf", file_path, "--outdir", outdir],
-                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                base = os.path.basename(file_path)
-                pdfname = os.path.splitext(base)[0] + ".pdf"
-                candidate = os.path.join(outdir, pdfname)
-                if not os.path.exists(candidate):
-                    raise RuntimeError("LibreOffice conversion produced no PDF. Check the input file and LibreOffice installation.")
-                if pypdf is None:
-                    raise RuntimeError("pypdf is required to extract text from converted PDF. Install with `pip install pypdf`.")
-                reader = pypdf.PdfReader(candidate)
-                pages = [p.extract_text() or "" for p in reader.pages]
-                text = "\n".join(pages)
-
-            # PDF
-            elif ext == ".pdf":
-                reader = pypdf.PdfReader(file_path)
-                pages = [p.extract_text() or "" for p in reader.pages]
-                text = "\n".join(pages)
-
-            # Plain text fallback
-            else:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-
-            if text is None:
-                raise RuntimeError("No text could be extracted from the provided file.")
-
-            # Chunking: semantic-first strategy
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                separators=["\n\n", "\n", ".", " ", ""]
+            trace = self.langfuse.trace(
+                name="chat",
+                input=prompt,
+                output=response,
+                metadata=metadata,
             )
-            chunks = text_splitter.split_text(text)
-            docs = [Document(page_content=chunk, metadata={"source": file_path}) for chunk in chunks]
-
-            # Embeddings (GoogleGenerativeAIEmbeddings)
-            embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
-
-            # Create Chroma vectorstore from documents
-            try:
-                chroma = Chroma.from_documents(documents=docs, embedding=embeddings)
-            except Exception as e:
-                print(f"Failed to create Chroma vectorstore: {e}")
-                chroma = None
-
-            # Create BM25 retriever
-            try:
-                bm25 = BM25Retriever(documents=docs)
-            except Exception as e:
-                print(f"Failed to create BM25 retriever: {e}")
-                bm25 = None
-
-            # Attach the hybrid retriever tool and recreate agent so tools list is updated
-            self.retriever_tool = ChromaBM25HybridRetrieverTool(chroma=chroma, bm25=bm25, top_k=5, alpha=0.5)
-            self._create_agent()
-
-            print(f"Loaded {len(docs)} document chunks from {file_path} into local Chroma store and BM25 retriever")
-            return True
-
+            self.langfuse.flush()
+            return trace.id
         except Exception as e:
-            print(f"Error loading documents from {file_path}: {e}")
-            return False
+            logger.exception("Langfuse trace creation failed: %s", e)
+            return None
+
+
+    def _gaia_file_to_context(self, file_path: str) -> str:
+        """Convert a GAIA task file into prompt context."""
+        if not file_path:
+            return ""
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        mime_type = mime_type or ""
+        ext = os.path.splitext(file_path)[1].lower()
+        filename = os.path.basename(file_path)
+
+        if mime_type.startswith("image") or ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}:
+            return (
+                f"Attached media file: {file_path} (image).\n"
+                "Use the multimodal_processor tool on this file_path before answering."
+            )
+
+        if mime_type.startswith("video") or ext in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+            return (
+                f"Attached media file: {file_path} (video).\n"
+                "Use the multimodal_processor tool on this file_path before answering."
+            )
+
+        if mime_type.startswith("audio") or ext in {".mp3", ".wav", ".m4a"}:
+            return (
+                f"Attached media file: {file_path} (audio).\n"
+                "Use the multimodal_processor tool on this file_path before answering."
+            )
+
+        try:
+            from llama_index.readers.docling import DoclingReader
+
+            docling_reader = DoclingReader(
+                export_type=DoclingReader.ExportType.MARKDOWN
+            )
+            documents = docling_reader.load_data(file_path)
+            content = "\n\n".join([doc.text for doc in documents if doc.text])
+            if content:
+                return f"Document context from {filename}:\n{content}"
+        except Exception as e:
+            logger.exception("DoclingReader failed for %s: %s", filename, e)
+
+        return ""
 
 
     def download_gaia_file(self, task_id: str, api_url: str = "https://agents-course-unit4-scoring.hf.space") -> str:
@@ -844,7 +873,7 @@ class GAIAAgent:
             response.raise_for_status()
 
             # Try to get filename from headers
-            print(f"Response headers: {response.headers}")
+            logger.debug("Response headers: %s", response.headers)
             content_disp = response.headers.get("content-disposition", "")
             match = re.search(r'filename="(.+)"', content_disp)
             if match:
@@ -857,120 +886,83 @@ class GAIAAgent:
             with open(filename, 'wb') as f:
                 f.write(response.content)
 
-            print(f"Downloaded file saved as {filename}")
+            logger.info("Downloaded file saved as %s", filename)
             return os.path.abspath(filename)  # Or just return `filename` for relative path
 
         except Exception as e:
-            print(f"Failed to download file for task {task_id}: {e}")
+            logger.exception("Failed to download file for task %s: %s", task_id, e)
             return None
 
-    def solve_gaia_question(self, question_data: Dict[str, Any], tags: List[str] = None) -> str:
+    def run(self, query: str, max_steps: Optional[int] = None, reset_documents: bool = False) -> tuple[str, Optional[str]]:
         """
-        Solve a GAIA question with full Langfuse observability
+        Run the agent on a general query (main method for chat interface).
+
+        Args:
+            query: User's question or instruction
+            max_steps: Maximum reasoning steps (overrides agent default)
+            reset_documents: Reserved for compatibility (no-op)
+
+        Returns:
+            Tuple of (response_text, trace_id)
         """
-        question = question_data.get("Question", "")
-        task_id = question_data.get("task_id", "")
-        
-        # Prepare tags for observability
-        trace_tags = ["gaia-agent", "question-solving"]
-        if tags:
-            trace_tags.extend(tags)
-        if task_id:
-            trace_tags.append(f"task-{task_id}")
-
-        # Use SDK v3 context manager approach
-        with self.langfuse.start_as_current_span(
-            name="GAIA-Question-Solving",
-            input={"question": question, "task_id": task_id},
-            metadata={
-                "model": self.model.model_id,
-                "question_length": len(question),
-                "has_file": bool(task_id)
-            }
-        ) as span:
-            try:
-                # Set trace attributes using v3 syntax
-                span.update_trace(
-                    user_id=self.user_id,
-                    session_id=self.session_id,
-                    tags=trace_tags
-                )
-
-                # Download and load file if task_id provided
-                file_loaded = False
-                if task_id:
-                    file_path = self.download_gaia_file(task_id)
-                    if file_path:
-                        file_loaded = self.load_documents_from_file(file_path)
-                        print(f"Loaded file for task {task_id}")
-
-                # Prepare the prompt
-                prompt = f"""
-    Question: {question}
-    {f'Task ID: {task_id}' if task_id else ''}
-    {f'File loaded: Yes as {file_path}' if file_loaded else 'File loaded: No'}
-
-                """
-
-                print("=== AGENT REASONING ===")
-                result = self.agent.run(prompt)
-                print("=== END REASONING ===")
-
-                # Update span with result using v3 syntax
-                span.update(output={"answer": str(result)})
-
-                return str(result)
-
-            except Exception as e:
-                error_msg = f"Error processing question: {str(e)}"
-                print(error_msg)
-                
-                # Log error using v3 syntax
-                span.update(
-                    output={"error": error_msg},
-                    level="ERROR"
-                )
-                
-                return error_msg
-
-
-    def evaluate_answer(self, question: str, answer: str, expected_answer: str = None) -> Dict[str, Any]:
-        """
-        Evaluate the agent's answer using LLM-as-a-Judge and optionally compare with expected answer
-        """
-        evaluation_prompt = f"""
-Please evaluate the following answer to a question on a scale of 1-5:
-
-Question: {question}
-Answer: {answer}
-{f'Expected Answer: {expected_answer}' if expected_answer else ''}
-
-Rate the answer on:
-1. Accuracy (1-5)
-2. Completeness (1-5) 
-3. Clarity (1-5)
-
-Provide your rating as JSON: {{"accuracy": X, "completeness": Y, "clarity": Z, "overall": W, "reasoning": "explanation"}}
-        """
-
         try:
-            # Use the same model to evaluate
-            evaluation_result = self.agent.run(evaluation_prompt)
-            
-            # Try to parse JSON response
-            import json
-            scores = json.loads(evaluation_result)
-            return scores
-        except json.JSONDecodeError:
-            # If JSON parsing fails, return a default structure
-            print("Failed to parse evaluation result as JSON. Returning default scores.")
-            return {
-                "accuracy": 0,
-                "completeness": 0,
-                "clarity": 0,
-                "overall": 0,
-                "reasoning": "Could not parse evaluation result"
-            }
+            full_query = query
+
+            if max_steps:
+                original_max_steps = self.agent.max_steps
+                self.agent.max_steps = max_steps
+
+            response = self.agent.run(full_query)
+
+            if max_steps:
+                self.agent.max_steps = original_max_steps
+
+            response_text = str(response)
+            trace_id = self._log_run_trace(full_query, response_text)
+            self.last_trace_id = trace_id
+            return response_text, trace_id
+
+        except Exception as e:
+            error_msg = f"Error during agent execution: {e}"
+            logger.exception("Error during agent execution: %s", e)
+            import traceback
+            traceback.print_exc()
+            self.last_trace_id = None
+            return error_msg, None
+
+    def _extract_final_answer(self, response: str) -> str:
+        """Extract final answer from agent response for GAIA format"""
+        if "FINAL ANSWER:" in response:
+            return response.split("FINAL ANSWER:")[-1].strip()
+
+        lines = [line.strip() for line in response.split("\n") if line.strip()]
+        return lines[-1] if lines else response
+
+    def solve_gaia_question(self, question_dict: Dict[str, Any]) -> str:
+        """
+        Solve a GAIA benchmark question (legacy method for evaluation).
+        Now wraps the general run() method.
+
+        Args:
+            question_dict: Dictionary with "Question" key and optional "task_id"
+
+        Returns:
+            Formatted answer for GAIA benchmark
+        """
+        question_text = question_dict.get("Question", "")
+        task_id = question_dict.get("task_id")
+
+        if task_id:
+            file_path = self.download_gaia_file(task_id)
+            if file_path:
+                context = self._gaia_file_to_context(file_path)
+                if context:
+                    question_text = f"{context}\n\nQuestion: {question_text}"
+
+        response, _ = self.run(question_text)
+        final_answer = self._extract_final_answer(response)
+
+        return final_answer
 
 
     def add_user_feedback(self, trace_id: str, feedback_score: int, comment: str = None):
@@ -990,31 +982,6 @@ Provide your rating as JSON: {{"accuracy": X, "completeness": Y, "clarity": Z, "
                 comment=comment
             )
             self.langfuse.flush()
-            print(f"User feedback added: {feedback_score}/5")
+            logger.info("User feedback added: %s/5", feedback_score)
         except Exception as e:
-            print(f"Error adding user feedback: {e}")
-
-
-# Example usage with observability
-if __name__ == "__main__":
-    # Set up environment variables (you need to set these)
-    # os.environ["GOOGLE_API_KEY"] = "your-gemini-api-key"
-    # os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-..."
-    # os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-..."
-    
-    # Test the agent with observability
-    agent = GAIAAgent(
-        user_id="test-user-123",
-        session_id="test-session-456"
-    )
-
-    #Example question
-    question_data = {
-        "Question": "The attached Excel file contains the sales of menu items for a local fast-food chain. What were the total sales that the chain made from food (not including drinks)? Express your answer in USD with two decimal places.",
-        "task_id": "7bd855d8-463d-4ed5-93ca-5fe35145f733"
-    }
-
-    file = agent.download_gaia_file(question_data["task_id"], api_url="https://agents-course-unit4-scoring.hf.space"
-                                    )
-    answer = agent.solve_gaia_question(question_data)
-    print(f"Answer: {answer}")
+            logger.exception("Error adding user feedback: %s", e)

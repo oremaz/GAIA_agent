@@ -1,8 +1,4 @@
-"""
-ChromaDB Vector Store Management for LlamaIndex
-Handles conversation-specific stores and shared cached sources with Jina embeddings
-ONLY used for LlamaIndex + Local mode
-"""
+"""ChromaDB vector store management for LlamaIndex local mode."""
 
 import hashlib
 import json
@@ -24,10 +20,9 @@ logger = logging.getLogger(__name__)
 
 
 class VectorStoreManager:
-    """
-    Manages conversation-specific ChromaDB vector stores and shared cached sources
-    ONLY used for LlamaIndex + Local mode
-    Always uses Jina embeddings
+    """Manage conversation-specific stores and shared cached sources.
+
+    This is only used for LlamaIndex local mode and always uses Jina embeddings.
     """
 
     def __init__(
@@ -35,12 +30,11 @@ class VectorStoreManager:
         conversations_dir: str = "./chroma_db/conversations",
         library_dir: str = "./chroma_db/library"
     ):
-        """
-        Initialize vector store manager with Jina embeddings
+        """Initialize the vector store manager.
 
         Args:
-            conversations_dir: Directory for conversation-specific stores
-            library_dir: Directory for shared cached sources
+            conversations_dir: Directory for conversation-specific stores.
+            library_dir: Directory for shared cached sources.
         """
         self.conversations_dir = Path(conversations_dir)
         self.library_dir = Path(library_dir)
@@ -86,7 +80,14 @@ class VectorStoreManager:
         logger.info("VectorStoreManager initialized with Jina embeddings")
 
     def _create_chroma_client(self, path: Path):
-        """Create ChromaDB client with proper settings"""
+        """Create a ChromaDB client with fallback settings.
+
+        Args:
+            path: Directory for persistent storage.
+
+        Returns:
+            ChromaDB client instance.
+        """
         try:
             return chromadb.PersistentClient(path=str(path))
         except Exception:
@@ -102,7 +103,11 @@ class VectorStoreManager:
                 return chromadb.Client()
 
     def _load_library_index(self) -> Dict[str, Any]:
-        """Load the library index from disk."""
+        """Load the library index from disk.
+
+        Returns:
+            Library index dictionary.
+        """
         if not self.library_index_path.exists():
             return {"sources": {}, "by_key": {"file": {}, "url": {}}}
 
@@ -127,7 +132,15 @@ class VectorStoreManager:
             logger.error("Failed to save library index: %s", exc)
 
     def get_library_source_id(self, source_type: str, source_key: str) -> Optional[str]:
-        """Lookup a library source id by type and key."""
+        """Look up a library source id by type and key.
+
+        Args:
+            source_type: Source type ("file" or "url").
+            source_key: Unique source key.
+
+        Returns:
+            Source id if found, otherwise None.
+        """
         return self.library_index.get("by_key", {}).get(source_type, {}).get(source_key)
 
     def register_library_source(
@@ -138,7 +151,18 @@ class VectorStoreManager:
         documents: List[Document],
         source_meta: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, bool]:
-        """Register a source in the shared library."""
+        """Register a source in the shared library.
+
+        Args:
+            source_type: Source type ("file" or "url").
+            source_key: Unique source key.
+            label: Human-readable label.
+            documents: Documents to cache.
+            source_meta: Optional metadata to include.
+
+        Returns:
+            Tuple of (source_id, created).
+        """
         existing_id = self.get_library_source_id(source_type, source_key)
         if existing_id:
             return existing_id, False
@@ -192,12 +216,23 @@ class VectorStoreManager:
         return source_id, True
 
     def list_library_sources(self) -> List[Dict[str, Any]]:
-        """Return all known sources in the library."""
+        """Return all known sources in the library.
+
+        Returns:
+            Sorted list of library source entries.
+        """
         sources = list(self.library_index.get("sources", {}).values())
         return sorted(sources, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def load_library_documents(self, source_id: str) -> List[Document]:
-        """Load cached documents for a library source."""
+        """Load cached documents for a library source.
+
+        Args:
+            source_id: Library source id.
+
+        Returns:
+            List of Documents for the source.
+        """
         source_path = self.library_dir / f"{source_id}.json"
         if not source_path.exists():
             logger.warning("Library source not found: %s", source_id)
@@ -223,7 +258,14 @@ class VectorStoreManager:
         return documents
 
     def get_or_create_conversation_store(self, session_id: str) -> ChromaVectorStore:
-        """Get or create a conversation-specific vector store"""
+        """Get or create a conversation-specific vector store.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            ChromaVectorStore for the session.
+        """
 
         if session_id in self.conversation_stores:
             return self.conversation_stores[session_id]
@@ -250,16 +292,15 @@ class VectorStoreManager:
         session_id: str,
         index: Optional[VectorStoreIndex] = None
     ) -> VectorStoreIndex:
-        """
-        Add documents to conversation-specific vector store
+        """Add documents to a conversation-specific vector store.
 
         Args:
-            documents: List of documents to add
-            session_id: Session identifier
-            index: Existing conversation index (optional)
+            documents: Documents to add.
+            session_id: Session identifier.
+            index: Existing conversation index (optional).
 
         Returns:
-            Updated or new conversation VectorStoreIndex
+            Updated or new VectorStoreIndex.
         """
         if not documents:
             return index
@@ -291,14 +332,27 @@ class VectorStoreManager:
         session_id: str,
         index: Optional[VectorStoreIndex] = None
     ) -> VectorStoreIndex:
-        """Add a cached library source to a conversation store."""
+        """Add a cached library source to a conversation store.
+
+        Args:
+            source_id: Library source id.
+            session_id: Session identifier.
+            index: Existing conversation index (optional).
+
+        Returns:
+            Updated or new VectorStoreIndex.
+        """
         documents = self.load_library_documents(source_id)
         if not documents:
             return index
         return self.add_documents_to_conversation(documents, session_id, index)
 
     def delete_conversation_store(self, session_id: str):
-        """Delete a conversation-specific vector store"""
+        """Delete a conversation-specific vector store.
+
+        Args:
+            session_id: Session identifier.
+        """
 
         conv_dir = self.conversations_dir / session_id
 
@@ -316,7 +370,11 @@ class VectorStoreManager:
             del self.conversation_clients[session_id]
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get statistics about vector stores"""
+        """Get statistics about vector stores.
+
+        Returns:
+            Dictionary of store statistics.
+        """
         # Count conversation-specific documents
         conversation_count = 0
         for conv_id, conv_store in self.conversation_stores.items():
@@ -334,7 +392,14 @@ class VectorStoreManager:
         }
 
     def get_conversation_document_count(self, session_id: str) -> int:
-        """Get document count for a specific conversation."""
+        """Get document count for a specific conversation.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            Document count for the conversation.
+        """
         if session_id not in self.conversation_stores:
             return 0
         try:

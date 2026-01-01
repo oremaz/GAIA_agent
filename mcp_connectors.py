@@ -1,7 +1,4 @@
-"""
-Model Context Protocol (MCP) Server Connectors for smolagents
-Provides pre-configured MCP servers for common tools
-"""
+"""Model Context Protocol (MCP) server connectors for smolagents."""
 
 import os
 from typing import List, Optional
@@ -55,21 +52,34 @@ MCP_SERVERS = {
 
 
 def get_available_mcp_servers() -> List[str]:
-    """Get list of available MCP server names"""
+    """Return available MCP server names.
+
+    Returns:
+        List[str]: MCP server identifiers defined in this module.
+    """
     return list(MCP_SERVERS.keys())
 
 
 def get_mcp_server_info(server_name: str) -> Optional[dict]:
-    """Get information about a specific MCP server"""
+    """Return configuration for a specific MCP server.
+
+    Args:
+        server_name: MCP server identifier.
+
+    Returns:
+        The server configuration dictionary if found, otherwise None.
+    """
     return MCP_SERVERS.get(server_name)
 
 
 def check_mcp_server_requirements(server_name: str) -> tuple[bool, List[str]]:
-    """
-    Check if required environment variables are set for a server
+    """Check that required environment variables are set for a server.
+
+    Args:
+        server_name: MCP server identifier.
 
     Returns:
-        Tuple of (all_requirements_met, list_of_missing_vars)
+        Tuple of (all_requirements_met, list_of_missing_vars).
     """
     server_config = MCP_SERVERS.get(server_name)
     if not server_config:
@@ -86,16 +96,19 @@ def load_mcp_server(
     trust_remote_code: bool = True,
     structured_output: bool = False
 ) -> Optional[ToolCollection]:
-    """
-    Load an MCP server as a ToolCollection
+    """Load an MCP server as a ToolCollection.
 
     Args:
-        server_name: Name of the MCP server to load
-        trust_remote_code: Whether to trust remote code execution
-        structured_output: Enable structured output features
+        server_name: MCP server identifier.
+        trust_remote_code: Whether to trust remote code execution.
+        structured_output: Whether to enable structured output features.
 
     Returns:
-        ToolCollection if successful, None otherwise
+        ToolCollection if successful, otherwise None.
+
+    Raises:
+        ValueError: If the server is unknown or missing required env vars.
+        RuntimeError: If the server fails to start or load.
     """
     server_config = MCP_SERVERS.get(server_name)
     if not server_config:
@@ -134,16 +147,15 @@ def load_multiple_mcp_servers(
     trust_remote_code: bool = True,
     structured_output: bool = False
 ) -> List[ToolCollection]:
-    """
-    Load multiple MCP servers at once
+    """Load multiple MCP servers.
 
     Args:
-        server_names: List of server names to load
-        trust_remote_code: Whether to trust remote code execution
-        structured_output: Enable structured output features
+        server_names: MCP server identifiers to load.
+        trust_remote_code: Whether to trust remote code execution.
+        structured_output: Whether to enable structured output features.
 
     Returns:
-        List of ToolCollections (skips servers that fail to load)
+        List of ToolCollections for servers that load successfully.
     """
     tool_collections = []
 

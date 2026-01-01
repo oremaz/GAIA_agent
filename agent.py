@@ -61,14 +61,23 @@ def initialize_models(
     api_model_name: Optional[str] = None,
     session_id: Optional[str] = None,
 ):
-    """Initialize LLM, Code LLM, and Embed models.
+    """Initialize models for API or local mode.
 
     Args:
-        use_api_mode: when True use API-backed models (Gemini/OpenAI)
-        model_suite: "qwen" or "ministral" for local mode; provider name for API mode
-        local_model_id: Optional override for local model selection
-        api_model_name: Model name for API mode (e.g., "gemini-3-flash-preview", "gpt-4o")
-        session_id: Optional session id for per-session API state
+        use_api_mode: When True, use API-backed models (Gemini/OpenAI).
+        model_suite: Local suite ("qwen" or "ministral") or API provider name.
+        local_model_id: Optional local model override (HF model id).
+        api_model_name: Optional API model name (e.g., "gemini-3-flash-preview").
+        session_id: Optional session id for per-session API state.
+
+    Returns:
+        A tuple of initialized models. In API mode:
+        (embed_model, proj_llm, code_llm). In local mode:
+        (embed_model, proj_llm, code_llm, img_analysis_llm, media_analysis_llm,
+        img_gen_model, img_edit_model).
+
+    Raises:
+        Exception: If local model initialization fails.
     """
     if use_api_mode:
         # API Mode - Using native multimodal API clients
@@ -129,14 +138,14 @@ def initialize_models(
             img_edit_model = None
 
             if model_suite == "ministral":
-                model_id = local_model_id or os.environ.get("LOCAL_MODEL_ID", "mistralai/Ministral-3-8B-Instruct-2512")
+                model_id = local_model_id or "mistralai/Ministral-3-8B-Instruct-2512"
                 logger.info("Initializing Ministral suite: %s", model_id)
                 proj_llm = get_or_create_ministral_llm(model_name=model_id, device="auto")
                 code_llm = get_or_create_devstral_llm()
                 # Ministral doesn't have specialized image/media models
             else:
                 # Qwen suite - main model is always regular Instruct, specialized models created separately
-                model_id = local_model_id or os.environ.get("LOCAL_MODEL_ID", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+                model_id = local_model_id or "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
                 
                 # Main model: always a regular Qwen Instruct (not VL, not Omni)
                 logger.info("Initializing Qwen main model: %s", model_id)
@@ -192,13 +201,20 @@ def configure_models(
     local_model_id: Optional[str] = None,
     session_id: Optional[str] = None,
 ):
-    """Configure global model settings for the current agent session."""
+    """Configure global model settings for the current agent session.
+
+    Args:
+        use_api_mode: Whether to use API-backed models.
+        model_suite: Local suite or API provider name.
+        local_model_id: Local model id or API model name depending on mode.
+        session_id: Optional session id for per-session API state.
+    """
     global USE_API_MODE, LOCAL_MODEL_SUITE, embed_model, proj_llm, code_llm, IMAGE_CAPTION_LLM, _ACTIVE_MODEL_CONFIG
     global img_analysis_llm, media_analysis_llm, img_gen_model, img_edit_model
 
     resolved_use_api = bool(use_api_mode)
 
-    resolved_model_id = local_model_id or os.environ.get("LOCAL_MODEL_ID")
+    resolved_model_id = local_model_id
     config = {
         "use_api_mode": resolved_use_api,
         "model_suite": model_suite,
@@ -211,9 +227,6 @@ def configure_models(
 
     USE_API_MODE = resolved_use_api
     LOCAL_MODEL_SUITE = model_suite
-    if local_model_id:
-        os.environ["LOCAL_MODEL_ID"] = local_model_id
-
     # In API mode, local_model_id contains the API model name (e.g., gemini-3-flash-preview)
     # In local mode, it contains the HuggingFace model ID
     api_model_name = resolved_model_id if use_api_mode else None
@@ -282,7 +295,7 @@ logger.setLevel(logging.INFO)
 
 
 class LoggingQueryEngine(BaseQueryEngine):
-    """Thin wrapper that adds structured logging around query execution."""
+    """Wrap a BaseQueryEngine to add structured logging."""
 
     def __init__(self, inner_engine: BaseQueryEngine, name: str = "dynamic_hybrid_multimodal_rag_tool"):
         self._inner_engine = inner_engine
@@ -347,11 +360,17 @@ img_edit_model = None
 
 @weave.op
 def read_and_parse_content(input_path: str) -> List[Document]:
-    """
-    Enhanced document parsing with native multimodal support.
-    - PDFs: Use DoclingReader for layout-aware extraction
-    - Images/Audio/Video: Use multimodal LLM (IMAGE_CAPTION_LLM) directly
-    - Other documents: Use appropriate readers
+    """Parse a file into LlamaIndex Documents.
+
+    This handles Docling for PDFs and Office files, specialized readers for
+    CSV/Excel/JSON/text, and multimodal LLM analysis for images and media.
+
+    Args:
+        input_path: Path to the file on disk.
+
+    Returns:
+        List of Documents. On error, returns a single Document with an error
+        message in its text.
     """
     # Standard document parsing
     if not os.path.exists(input_path):
@@ -511,16 +530,16 @@ def read_and_parse_content(input_path: str) -> List[Document]:
 
 @weave.op
 def create_temporary_web_search_index(documents: List[Document], llm=None) -> Optional[VectorStoreIndex]:
-    """
-    Create a temporary in-memory RAG index for web search results.
-    This index is NOT persisted and will be garbage collected after use.
-    
+    """Create a temporary in-memory RAG index for web search results.
+
+    The index is not persisted and is garbage collected after use.
+
     Args:
-        documents: Documents extracted from web search
-        llm: LLM instance for query engine
-        
+        documents: Documents extracted from web search.
+        llm: Optional LLM instance for the query engine.
+
     Returns:
-        VectorStoreIndex for querying, or None if creation fails
+        VectorStoreIndex for querying, or None if creation fails.
     """
     if not documents:
         logger.warning("No documents provided for temporary index")
@@ -552,9 +571,21 @@ def create_temporary_web_search_index(documents: List[Document], llm=None) -> Op
         logger.exception("Failed to create temporary web search index: %s", e)
         return None
 
-def search_and_extract_content_from_url(query: str) -> List[Document]:
-    logger.info(f"[web] start search: {query}")
-    url = None
+def _extract_urls_from_results(results: List[Dict[str, Any]], max_results: int) -> List[str]:
+    urls: List[str] = []
+    for result in results:
+        url = result.get("href") or result.get("link") or result.get("url") or result.get("FirstURL") or result.get("first_url")
+        if not url:
+            continue
+        url = str(url).rstrip(").,;:'\"")
+        if url not in urls:
+            urls.append(url)
+        if len(urls) >= max_results:
+            break
+    return urls
+
+def search_for_urls(query: str, max_results: int = 3) -> List[str]:
+    logger.info("[web] start search: %s", query)
     ddgs_errors: List[str] = []
     backend_attempts = [
         ("google", {"backend": "google"}),
@@ -563,30 +594,26 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
 
     for backend_name, backend_kwargs in backend_attempts:
         try:
-            kwargs = {"max_results": 3}
+            kwargs = {"max_results": max_results}
             kwargs.update(backend_kwargs)
             with DDGS() as ddg:
                 results = list(ddg.text(query, **kwargs))
             logger.info("[web] ddgs backend='%s' results: %d", backend_name, len(results))
-            if results:
-                first = results[0]
-                url = first.get("href") or first.get("link") or first.get("url") or first.get("FirstURL") or first.get("first_url")
-                if url:
-                    break
+            urls = _extract_urls_from_results(results, max_results)
+            if urls:
+                return urls
         except Exception as e:
             ddgs_errors.append(f"{backend_name}: {e}")
-            logger.warning(f"[web] ddgs failed (backend={backend_name}): {e}")
-    if not url and ddgs_errors:
+            logger.warning("[web] ddgs failed (backend=%s): %s", backend_name, e)
+    if ddgs_errors:
         logger.warning("[web] ddgs attempts exhausted: %s", "; ".join(ddgs_errors))
 
-    if not url:
-        logger.info("[web] no URL extracted (blocked/timeout/empty)")
-        return [Document(text="No URL could be extracted from the search results.",
-                         metadata={"type": "web_text", "source": "search"})]
+    logger.info("[web] no URLs extracted (blocked/timeout/empty)")
+    return []
 
+def extract_documents_from_url(url: str) -> List[Document]:
     url = str(url).rstrip(").,;:'\"")
-    logger.info(f"[web] fetching url: {url}")
-
+    logger.info("[web] fetching url: %s", url)
     try:
         netloc = urlparse(url).netloc.lower()
         if "youtube" in netloc or "youtu.be" in netloc:
@@ -614,25 +641,70 @@ def search_and_extract_content_from_url(query: str) -> List[Document]:
     except Exception as e:
         logger.warning(f"[web] fetch failed for {url}: {e}")
         return [Document(text=f"Error extracting content from URL: {e}",
-                         metadata={"type": "web_text", "source": url})]
+                         metadata={"type": "web_text", "source": url, "error": True})]
+
+def search_and_extract_content_from_url(query: str, max_results: int = 3) -> List[Document]:
+    urls = search_for_urls(query, max_results=max_results)
+    if not urls:
+        return [Document(text="No URL could be extracted from the search results.",
+                         metadata={"type": "web_text", "source": "search", "error": True})]
+
+    documents: List[Document] = []
+    for url in urls:
+        documents.extend(extract_documents_from_url(url))
+    return documents
+
+def format_web_search_documents(documents: List[Document]) -> str:
+    sources: List[str] = []
+    text_by_source: Dict[str, List[str]] = {}
+    for doc in documents:
+        metadata = doc.metadata or {}
+        source = metadata.get("source", "unknown")
+        if source not in text_by_source:
+            text_by_source[source] = []
+            sources.append(source)
+        text_by_source[source].append(doc.text or "")
+
+    parts: List[str] = []
+    for source in sources:
+        body = "\n\n".join(text_by_source[source]).strip()
+        if not body:
+            continue
+        parts.append(f"Source: {source}\n\n{body}")
+    return "\n\n---\n\n".join(parts)
 
 def enhanced_web_search_and_query(query: str) -> str:
-    """
-    Performs web search, extracts content, creates temporary in-memory index,
-    queries it, and returns the answer. Index is discarded after use.
+    """Run web search and return either raw pages or a RAG answer.
+
+    API mode returns raw page content for multiple results. Local mode builds
+    a temporary in-memory index and answers the query.
+
+    Args:
+        query: The search query.
+
+    Returns:
+        A string containing either raw page content or an answer.
     """
     # Extract content from web search
-    documents = search_and_extract_content_from_url(query)
+    documents = search_and_extract_content_from_url(query, max_results=3)
 
-    if not documents or any("Error" in doc.text for doc in documents):
+    valid_documents = [
+        doc for doc in documents
+        if doc.text and not (doc.metadata or {}).get("error")
+    ]
+    if not valid_documents:
         error_msg = documents[0].text if documents else "No content extracted"
         logger.warning("Web search failed for query '%s': %s", query, error_msg)
         return f"Failed to extract web content: {error_msg}"
 
-    logger.info("Creating temporary index for %d documents from web search", len(documents))
+    if USE_API_MODE:
+        logger.info("API mode web search: returning raw content for %d documents", len(valid_documents))
+        return format_web_search_documents(valid_documents)
+
+    logger.info("Creating temporary index for %d documents from web search", len(valid_documents))
     
     # Create temporary in-memory index
-    temp_index = create_temporary_web_search_index(documents, llm=proj_llm)
+    temp_index = create_temporary_web_search_index(valid_documents, llm=proj_llm)
     
     if temp_index is None:
         return "Failed to create temporary search index"
@@ -663,9 +735,13 @@ def enhanced_web_search_and_query(query: str) -> str:
         return "Error processing web search results"
 
 def make_enhanced_web_search_tool():
-    """Create web search tool that uses temporary in-memory RAG"""
+    """Create a web search tool with API/raw and local/RAG behavior.
+
+    Returns:
+        Callable tool function that accepts a query string.
+    """
     def enhanced_web_search(query: str) -> str:
-        """Perform a web search, extract content, create temporary RAG index, query it, and return the answer. The index is discarded after use."""
+        """Perform web search and return raw pages (API) or a RAG answer (local)."""
         logger.info(f"enhanced_web_search called with query: {query}")
         return enhanced_web_search_and_query(query)
 
@@ -673,7 +749,14 @@ def make_enhanced_web_search_tool():
     return enhanced_web_search
 
 def safe_import(module_name):
-    """Safely import a module, return None if not available"""
+    """Import a module by name, returning None on ImportError.
+
+    Args:
+        module_name: Fully qualified module name.
+
+    Returns:
+        Imported module object, or None if import fails.
+    """
     try:
         return __import__(module_name, fromlist=[''])
     except ImportError:
@@ -719,10 +802,16 @@ if "PIL" in safe_globals:
 
 
 def execute_python_code(code: str) -> str:
-    """python_code_execution(code: str) -> str
+    """Execute Python code in a restricted global namespace.
 
-    Execute arbitrary Python code inside a restricted global namespace.
-    Captures standard output (print statements) and the value of a 'result' variable.
+    Captures stdout (print statements) and the value of a `result` variable,
+    if defined in the executed code.
+
+    Args:
+        code: Python source code to execute.
+
+    Returns:
+        Combined stdout and result value, or an error message on failure.
     """
     output_buffer = io.StringIO()
     try:
@@ -748,7 +837,13 @@ def execute_python_code(code: str) -> str:
 
 # Pydantic model for structured output
 class StructuredResponse(BaseModel):
-    """Structured answer format with validation"""
+    """Structured answer format with validation.
+
+    Attributes:
+        reasoning: Step-by-step reasoning used to derive the answer.
+        final_answer: Exact answer in concise format.
+        confidence: Confidence score between 0 and 1.
+    """
     reasoning: str = Field(
         description="Step-by-step reasoning process used to arrive at the answer"
     )
@@ -763,7 +858,15 @@ class StructuredResponse(BaseModel):
     )
 
 def llm_reformat(response: str, question: str) -> str:
-    """Use Pydantic-based LLM program to extract structured answer"""
+    """Extract a concise final answer from an LLM response.
+
+    Args:
+        response: Full model response text.
+        question: Original user question.
+
+    Returns:
+        Extracted final answer, or the original response on failure.
+    """
 
     format_prompt = """Extract the exact answer from the response below.
 
@@ -1058,20 +1161,26 @@ If you need to return a text result or a specific value, assign it to a variable
 
     @weave.op
     def _record_steps(self, deltas: List[str]) -> int:
-        """Record streamed deltas as a single Weave op for step visibility."""
+        """Record streamed deltas as a single Weave op.
+
+        Args:
+            deltas: Streamed token deltas.
+
+        Returns:
+            Count of deltas recorded.
+        """
         return len(deltas)
 
     @weave.op
     def run(self, query: str, max_steps: Optional[int] = None) -> str:
-        """
-        Run the agent on a general query (main method for chat interface).
+        """Run the agent on a user query.
 
         Args:
-            query: User's question or instruction
-            max_steps: Maximum reasoning steps (not used for workflow agents but kept for API consistency)
+            query: User question or instruction.
+            max_steps: Maximum reasoning steps (kept for API compatibility).
 
         Returns:
-            Agent's response as a string
+            Agent response as a string.
         """
         try:
             try:
@@ -1093,9 +1202,15 @@ If you need to return a text result or a specific value, assign it to a variable
             return error_msg
 
     async def process_query(self, query: str) -> str:
-        """
-        Process user query with knowledge base integration.
-        Uses a non-streaming await pattern for the workflow execution.
+        """Process a query with knowledge base integration.
+
+        Uses a non-streaming await pattern for workflow execution.
+
+        Args:
+            query: User question or instruction.
+
+        Returns:
+            Final answer string formatted by the post-processor.
         """
         context_prompt = f"""Question: {query}
 
@@ -1141,5 +1256,5 @@ If you need to return a text result or a specific value, assign it to a variable
             return error_msg
 
     def get_knowledge_base_stats(self):
-        """Get statistics about the current knowledge base"""
+        """Return statistics about the current knowledge base."""
         return self.vector_store_manager.get_stats()

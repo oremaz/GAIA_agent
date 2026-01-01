@@ -1,7 +1,4 @@
-"""
-Conversational AI Agent - Streamlit UI
-Production-ready AI agent chatbot with multi-provider support
-"""
+"""Streamlit UI for the Conversational AI Agent."""
 
 import streamlit as st
 import os
@@ -68,7 +65,7 @@ st.markdown("""
 # ============================================================================
 
 def initialize_session_state():
-    """Initialize all session state variables"""
+    """Initialize Streamlit session state variables."""
 
     # Session management
     if 'session_manager' not in st.session_state:
@@ -106,7 +103,11 @@ def initialize_session_state():
 # ============================================================================
 
 def initialize_agent_for_session(session: ChatSession):
-    """Initialize agent based on session configuration"""
+    """Initialize the agent for a session configuration.
+
+    Args:
+        session: Chat session with stored configuration.
+    """
 
     agent_config = session.agent_config
 
@@ -176,7 +177,7 @@ def initialize_agent_for_session(session: ChatSession):
 # ============================================================================
 
 def render_session_management():
-    """Render session management sidebar"""
+    """Render the session management sidebar."""
 
     st.sidebar.header("Chat Sessions")
 
@@ -214,7 +215,7 @@ def render_session_management():
 
 
 def show_new_chat_config():
-    """Show configuration dialog for new chat"""
+    """Show the new chat configuration panel."""
 
     with st.sidebar.expander("Configure New Chat", expanded=True):
         # Framework selection
@@ -386,7 +387,11 @@ def show_new_chat_config():
 
 
 def create_chat_with_config(agent_config: Dict[str, Any]):
-    """Create a new chat session with specific configuration"""
+    """Create a new chat session with a specific configuration.
+
+    Args:
+        agent_config: Configuration dictionary for the new session.
+    """
 
     # Generate title
     framework = agent_config["framework"]
@@ -410,7 +415,11 @@ def create_chat_with_config(agent_config: Dict[str, Any]):
 
 
 def load_session(session_id: str):
-    """Load an existing session"""
+    """Load an existing session and initialize its agent.
+
+    Args:
+        session_id: Session identifier to load.
+    """
 
     session = st.session_state.session_manager.load_session(session_id)
 
@@ -426,7 +435,11 @@ def load_session(session_id: str):
 
 
 def delete_session(session_id: str):
-    """Delete a session"""
+    """Delete a session and its associated data.
+
+    Args:
+        session_id: Session identifier to delete.
+    """
 
     if st.session_state.session_manager.delete_session(session_id, cleanup_vector_store=True):
 
@@ -446,7 +459,7 @@ def delete_session(session_id: str):
 # ============================================================================
 
 def render_vector_store_section():
-    """Render vector store management section"""
+    """Render the vector store management section."""
 
     if not st.session_state.current_session:
         st.sidebar.info("Create or select a chat first")
@@ -535,19 +548,41 @@ def render_vector_store_section():
 
 
 def _format_library_label(entry: Dict[str, Any]) -> str:
-    """Format a library entry for UI display."""
+    """Format a library entry for UI display.
+
+    Args:
+        entry: Library entry dictionary.
+
+    Returns:
+        Human-readable label string.
+    """
     label = entry.get("label") or entry.get("source_key") or "Unknown"
     source_type = entry.get("source_type", "source")
     return f"{label} ({source_type})"
 
 
 def _get_linked_sources(session: ChatSession) -> set:
-    """Return linked source ids for the session."""
+    """Return linked source ids for the session.
+
+    Args:
+        session: Chat session instance.
+
+    Returns:
+        Set of linked source ids.
+    """
     return set(session.metadata.get("linked_sources", []))
 
 
 def _link_source_to_session(session: ChatSession, source_id: str) -> bool:
-    """Link a source to the session if not already linked."""
+    """Link a source to the session if not already linked.
+
+    Args:
+        session: Chat session instance.
+        source_id: Library source identifier.
+
+    Returns:
+        True if the source was linked, False if already linked.
+    """
     linked_sources = _get_linked_sources(session)
     if source_id in linked_sources:
         return False
@@ -557,7 +592,11 @@ def _link_source_to_session(session: ChatSession, source_id: str) -> bool:
 
 
 def upload_to_conversation_store(uploaded_file):
-    """Upload file to conversation vector store with caching."""
+    """Upload a file to the conversation vector store with caching.
+
+    Args:
+        uploaded_file: Streamlit uploaded file object.
+    """
 
     with st.spinner(f"Processing {uploaded_file.name}..."):
         try:
@@ -602,7 +641,11 @@ def upload_to_conversation_store(uploaded_file):
 
 
 def fetch_url_to_conversation(url: str):
-    """Fetch URL and add to conversation vector store with caching."""
+    """Fetch a URL and add it to the conversation vector store with caching.
+
+    Args:
+        url: URL to fetch and index.
+    """
 
     with st.spinner(f"Fetching {url}..."):
         try:
@@ -650,7 +693,16 @@ def add_library_sources_to_conversation(
     rerun: bool = True,
     announce_label: Optional[str] = None,
 ) -> bool:
-    """Add cached library sources to the current conversation."""
+    """Add cached library sources to the current conversation.
+
+    Args:
+        source_ids: Library source identifiers to link.
+        rerun: Whether to trigger a Streamlit rerun.
+        announce_label: Optional label to announce in the chat history.
+
+    Returns:
+        True if any sources were linked, otherwise False.
+    """
     session = st.session_state.current_session
     if not session or not st.session_state.vector_store_manager:
         return False
@@ -692,7 +744,11 @@ def add_library_sources_to_conversation(
 # ============================================================================
 
 def process_chat_document(uploaded_file):
-    """Process document uploaded within chat"""
+    """Process a document uploaded within a chat.
+
+    Args:
+        uploaded_file: Streamlit uploaded file object.
+    """
 
     session = st.session_state.current_session
     agent_config = session.agent_config
@@ -766,7 +822,7 @@ def process_chat_document(uploaded_file):
 # ============================================================================
 
 def render_chat_interface():
-    """Render main chat interface"""
+    """Render the main chat interface."""
 
     if not st.session_state.current_session:
         st.markdown('<div class="main-header">AI Agent</div>', unsafe_allow_html=True)
@@ -870,7 +926,11 @@ def render_chat_interface():
 
 
 def handle_user_message(prompt: str):
-    """Handle user message and generate response"""
+    """Handle a user message and generate a response.
+
+    Args:
+        prompt: User prompt text.
+    """
 
     session = st.session_state.current_session
 
@@ -913,7 +973,12 @@ def _infer_media_type(extension: str) -> str:
 
 
 def handle_user_message_with_media(prompt: str, media_files: List):
-    """Handle user message with attached media files (images, audio, video)"""
+    """Handle a user message with attached media files.
+
+    Args:
+        prompt: User prompt text.
+        media_files: List of uploaded media files.
+    """
 
     session = st.session_state.current_session
     agent_config = session.agent_config
@@ -1022,7 +1087,14 @@ def handle_user_message_with_media(prompt: str, media_files: List):
 
 
 def _parse_agent_response(result) -> tuple[str, Optional[str]]:
-    """Normalize agent outputs to (response_text, trace_id)."""
+    """Normalize agent outputs to (response_text, trace_id).
+
+    Args:
+        result: Agent output in tuple/dict/string form.
+
+    Returns:
+        Tuple of response text and optional trace id.
+    """
     if isinstance(result, tuple) and len(result) == 2:
         response_text, trace_id = result
         return str(response_text), trace_id
@@ -1034,7 +1106,11 @@ def _parse_agent_response(result) -> tuple[str, Optional[str]]:
 
 
 def add_prompt_media_files(uploaded_files):
-    """Store media files to attach to the next prompt without indexing."""
+    """Store media files to attach to the next prompt without indexing.
+
+    Args:
+        uploaded_files: Streamlit uploaded file(s).
+    """
     session = st.session_state.current_session
     if not session:
         st.sidebar.warning("Create or select a chat first.")
@@ -1095,14 +1171,25 @@ def add_prompt_media_files(uploaded_files):
         )
 
 def _consume_prompt_media(session: ChatSession) -> List[Dict[str, Any]]:
-    """Return and clear prompt media for the next user message."""
+    """Return and clear prompt media for the next user message.
+
+    Args:
+        session: Chat session instance.
+
+    Returns:
+        List of pending prompt media entries.
+    """
     if not session:
         return []
     return session.metadata.pop("pending_prompt_media", [])
 
 
 def _cleanup_prompt_media(prompt_media: List[Dict[str, Any]]) -> None:
-    """Remove temporary prompt media attachments from disk."""
+    """Remove temporary prompt media attachments from disk.
+
+    Args:
+        prompt_media: List of prompt media metadata.
+    """
     for info in prompt_media or []:
         path = info.get("path")
         if not path:
@@ -1119,7 +1206,17 @@ def _build_prompt(
     agent_config: Dict[str, Any],
     max_history: int = 8,
 ) -> str:
-    """Build prompt with documents, vector store metadata, and recent history."""
+    """Build a prompt with documents, vector store metadata, and history.
+
+    Args:
+        prompt: User prompt text.
+        session: Chat session instance.
+        agent_config: Agent configuration dict.
+        max_history: Max number of recent messages to include.
+
+    Returns:
+        Full prompt string.
+    """
     parts = []
 
     def _document_block() -> Optional[str]:
@@ -1209,7 +1306,14 @@ def _build_prompt(
 
 
 def generate_response(prompt: str) -> tuple[str, Optional[str]]:
-    """Generate response using the configured agent"""
+    """Generate a response using the configured agent.
+
+    Args:
+        prompt: User prompt text.
+
+    Returns:
+        Tuple of response text and optional trace id.
+    """
 
     session = st.session_state.current_session
     agent_config = session.agent_config
@@ -1237,7 +1341,15 @@ def generate_multimodal_response(
     prompt: str,
     media_paths: List[str],
 ) -> tuple[str, Optional[str]]:
-    """Generate response with multimodal content (images, audio, video)"""
+    """Generate a response with multimodal content.
+
+    Args:
+        prompt: User prompt text.
+        media_paths: Paths to media files to attach.
+
+    Returns:
+        Tuple of response text and optional trace id.
+    """
 
     session = st.session_state.current_session
     agent_config = session.agent_config
@@ -1313,7 +1425,16 @@ def generate_multimodal_response(
 # ============================================================================
 
 def submit_feedback(trace_id: str, score: int, comment: str) -> bool:
-    """Send feedback to Langfuse using the agent hook."""
+    """Send feedback to Langfuse using the agent hook.
+
+    Args:
+        trace_id: Trace id to score.
+        score: Feedback score (0 or 1).
+        comment: Optional feedback comment.
+
+    Returns:
+        True if feedback was submitted, otherwise False.
+    """
     agent = st.session_state.agent
     if not agent or not hasattr(agent, "add_user_feedback"):
         return False
@@ -1367,7 +1488,7 @@ def render_feedback_section():
 # ============================================================================
 
 def render_settings():
-    """Render settings page"""
+    """Render the settings sidebar."""
 
     st.sidebar.header("Settings")
 
@@ -1415,7 +1536,7 @@ def render_settings():
 
 
 def export_all_sessions():
-    """Export all chat sessions"""
+    """Export all chat sessions to JSON."""
 
     import json
     from datetime import datetime
@@ -1449,7 +1570,7 @@ def export_all_sessions():
 
 
 def clear_all_data():
-    """Clear all application data"""
+    """Clear all application data and reset state."""
 
     import shutil
 
@@ -1478,7 +1599,7 @@ def clear_all_data():
 # ============================================================================
 
 def main():
-    """Main application entry point"""
+    """Main application entry point."""
 
     # Initialize session state
     initialize_session_state()

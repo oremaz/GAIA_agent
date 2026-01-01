@@ -1,8 +1,4 @@
-"""
-Chat Session Manager
-Handles chat history persistence, loading, and conversation memory
-Each session stores its own agent configuration
-"""
+"""Chat session persistence and metadata management."""
 
 import json
 import logging
@@ -16,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class Message:
-    """Represents a single chat message"""
+    """Represent a single chat message."""
 
     def __init__(
         self,
@@ -49,7 +45,7 @@ class Message:
 
 
 class ChatSession:
-    """Represents a single chat session with agent configuration"""
+    """Represent a single chat session with agent configuration."""
 
     def __init__(
         self,
@@ -74,7 +70,13 @@ class ChatSession:
         }
 
     def add_message(self, role: str, content: str, metadata: Optional[Dict[str, Any]] = None):
-        """Add a message to the session"""
+        """Add a message to the session.
+
+        Args:
+            role: Message role ("user" or "assistant").
+            content: Message content text.
+            metadata: Optional message metadata.
+        """
         message = Message(role=role, content=content, metadata=metadata)
         self.messages.append(message)
         self.metadata["updated_at"] = datetime.now().isoformat()
@@ -100,14 +102,13 @@ class ChatSession:
 
 
 class SessionManager:
-    """Manages chat sessions with persistence"""
+    """Manage chat sessions with persistence."""
 
     def __init__(self, storage_path: str = ".chat_sessions"):
-        """
-        Initialize session manager
+        """Initialize the session manager.
 
         Args:
-            storage_path: Directory to store session files
+            storage_path: Directory to store session files.
         """
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(exist_ok=True)
@@ -119,7 +120,11 @@ class SessionManager:
         logger.info("SessionManager initialized: %s", self.storage_path)
 
     def _load_index(self) -> Dict[str, Dict[str, Any]]:
-        """Load sessions index from disk"""
+        """Load the sessions index from disk.
+
+        Returns:
+            Sessions index dictionary.
+        """
         if not self.index_file.exists():
             return {}
 
@@ -131,7 +136,7 @@ class SessionManager:
             return {}
 
     def _save_index(self):
-        """Save sessions index to disk"""
+        """Save the sessions index to disk."""
         try:
             with open(self.index_file, 'w', encoding='utf-8') as f:
                 json.dump(self.sessions_index, f, indent=2, ensure_ascii=False)
@@ -144,7 +149,16 @@ class SessionManager:
         metadata: Optional[Dict[str, Any]] = None,
         agent_config: Optional[Dict[str, Any]] = None
     ) -> ChatSession:
-        """Create a new chat session with agent configuration"""
+        """Create a new chat session with agent configuration.
+
+        Args:
+            title: Optional session title.
+            metadata: Optional session metadata.
+            agent_config: Optional agent configuration.
+
+        Returns:
+            Newly created ChatSession.
+        """
         session = ChatSession(title=title, metadata=metadata, agent_config=agent_config)
 
         # Add to index
@@ -163,7 +177,14 @@ class SessionManager:
         return session
 
     def load_session(self, session_id: str) -> Optional[ChatSession]:
-        """Load a session from disk"""
+        """Load a session from disk.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            ChatSession if found, otherwise None.
+        """
         session_file = self.storage_path / f"{session_id}.json"
 
         if not session_file.exists():
@@ -183,7 +204,11 @@ class SessionManager:
             return None
 
     def save_session(self, session: ChatSession):
-        """Save a session to disk"""
+        """Save a session to disk.
+
+        Args:
+            session: ChatSession instance to persist.
+        """
         self._save_session(session)
 
         # Update index
@@ -196,7 +221,11 @@ class SessionManager:
             self._save_index()
 
     def _save_session(self, session: ChatSession):
-        """Internal method to save session"""
+        """Persist a session to disk.
+
+        Args:
+            session: ChatSession instance to persist.
+        """
         session_file = self.storage_path / f"{session.session_id}.json"
 
         try:
@@ -207,14 +236,13 @@ class SessionManager:
             logger.error("Failed to save session %s: %s", session.session_id, e)
 
     def list_sessions(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        List all sessions sorted by most recent
+        """List sessions sorted by most recent.
 
         Args:
-            limit: Maximum number of sessions to return
+            limit: Maximum number of sessions to return.
 
         Returns:
-            List of session metadata dicts
+            List of session metadata dictionaries.
         """
         sessions = [
             {
@@ -233,15 +261,14 @@ class SessionManager:
         return sessions
 
     def delete_session(self, session_id: str, cleanup_vector_store: bool = True) -> bool:
-        """
-        Delete a session and optionally its conversation-specific vector store
+        """Delete a session and optionally its vector store.
 
         Args:
-            session_id: Session ID to delete
-            cleanup_vector_store: Whether to delete conversation vector store
+            session_id: Session identifier to delete.
+            cleanup_vector_store: Whether to delete conversation vector store.
 
         Returns:
-            True if successful
+            True if successful, otherwise False.
         """
         session_file = self.storage_path / f"{session_id}.json"
 

@@ -1,7 +1,4 @@
-"""
-Document Processor
-Handles file uploads, URL fetching, and document parsing using Docling
-"""
+"""Document processing helpers for uploads, URLs, and Docling parsing."""
 
 import os
 import json
@@ -90,10 +87,10 @@ class UserAgentWebPageReader(SimpleWebPageReader):
 
 
 class DocumentProcessor:
-    """Processes various document types into LlamaIndex Documents"""
+    """Process documents into LlamaIndex Document objects."""
 
     def __init__(self):
-        """Initialize document processor with readers"""
+        """Initialize document readers and supported extensions."""
 
         # Initialize readers
         self.docling_reader = DoclingReader(
@@ -115,14 +112,13 @@ class DocumentProcessor:
         self.text_extensions = {'.txt', '.md', '.markdown', '.rst'}
 
     def process_file(self, file_path: str) -> Tuple[List[Document], str]:
-        """
-        Process a file into Documents
+        """Process a file into Documents.
 
         Args:
-            file_path: Path to file
+            file_path: Path to the file.
 
         Returns:
-            Tuple of (documents, file_type)
+            Tuple of (documents, file_type).
         """
         if not os.path.exists(file_path):
             logger.error("File not found: %s", file_path)
@@ -168,14 +164,13 @@ class DocumentProcessor:
             return [], file_type
 
     def process_uploaded_file(self, uploaded_file) -> Tuple[List[Document], str]:
-        """
-        Process a Streamlit uploaded file
+        """Process a Streamlit uploaded file into Documents.
 
         Args:
-            uploaded_file: Streamlit UploadedFile object
+            uploaded_file: Streamlit UploadedFile object.
 
         Returns:
-            Tuple of (documents, file_type)
+            Tuple of (documents, file_type).
         """
         # Save to temp file
         with tempfile.NamedTemporaryFile(
@@ -202,14 +197,13 @@ class DocumentProcessor:
                 pass
 
     def process_url(self, url: str) -> Tuple[List[Document], str]:
-        """
-        Process a URL into Documents
+        """Process a URL into Documents.
 
         Args:
-            url: URL to fetch
+            url: URL to fetch.
 
         Returns:
-            Tuple of (documents, url_type)
+            Tuple of (documents, url_type).
         """
         logger.info("Processing URL: %s", url)
 
@@ -245,7 +239,14 @@ class DocumentProcessor:
 
 
     def _process_with_docling(self, file_path: str) -> List[Document]:
-        """Process file with DoclingReader"""
+        """Process a file using DoclingReader.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            List of Documents parsed by Docling.
+        """
         try:
             documents = self.docling_reader.load_data(file_path)
             return documents
@@ -254,7 +255,14 @@ class DocumentProcessor:
             return []
 
     def _process_text(self, file_path: str) -> List[Document]:
-        """Process plain text file"""
+        """Process a plain text file.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            List of Documents parsed from the text file.
+        """
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -284,7 +292,14 @@ class DocumentProcessor:
                 return []
 
     def _process_json(self, file_path: str) -> List[Document]:
-        """Process JSON file into a single Document"""
+        """Process a JSON file into a single Document.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            List containing a single Document on success, otherwise empty.
+        """
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -304,7 +319,14 @@ class DocumentProcessor:
             return []
 
     def _get_file_type(self, extension: str) -> str:
-        """Determine file type from extension"""
+        """Determine file type from extension.
+
+        Args:
+            extension: File extension including leading dot.
+
+        Returns:
+            File type label.
+        """
         if extension in self.docling_extensions:
             return "document"
         if extension in self.csv_extensions:

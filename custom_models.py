@@ -73,8 +73,12 @@ def _truncate_on_stop(text: str, stop: Optional[List[str]]) -> str:
 def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return a cached JinaEmbeddingsV4 instance or create one.
 
-    Keyed by (model_name, device). If model_name is None the default from
-    the class will be used.
+    Args:
+        model_name: Optional Jina embedding model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created JinaEmbeddingsV4 instance.
     """
     key = (model_name or "jinaai/jina-embeddings-v4", device or "auto")
     # Fast path
@@ -118,7 +122,13 @@ def get_or_create_jina_embedder(model_name: Optional[str] = None, device: Option
 def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5, device: str = "cpu"):
     """Return a cached JinaMultimodalReranker instance or create one.
 
-    Keyed by (model_name, top_n, device).
+    Args:
+        model_name: Optional Jina reranker model id.
+        top_n: Number of top documents to keep.
+        device: Device for the reranker ("cpu", "cuda", or "auto").
+
+    Returns:
+        Cached or newly created JinaMultimodalReranker instance.
     """
     key = (model_name or "jinaai/jina-reranker-m0", top_n, device)
     inst = _RERANKER_CACHE.get(key)
@@ -160,8 +170,12 @@ def get_or_create_jina_reranker(model_name: Optional[str] = None, top_n: int = 5
 def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return cached Qwen3VLMultiModal or create one.
 
-    Cached by (model_name, device). Defaults to the int4-friendly
-    Qwen/Qwen3-VL-30B-A3B-Instruct checkpoint described in the docs.
+    Args:
+        model_name: Optional Qwen3-VL model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created Qwen3VLMultiModal instance.
     """
     key = (model_name or "Qwen/Qwen3-VL-30B-A3B-Instruct", device or "auto")
     inst = _LLM_CACHE.get(key)
@@ -207,7 +221,12 @@ def get_or_create_qwen_vl_llm(model_name: Optional[str] = None, device: Optional
 def get_or_create_ministral_llm(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return cached MinistralMultiModal or create one.
 
-    Defaults to Ministral-3-8B-Instruct-2512.
+    Args:
+        model_name: Optional Ministral model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created MinistralMultiModal instance.
     """
     key = (model_name or "mistralai/Ministral-3-8B-Instruct-2512", device or "auto")
     inst = _MINISTRAL_CACHE.get(key)
@@ -250,9 +269,13 @@ def get_or_create_ministral_llm(model_name: Optional[str] = None, device: Option
 
 def get_or_create_devstral_llm(model_name: Optional[str] = None, device: Optional[str] = None):
     """Return cached Devstral LLM configured for agentic software engineering tasks.
-    
-    Uses Mistral3ForConditionalGeneration with Devstral-Small-2-24B-Instruct-2512.
-    This model excels at using tools, exploring codebases, and editing multiple files.
+
+    Args:
+        model_name: Optional Devstral model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created DevstralLLM instance.
     """
     key = (model_name or "mistralai/Devstral-Small-2-24B-Instruct-2512", device or "auto")
     inst = _LLM_CACHE.get(key)
@@ -296,7 +319,14 @@ def get_or_create_devstral_llm(model_name: Optional[str] = None, device: Optiona
         return inst
 
 def unload_model_from_gpu(model):
-    """Unload a model from GPU to CPU and clear cache."""
+    """Move a model to CPU and clear GPU cache.
+
+    Args:
+        model: Model wrapper with a `_model` attribute.
+
+    Returns:
+        True on success, False on failure.
+    """
     try:
         if hasattr(model, '_model') and model._model is not None:
             _logger.info("Unloading model from GPU to CPU")
@@ -311,7 +341,14 @@ def unload_model_from_gpu(model):
 
 
 def reload_model_to_gpu(model):
-    """Reload a model from CPU to GPU."""
+    """Move a model back to GPU if available.
+
+    Args:
+        model: Model wrapper with a `_model` attribute.
+
+    Returns:
+        True on success, False on failure.
+    """
     try:
         if hasattr(model, '_model') and model._model is not None:
             _logger.info("Reloading model to GPU")
@@ -328,10 +365,11 @@ _DEFAULT_QWEN_VL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
 
 class DevstralLLM(CustomLLM):
-    """CustomLLM wrapper for Devstral-Small-2-24B-Instruct-2512 using Mistral3ForConditionalGeneration.
+    """CustomLLM wrapper for Devstral-Small-2-24B-Instruct-2512.
 
-    Optimized for agentic software engineering tasks including tool use, code exploration, and multi-file editing.
-    Model is in FP8 format by default - no additional quantization applied.
+    Optimized for agentic software engineering tasks including tool use, code
+    exploration, and multi-file editing. The model is FP8 by default, so no
+    additional quantization is applied.
     """
 
     model_id: str = Field(default="mistralai/Devstral-Small-2-24B-Instruct-2512")
@@ -370,7 +408,11 @@ class DevstralLLM(CustomLLM):
         return self.model_id
 
     def _init_hf(self) -> None:
-        """Load tokenizer + Devstral model. No quantization - model is already FP8."""
+        """Load tokenizer and model weights for Devstral.
+
+        Raises:
+            RuntimeError: If the Mistral backend is unavailable.
+        """
         try:
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
         except Exception:
@@ -421,7 +463,14 @@ class DevstralLLM(CustomLLM):
                     pass
 
     def _truncate_input(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Truncate input to max_input_tokens"""
+        """Truncate input ids to the configured maximum length.
+
+        Args:
+            input_ids: Token ids tensor.
+
+        Returns:
+            Truncated tensor if needed, otherwise the original tensor.
+        """
         if input_ids.shape[-1] > self.max_input_tokens:
             _logger.warning(
                 "Truncating Devstral input from %d to %d tokens",
@@ -529,12 +578,10 @@ class DevstralLLM(CustomLLM):
 
 
 class Qwen3VLMultiModal(CustomLLM):
-    """CustomLLM wrapper for Qwen3-VL-30B-A3B-Instruct with int4 quantization.
+    """CustomLLM wrapper for Qwen3-VL with optional 4-bit quantization.
 
-    The implementation mirrors the official Qwen3-VL documentation flow: prompts
-    are built via AutoProcessor.apply_chat_template with tokenized inputs so
-    llama-index can drive the model seamlessly. We quantize to 4-bit NF4 via
-    BitsAndBytes to satisfy the memory constraints called out in the requirements.
+    Prompts are built via AutoProcessor.apply_chat_template so llama-index can
+    drive the model. When available, BitsAndBytes is used for 4-bit NF4 loading.
     """
 
     model_id: str = Field(default=_DEFAULT_QWEN_VL)
@@ -575,7 +622,10 @@ class Qwen3VLMultiModal(CustomLLM):
         return self.model_id
 
     def _init_hf(self) -> None:
-        """Load processor + Qwen3-VL model with 4-bit quantization."""
+        """Load processor and model weights for Qwen3-VL.
+
+        Attempts 4-bit quantization when BitsAndBytes is available.
+        """
         try:
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
         except Exception:
@@ -801,11 +851,11 @@ class Qwen3VLMultiModal(CustomLLM):
 # ---------------- Embedding / reranker helpers ---------------- #
 
 class JinaEmbeddingsV4(BaseEmbedding):
-    """
-    Memory-constrained wrapper for jinaai/jina-embeddings-v4.
-    - 4-bit NF4 + FP16 compute with automatic sharding/offload
-    - Caps sequence length and batch size to limit activation/KV memory spikes
-    - Processes items sequentially (batch_size=1) to avoid multi-GiB peaks
+    """Memory-constrained wrapper for jinaai/jina-embeddings-v4.
+
+    Uses 4-bit NF4 + FP16 compute with automatic sharding/offload, caps sequence
+    length and batch size to limit memory spikes, and processes items
+    sequentially by default.
     """
     model_name: str = Field(default="jinaai/jina-embeddings-v4")
 
@@ -894,11 +944,22 @@ class JinaEmbeddingsV4(BaseEmbedding):
         batch_size: Optional[int] = None,
         is_query: bool = False,
     ) -> List[List[float]]:
-        """
-        Strict memory controls:
-        - batch_size forced to 1 by default
-        - max_length capped (queries vs passages)
-        - optional truncate_dim to reduce output dimensionality
+        """Embed text (optionally paired with images) with strict memory limits.
+
+        Args:
+            texts: Input texts to embed.
+            image_paths: Optional image paths aligned with texts.
+            task: Embedding task label.
+            prompt_name: Optional prompt name for the model.
+            return_multivector: Whether to return multi-vector output.
+            truncate_dim: Optional output dimensionality reduction.
+            max_length: Optional max token length.
+            max_pixels: Optional image pixel cap.
+            batch_size: Optional batch size override.
+            is_query: Whether inputs are queries (affects max length).
+
+        Returns:
+            List of embedding vectors.
         """
 
         try:
@@ -1022,9 +1083,10 @@ class JinaEmbeddingsV4(BaseEmbedding):
         return self._get_text_embedding(text, image_path)
 
 class JinaMultimodalReranker:
-    """
-    Custom Jina multimodal reranker using jinaai/jina-reranker-m0.
-    Supports text-to-text, text-to-image, image-to-text, and image-to-image reranking.
+    """Jina multimodal reranker using jinaai/jina-reranker-m0.
+
+    Supports text-to-text, text-to-image, image-to-text, and image-to-image
+    reranking.
     """
     
     def __init__(self, model_name: str = "jinaai/jina-reranker-m0", top_n: int = 5, device: str = "auto"):
@@ -1035,7 +1097,7 @@ class JinaMultimodalReranker:
         self._loaded = False
     
     def _load_model(self):
-        """Load the Jina reranker model"""
+        """Load the Jina reranker model."""
         try:
 
             # Determine target device. Prefer cuda:1 when multiple GPUs exist,
@@ -1103,9 +1165,10 @@ class JinaMultimodalReranker:
             raise
     
     def postprocess_nodes(self, nodes, query_bundle):
-        """
-        Rerank nodes using Jina multimodal reranker.
-        Automatically detects content types and uses appropriate reranking method.
+        """Rerank nodes using the Jina multimodal reranker.
+
+        Automatically detects content types and uses the appropriate reranking
+        strategy.
         """
         if not nodes:
             return []
@@ -1202,7 +1265,7 @@ class JinaMultimodalReranker:
         return reranked_nodes
     
     def _node_has_image(self, node) -> bool:
-        """Check if a node contains image content"""
+        """Check whether a node contains image content."""
         # Check metadata for image indicators
         metadata = getattr(node, 'metadata', {})
         
@@ -1232,7 +1295,7 @@ class JinaMultimodalReranker:
         return False
     
     def _extract_image_path(self, node) -> Optional[str]:
-        """Extract image path from node"""
+        """Extract an image path from a node, if present."""
         # Try image_path attribute first
         if hasattr(node, 'image_path') and node.image_path:
             return node.image_path
@@ -1254,7 +1317,15 @@ class JinaMultimodalReranker:
         return None
 
     def score_text_pairs(self, pairs: List[List[str]], max_length: int = 1024) -> List[float]:
-        """Utility helper for non-llama-index callers: score query/document text pairs."""
+        """Score query/document text pairs.
+
+        Args:
+            pairs: List of [query, document] pairs.
+            max_length: Max token length for scoring.
+
+        Returns:
+            List of scores aligned to input pairs.
+        """
         if not pairs:
             return []
         if not getattr(self, "_loaded", False):
@@ -1269,14 +1340,12 @@ class JinaMultimodalReranker:
 _MINISTRAL_CACHE = {}
 
 class MinistralMultiModal(CustomLLM):
-    """CustomLLM wrapper for Mistral Ministral-3 series (3B/8B/14B) in native FP8.
+    """CustomLLM wrapper for Mistral Ministral-3 series in native FP8.
 
-    Supports:
+    Supported checkpoints include:
     - mistralai/Ministral-3-3B-Instruct-2512
     - mistralai/Ministral-3-8B-Instruct-2512
     - mistralai/Ministral-3-14B-Instruct-2512
-
-    Mirrors Qwen3VLMultiModal implementation pattern.
     """
 
     model_id: str = Field(default="mistralai/Ministral-3-8B-Instruct-2512")
@@ -1316,7 +1385,11 @@ class MinistralMultiModal(CustomLLM):
         return self.model_id
 
     def _init_hf(self) -> None:
-        """Load tokenizer + Ministral-3 model in native FP8"""
+        """Load tokenizer and model weights for Ministral-3.
+
+        Raises:
+            RuntimeError: If the Mistral backend is unavailable.
+        """
 
         try:
             os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
@@ -1386,7 +1459,14 @@ class MinistralMultiModal(CustomLLM):
                     pass
 
     def _truncate_input(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Truncate input to max_input_tokens"""
+        """Truncate input ids to the configured maximum length.
+
+        Args:
+            input_ids: Token ids tensor.
+
+        Returns:
+            Truncated tensor if needed, otherwise the original tensor.
+        """
         if input_ids.shape[-1] > self.max_input_tokens:
             _logger.warning(
                 "Truncating Ministral input from %d to %d tokens",
@@ -1498,7 +1578,7 @@ class MinistralMultiModal(CustomLLM):
 # ============================================================================
 
 class GeminiMultimodalLLM(CustomLLM):
-    """Native Gemini API client with multimodal support (text, image, audio, video)."""
+    """Gemini API client with multimodal support."""
     
     model_id: str = Field(default="gemini-3-pro-preview")
     max_new_tokens: int = Field(default=16000)
@@ -1535,7 +1615,14 @@ class GeminiMultimodalLLM(CustomLLM):
         return self.model_id
     
     def _infer_interaction_type(self, mime_type: str) -> str:
-        """Map mime type to Gemini Interactions input type."""
+        """Map a MIME type to a Gemini interaction input type.
+
+        Args:
+            mime_type: MIME type string.
+
+        Returns:
+            Gemini input type string (e.g., "image", "audio", "video").
+        """
         if mime_type.startswith("image/"):
             return "image"
         if mime_type.startswith("audio/"):
@@ -1552,7 +1639,15 @@ class GeminiMultimodalLLM(CustomLLM):
         image_documents: Optional[List[ImageDocument]] = None,
         **kwargs
     ) -> List[Dict[str, Any]]:
-        """Prepare Interactions input with text and optional media."""
+        """Prepare Gemini interaction input with text and optional media.
+
+        Args:
+            prompt: User prompt text.
+            image_documents: Optional image documents with file paths.
+
+        Returns:
+            List of Gemini interaction inputs.
+        """
         inputs: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
 
         if image_documents:
@@ -1638,7 +1733,7 @@ class GeminiMultimodalLLM(CustomLLM):
 
 
 class OpenAIMultimodalLLM(CustomLLM):
-    """Native OpenAI API client with multimodal support."""
+    """OpenAI API client with multimodal support."""
     
     model_id: str = Field(default="gpt-4o")
     max_new_tokens: int = Field(default=4096)
@@ -1687,7 +1782,15 @@ class OpenAIMultimodalLLM(CustomLLM):
         return self._conversation_id
 
     def _prepare_input(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None) -> List[Dict]:
-        """Prepare Responses API input with text and optional images."""
+        """Prepare Responses API input with text and optional images.
+
+        Args:
+            prompt: User prompt text.
+            image_documents: Optional image documents with file paths.
+
+        Returns:
+            Responses API payload list.
+        """
         content = [{"type": "input_text", "text": prompt}]
 
         if image_documents:
@@ -1769,7 +1872,7 @@ class OpenAIMultimodalLLM(CustomLLM):
 # ============================================================================
 
 class Qwen3TextLLM(CustomLLM):
-    """Qwen3 text-only models (4B and 30B FP8 variants) without vision capabilities."""
+    """Qwen3 text-only model wrapper without vision capabilities."""
     
     model_id: str = Field(default="Qwen/Qwen3-4B-Instruct-2507-FP8")
     max_new_tokens: int = Field(default=16384)
@@ -1806,7 +1909,7 @@ class Qwen3TextLLM(CustomLLM):
         return self.model_id
     
     def _init_hf(self) -> None:
-        """Load tokenizer + model. Models are already in FP8, no quantization needed."""
+        """Load tokenizer and model weights for Qwen3 text models."""
         self._tokenizer = AutoTokenizer.from_pretrained(
             self.model_id,
             trust_remote_code=True
@@ -1914,7 +2017,7 @@ class Qwen3TextLLM(CustomLLM):
 # ============================================================================
 
 class Qwen3OmniMultiModal(CustomLLM):
-    """Qwen3-Omni-30B-A3B-Instruct for audio, video, and text processing."""
+    """Qwen3-Omni model wrapper for audio, video, and text processing."""
     
     model_id: str = Field(default="Qwen/Qwen3-Omni-30B-A3B-Instruct")
     max_new_tokens: int = Field(default=4096)
@@ -1953,7 +2056,7 @@ class Qwen3OmniMultiModal(CustomLLM):
         return self.model_id
     
     def _init_hf(self) -> None:
-        """Load processor + Qwen3-Omni model."""
+        """Load processor and model weights for Qwen3-Omni."""
         model_kwargs = {
             "dtype": "auto",
             "device_map": self.device_map,
@@ -1989,7 +2092,15 @@ class Qwen3OmniMultiModal(CustomLLM):
                     pass
     
     def _prepare_conversation(self, prompt: str, image_documents: Optional[List[ImageDocument]] = None) -> List[Dict]:
-        """Prepare conversation with text, images, audio, and video."""
+        """Prepare conversation with text, images, audio, and video.
+
+        Args:
+            prompt: User prompt text.
+            image_documents: Optional media documents with file paths.
+
+        Returns:
+            Conversation payload for the processor.
+        """
         content = [{"type": "text", "text": prompt}]
         
         if image_documents:
@@ -2072,7 +2183,7 @@ class Qwen3OmniMultiModal(CustomLLM):
 # ============================================================================
 
 class QwenImageGenerator:
-    """Image generation using Qwen-Image-2512 diffusion model."""
+    """Image generation using the Qwen-Image-2512 diffusion model."""
     
     def __init__(self, model_name: str = "Qwen/Qwen-Image-2512"):
         if not DIFFUSERS_AVAILABLE:
@@ -2083,7 +2194,7 @@ class QwenImageGenerator:
         self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
     def _ensure_pipeline(self):
-        """Lazy load the pipeline."""
+        """Lazy-load the diffusion pipeline."""
         if self.pipe is None:
             _logger.info(f"Loading image generation pipeline: {self.model_name}")
             self.pipe = DiffusionPipeline.from_pretrained(
@@ -2101,7 +2212,20 @@ class QwenImageGenerator:
         seed: Optional[int] = None,
         output_path: str = "generated_image.png"
     ) -> str:
-        """Generate image from text prompt."""
+        """Generate an image from a text prompt.
+
+        Args:
+            prompt: Text prompt to render.
+            negative_prompt: Negative prompt guidance.
+            aspect_ratio: Aspect ratio string (e.g., "16:9").
+            num_inference_steps: Number of diffusion steps.
+            true_cfg_scale: CFG scale value.
+            seed: Optional random seed.
+            output_path: Output image path.
+
+        Returns:
+            Path to the generated image.
+        """
         self._ensure_pipeline()
         
         aspect_ratios = {
@@ -2141,7 +2265,7 @@ class QwenImageGenerator:
 # ============================================================================
 
 class QwenImageEditor:
-    """Image editing using Qwen-Image-Edit-2511."""
+    """Image editing using the Qwen-Image-Edit-2511 model."""
     
     def __init__(self, model_name: str = "Qwen/Qwen-Image-Edit-2511"):
         if not DIFFUSERS_AVAILABLE:
@@ -2151,7 +2275,7 @@ class QwenImageEditor:
         self.torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     
     def _ensure_pipeline(self):
-        """Lazy load the pipeline."""
+        """Lazy-load the image editing pipeline."""
         if self.pipeline is None:
             _logger.info(f"Loading image editing pipeline: {self.model_name}")
             self.pipeline = QwenImageEditPlusPipeline.from_pretrained(
@@ -2172,7 +2296,21 @@ class QwenImageEditor:
         seed: int = 0,
         output_path: str = "edited_image.png"
     ) -> str:
-        """Edit image(s) based on text prompt."""
+        """Edit image(s) based on a text prompt.
+
+        Args:
+            image_paths: Path or list of paths to input images.
+            prompt: Edit instruction.
+            negative_prompt: Negative prompt guidance.
+            num_inference_steps: Number of diffusion steps.
+            guidance_scale: Guidance scale value.
+            true_cfg_scale: CFG scale value.
+            seed: Random seed.
+            output_path: Output image path.
+
+        Returns:
+            Path to the edited image.
+        """
         self._ensure_pipeline()
         
         # Load images
@@ -2206,7 +2344,15 @@ class QwenImageEditor:
 # ============================================================================
 
 def get_or_create_qwen3_text_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached Qwen3TextLLM or create one."""
+    """Return cached Qwen3TextLLM or create one.
+
+    Args:
+        model_name: Optional Qwen3 text model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created Qwen3TextLLM instance.
+    """
     key = (model_name or "Qwen/Qwen3-4B-Instruct-2507-FP8", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
@@ -2224,7 +2370,15 @@ def get_or_create_qwen3_text_llm(model_name: Optional[str] = None, device: Optio
 
 
 def get_or_create_qwen3_omni_llm(model_name: Optional[str] = None, device: Optional[str] = None):
-    """Return cached Qwen3OmniMultiModal or create one."""
+    """Return cached Qwen3OmniMultiModal or create one.
+
+    Args:
+        model_name: Optional Qwen3-Omni model id.
+        device: Optional device map or device string.
+
+    Returns:
+        Cached or newly created Qwen3OmniMultiModal instance.
+    """
     key = (model_name or "Qwen/Qwen3-Omni-30B-A3B-Instruct", device or "auto")
     inst = _LLM_CACHE.get(key)
     if inst is not None:
@@ -2246,7 +2400,16 @@ def get_or_create_gemini_llm(
     api_key: Optional[str] = None,
     session_id: Optional[str] = None,
 ):
-    """Return cached GeminiMultimodalLLM or create one."""
+    """Return cached GeminiMultimodalLLM or create one.
+
+    Args:
+        model_name: Optional Gemini model name.
+        api_key: Optional API key override.
+        session_id: Optional session identifier for caching.
+
+    Returns:
+        Cached or newly created GeminiMultimodalLLM instance.
+    """
     key = (model_name or "gemini-3-pro-preview", api_key or os.environ.get("GOOGLE_API_KEY"), session_id)
     inst = _API_CLIENT_CACHE.get(key)
     if inst is not None:
@@ -2268,7 +2431,16 @@ def get_or_create_openai_llm(
     api_key: Optional[str] = None,
     session_id: Optional[str] = None,
 ):
-    """Return cached OpenAIMultimodalLLM or create one."""
+    """Return cached OpenAIMultimodalLLM or create one.
+
+    Args:
+        model_name: Optional OpenAI model name.
+        api_key: Optional API key override.
+        session_id: Optional session identifier for caching.
+
+    Returns:
+        Cached or newly created OpenAIMultimodalLLM instance.
+    """
     key = (model_name or "gpt-4o", api_key or os.environ.get("OPENAI_API_KEY"), session_id)
     inst = _API_CLIENT_CACHE.get(key)
     if inst is not None:
@@ -2286,7 +2458,14 @@ def get_or_create_openai_llm(
 
 
 def get_or_create_image_generator(model_name: Optional[str] = None):
-    """Return cached QwenImageGenerator or create one."""
+    """Return cached QwenImageGenerator or create one.
+
+    Args:
+        model_name: Optional Qwen image model id.
+
+    Returns:
+        Cached or newly created QwenImageGenerator instance.
+    """
     if not DIFFUSERS_AVAILABLE:
         raise RuntimeError("Diffusers library not available. Cannot create image generator.")
     
@@ -2308,7 +2487,14 @@ def get_or_create_image_generator(model_name: Optional[str] = None):
 
 
 def get_or_create_image_editor(model_name: Optional[str] = None):
-    """Return cached QwenImageEditor or create one."""
+    """Return cached QwenImageEditor or create one.
+
+    Args:
+        model_name: Optional Qwen image edit model id.
+
+    Returns:
+        Cached or newly created QwenImageEditor instance.
+    """
     if not DIFFUSERS_AVAILABLE:
         raise RuntimeError("Diffusers library not available. Cannot create image editor.")
     

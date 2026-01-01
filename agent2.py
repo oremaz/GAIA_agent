@@ -43,8 +43,14 @@ root_logger.setLevel(logging.INFO)
 logger.setLevel(logging.INFO)
 
 def llm_reformat(response: str, question: str) -> str:
-    """
-    Use LLM to extract the exact answer from the response using the same prompt format as agent.py.
+    """Extract the final answer from a response using an LLM.
+
+    Args:
+        response: Full model response text.
+        question: Original user question.
+
+    Returns:
+        Extracted final answer, or the original response on failure.
     """
     format_prompt = f"""Extract the exact answer from the response below.
 
@@ -117,7 +123,15 @@ class FinalAnswerTool(Tool):
     output_type = "any"
 
     def forward(self, answer: Any, original_question: str = "") -> Any:
-        """Return the answer, optionally normalized using the LLM."""
+        """Return the answer, optionally normalized by the LLM.
+
+        Args:
+            answer: Proposed final answer.
+            original_question: Optional original question for formatting.
+
+        Returns:
+            Normalized answer if possible, otherwise the original answer.
+        """
         if not original_question:
             return answer
         if isinstance(answer, (int, float)):
@@ -128,14 +142,13 @@ class FinalAnswerTool(Tool):
 
 @tool
 def get_youtube_transcript(youtube_url: str) -> str:
-    """
-    Fetches the transcript of a YouTube video given its URL, if available.
+    """Fetch a YouTube transcript given a URL or video id.
 
     Args:
-        youtube_url: The URL of the YouTube video to fetch the transcript for.
+        youtube_url: YouTube URL or video id.
 
     Returns:
-        The transcript text if available, or an error message if not.
+        Transcript text if available, otherwise an error message.
     """
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
@@ -178,7 +191,14 @@ class WebSearchTool(Tool):
         self.ddgs = DDGS(**kwargs)
 
     def _perform_search(self, query: str):
-        """Internal method to perform the actual search."""
+        """Perform the underlying DDGS search.
+
+        Args:
+            query: Search query.
+
+        Returns:
+            Iterable of DDGS search results.
+        """
         return self.ddgs.text(query, max_results=self.max_results)
 
     def forward(self, query: str) -> str:
@@ -212,13 +232,13 @@ class WebSearchTool(Tool):
 
 @tool
 def visit_webpage(url: str) -> str:
-    """Visits a webpage at the given URL and returns its content as a markdown string.
+    """Fetch a webpage and return its content as Markdown.
 
     Args:
-        url: The URL of the webpage to visit.
+        url: Webpage URL.
 
     Returns:
-        The content of the webpage converted to Markdown, or an error message if the request fails.
+        Markdown content, or an error message if the request fails.
     """
     try:
         # Send a GET request to the URL
@@ -299,14 +319,16 @@ class UnifiedMultimodalTool(Tool):
                 task: str = "analyze", 
                 modality: str = "auto",
                 additional_context: str = "") -> str:
-        """
-        Process multimedia files with unified interface
-        
+        """Process multimedia files with a unified interface.
+
         Args:
-            file_path: Path to media file
-            task: Processing task (analyze, transcribe, extract, caption, summarize, search)
-            modality: Force specific modality (auto, audio, video, image)
-            additional_context: Extra instructions for processing
+            file_path: Path to media file.
+            task: Processing task (analyze, transcribe, extract, caption, summarize, search).
+            modality: Force modality (auto, audio, video, image).
+            additional_context: Extra instructions for processing.
+
+        Returns:
+            Model output text or an error message.
         """
         try:
             # Auto-detect modality if not specified
@@ -339,7 +361,14 @@ class UnifiedMultimodalTool(Tool):
             return f"Error processing {modality} file: {str(e)}"
     
     def _detect_modality(self, file_path: str) -> str:
-        """Auto-detect file modality using mimetypes.guess_type()"""
+        """Detect media modality using mimetypes and extension fallback.
+
+        Args:
+            file_path: Path to media file.
+
+        Returns:
+            Detected modality string (audio, video, image, unsupported, unknown).
+        """
         # Use mimetypes.guess_type for reliable MIME type detection
         mime_type, _ = mimetypes.guess_type(file_path)
         
@@ -373,7 +402,14 @@ class UnifiedMultimodalTool(Tool):
             return 'unknown'
     
     def _get_mime_type(self, file_path: str) -> str:
-        """Get MIME type using mimetypes.guess_type()"""
+        """Determine MIME type with fallback mappings.
+
+        Args:
+            file_path: Path to media file.
+
+        Returns:
+            MIME type string.
+        """
         mime_type, encoding = mimetypes.guess_type(file_path)
         
         if mime_type:
@@ -394,7 +430,16 @@ class UnifiedMultimodalTool(Tool):
         return fallback_mappings.get(ext, 'application/octet-stream')
     
     def _generate_prompt(self, task: str, modality: str, context: str) -> str:
-        """Generate contextual prompts based on task and modality"""
+        """Generate a task prompt based on modality and context.
+
+        Args:
+            task: Task name.
+            modality: Media modality.
+            context: Additional instructions.
+
+        Returns:
+            Prompt string tailored to the task and modality.
+        """
         
         base_prompts = {
             'analyze': {
@@ -437,7 +482,14 @@ class UnifiedMultimodalTool(Tool):
         return prompt
     
     def _get_media_resolution(self, modality: str) -> Optional[Dict[str, str]]:
-        """Get recommended media resolution based on modality"""
+        """Return recommended media resolution hint for Gemini.
+
+        Args:
+            modality: Media modality.
+
+        Returns:
+            Resolution hint dictionary or None.
+        """
         if modality == 'image':
             return {"level": "media_resolution_high"}
         elif modality == 'video':
@@ -446,7 +498,16 @@ class UnifiedMultimodalTool(Tool):
         return None
 
     def _process_with_files_api(self, file_path: str, prompt: str, modality: str) -> str:
-        """Process large files using Files API"""
+        """Process large files using the Gemini Files API.
+
+        Args:
+            file_path: Path to media file.
+            prompt: Prepared prompt text.
+            modality: Media modality.
+
+        Returns:
+            Model response text.
+        """
         uploaded_file = self.client.files.upload(file=file_path)
         
         resolution = self._get_media_resolution(modality)
@@ -478,7 +539,16 @@ class UnifiedMultimodalTool(Tool):
         return response.text
     
     def _process_inline(self, file_path: str, prompt: str, modality: str) -> str:
-        """Process smaller files inline"""
+        """Process smaller files inline with the Gemini API.
+
+        Args:
+            file_path: Path to media file.
+            prompt: Prepared prompt text.
+            modality: Media modality.
+
+        Returns:
+            Model response text.
+        """
         with open(file_path, "rb") as f:
             file_data = f.read()
         
@@ -518,14 +588,26 @@ class UnifiedMultimodalTool(Tool):
         return response.text
 
     def _select_transcription_model(self) -> str:
-        """Choose an OpenAI transcription model with optional diarization support."""
+        """Choose an OpenAI transcription model.
+
+        Returns:
+            Transcription model name.
+        """
         env_model = os.environ.get("OPENAI_TRANSCRIBE_MODEL")
         if env_model:
             return env_model
         return "gpt-4o-mini-transcribe"
 
     def _process_openai_image(self, file_path: str, prompt: str) -> str:
-        """Process image with OpenAI Responses API using file uploads."""
+        """Process an image using the OpenAI Responses API.
+
+        Args:
+            file_path: Path to image file.
+            prompt: Prompt text.
+
+        Returns:
+            Model response text.
+        """
         with open(file_path, "rb") as f:
             result = self.client.files.create(
                 file=f,
@@ -546,7 +628,14 @@ class UnifiedMultimodalTool(Tool):
         return (response.output_text or "").strip()
 
     def _process_openai_audio(self, file_path: str) -> str:
-        """Process audio/video with OpenAI transcriptions."""
+        """Process audio/video using OpenAI transcriptions.
+
+        Args:
+            file_path: Path to audio or video file.
+
+        Returns:
+            Transcription text or an error message.
+        """
         ext = os.path.splitext(file_path)[1].lower()
         allowed_exts = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
         if ext not in allowed_exts:
@@ -569,7 +658,14 @@ class UnifiedMultimodalTool(Tool):
         return transcript_text.strip()
 
     def get_file_info(self, file_path: str) -> Dict[str, str]:
-        """Get detailed file information including MIME type and modality"""
+        """Return file metadata including MIME type and modality.
+
+        Args:
+            file_path: Path to media file.
+
+        Returns:
+            Metadata dictionary for the file.
+        """
         mime_type, encoding = mimetypes.guess_type(file_path)
         modality = self._detect_modality(file_path)
         file_size = os.path.getsize(file_path)
@@ -589,17 +685,19 @@ def initialize_llm_model(
     temperature: float = 0.7,
     **kwargs
 ) -> Any:
-    """
-    Initialize LLM model from various providers for smolagents
+    """Initialize an LLM model for smolagents.
 
     Args:
-        provider: "gemini" or "openai"
-        model_name: Specific model name (required)
-        temperature: Sampling temperature
-        **kwargs: Additional model-specific parameters
+        provider: "gemini" or "openai".
+        model_name: Specific model name (required).
+        temperature: Sampling temperature.
+        **kwargs: Additional model-specific parameters.
 
     Returns:
-        Initialized model instance compatible with smolagents
+        Initialized model instance compatible with smolagents.
+
+    Raises:
+        ValueError: If provider or model configuration is invalid.
     """
     # Provider configuration
     config = {
@@ -657,9 +755,7 @@ def initialize_llm_model(
 
 
 class GAIAAgent:
-    """
-    GAIA agent using smolagents with Gemini 2.0 Flash and Langfuse observability
-    """
+    """GAIA agent using smolagents with Langfuse observability."""
 
     def __init__(
         self,
@@ -669,15 +765,14 @@ class GAIAAgent:
         model_name: Optional[str] = None,
         mcp_servers: Optional[List[str]] = None
     ):
-        """
-        Initialize the agent with configurable LLM provider and MCP tools
+        """Initialize the agent with an LLM provider and MCP tools.
 
         Args:
-            user_id: User identifier for tracking
-            session_id: Session identifier for tracking
-            provider: LLM provider ("gemini", "openai")
-            model_name: Specific model name (uses defaults if None)
-            mcp_servers: List of MCP server names to load
+            user_id: User identifier for tracking.
+            session_id: Session identifier for tracking.
+            provider: LLM provider ("gemini", "openai").
+            model_name: Specific model name (uses defaults if None).
+            mcp_servers: List of MCP server names to load.
         """
 
         # Initialize Langfuse observability
@@ -737,7 +832,7 @@ class GAIAAgent:
             logger.warning("Langfuse client unavailable: %s", e)
 
     def _setup_langfuse_observability(self):
-        """Set up Langfuse observability with OpenTelemetry"""
+        """Set up Langfuse observability with OpenTelemetry."""
         # Get Langfuse keys from environment variables
         langfuse_public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
         langfuse_secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
@@ -770,7 +865,7 @@ class GAIAAgent:
         SmolagentsInstrumentor().instrument(tracer_provider=trace_provider)
 
     def _create_agent(self):
-        """Create the CodeAgent with tools"""
+        """Create the CodeAgent with tools."""
         base_tools = [
             WebSearchTool(),
             visit_webpage,
@@ -797,7 +892,15 @@ class GAIAAgent:
         )
 
     def _log_run_trace(self, prompt: str, response: str) -> Optional[str]:
-        """Log input/output to Langfuse and return trace_id if available."""
+        """Log input/output to Langfuse and return a trace id if available.
+
+        Args:
+            prompt: Input prompt text.
+            response: Model response text.
+
+        Returns:
+            Trace id if recorded, otherwise None.
+        """
         if not self.langfuse:
             return None
 
@@ -823,7 +926,14 @@ class GAIAAgent:
 
 
     def _gaia_file_to_context(self, file_path: str) -> str:
-        """Convert a GAIA task file into prompt context."""
+        """Convert a GAIA task file into prompt context.
+
+        Args:
+            file_path: Path to the GAIA task file.
+
+        Returns:
+            Prompt-ready context string.
+        """
         if not file_path:
             return ""
 
@@ -867,7 +977,15 @@ class GAIAAgent:
 
 
     def download_gaia_file(self, task_id: str, api_url: str = "https://agents-course-unit4-scoring.hf.space") -> str:
-        """Download file associated with GAIA task_id and return its path"""
+        """Download a GAIA task file and return its local path.
+
+        Args:
+            task_id: GAIA task identifier.
+            api_url: Base API URL.
+
+        Returns:
+            Local file path, or None on failure.
+        """
         try:
             response = requests.get(f"{api_url}/files/{task_id}", timeout=30)
             response.raise_for_status()
@@ -894,16 +1012,15 @@ class GAIAAgent:
             return None
 
     def run(self, query: str, max_steps: Optional[int] = None, reset_documents: bool = False) -> tuple[str, Optional[str]]:
-        """
-        Run the agent on a general query (main method for chat interface).
+        """Run the agent on a user query.
 
         Args:
-            query: User's question or instruction
-            max_steps: Maximum reasoning steps (overrides agent default)
-            reset_documents: Reserved for compatibility (no-op)
+            query: User question or instruction.
+            max_steps: Maximum reasoning steps (overrides agent default).
+            reset_documents: Reserved for compatibility (no-op).
 
         Returns:
-            Tuple of (response_text, trace_id)
+            Tuple of (response_text, trace_id).
         """
         try:
             full_query = query
@@ -931,7 +1048,14 @@ class GAIAAgent:
             return error_msg, None
 
     def _extract_final_answer(self, response: str) -> str:
-        """Extract final answer from agent response for GAIA format"""
+        """Extract the final answer from an agent response.
+
+        Args:
+            response: Full model response text.
+
+        Returns:
+            Extracted final answer string.
+        """
         if "FINAL ANSWER:" in response:
             return response.split("FINAL ANSWER:")[-1].strip()
 
@@ -939,15 +1063,13 @@ class GAIAAgent:
         return lines[-1] if lines else response
 
     def solve_gaia_question(self, question_dict: Dict[str, Any]) -> str:
-        """
-        Solve a GAIA benchmark question (legacy method for evaluation).
-        Now wraps the general run() method.
+        """Solve a GAIA benchmark question (legacy method for evaluation).
 
         Args:
-            question_dict: Dictionary with "Question" key and optional "task_id"
+            question_dict: Dictionary with "Question" key and optional "task_id".
 
         Returns:
-            Formatted answer for GAIA benchmark
+            Formatted answer for GAIA benchmark.
         """
         question_text = question_dict.get("Question", "")
         task_id = question_dict.get("task_id")
@@ -966,13 +1088,12 @@ class GAIAAgent:
 
 
     def add_user_feedback(self, trace_id: str, feedback_score: int, comment: str = None):
-        """
-        Add user feedback to a specific trace
-        
+        """Add user feedback to a specific trace.
+
         Args:
-            trace_id: The trace ID to add feedback to
-            feedback_score: Score from 0-5 (0=very bad, 5=excellent)
-            comment: Optional comment from user
+            trace_id: Trace id to score.
+            feedback_score: Score from 0-5 (0=very bad, 5=excellent).
+            comment: Optional user comment.
         """
         try:
             self.langfuse.score(

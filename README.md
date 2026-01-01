@@ -7,29 +7,29 @@ Production-grade conversational AI agent with a Streamlit UI, LlamaIndex-based m
 ### 1) LlamaIndex conversational agent (`agent.py`)
 - **Multi-agent workflow** (`ReActAgent` + `AgentWorkflow`) with a research agent and optional specialized agents (code execution, image analysis, media analysis, image generation/editing).
 - **Modes**:
-  - **API mode**: Gemini or OpenAI (selected per chat in the UI). Uses Jina embeddings for any indexing.
+  - **API mode**: Gemini or OpenAI (selected per chat in the UI). No vector store; web search returns raw page content.
   - **Local mode**: Qwen or Ministral suites with specialized models (text, vision, audio/video, code, optional image generation/editing if diffusers are available).
 - **Document handling**:
   - Docling for PDFs, Office files, and HTML.
   - CSV/Excel/JSON/text readers for structured data.
   - Images/audio/video processed through the active multimodal LLM in local mode.
-- **Web search RAG**:
+- **Web search**:
   - DDGS search + content extraction.
-  - Temporary in-memory `VectorStoreIndex` with hierarchical chunking and Jina reranking.
+  - Local mode: temporary in-memory `VectorStoreIndex` with hierarchical chunking and Jina reranking.
+  - API mode: returns full page content for multiple results (no indexing).
 - **Code execution** with a restricted global namespace.
 - **Structured answer extraction** via Pydantic `LLMTextCompletionProgram`.
 
-### 2) smolagents GAIA runner (`agent2.py`)
+### 2) smolagents runner (`agent2.py`)
 - **smolagents agent** built on `CodeAgent` with:
   - Web search (DuckDuckGo), page visiting, YouTube transcript, Python interpreter, and optional multimodal tool.
   - Optional MCP tool collections (filesystem, GitHub, Brave Search, Slack, Postgres, PubMed).
-- **Used for the Hugging Face GAIA challenge** as the final assignment for the AI Agent course.
 - Supports **Gemini** and **OpenAI** via `OpenAIServerModel`.
 - Optional multimodal tool:
   - **Gemini**: images/audio/video via Gemini SDK.
   - **OpenAI**: images via Responses API; audio/video via transcription models.
 - **Document loading** in memory (Docling-first). If Docling fails, the document is skipped.
-- **GAIA task files**: documents are injected into the prompt via Docling; media files are passed as file paths with explicit tool instructions to call `multimodal_processor`.
+- **Used for the Hugging Face GAIA challenge** as the final assignment for the AI Agent course; GAIA task files: documents are injected into the prompt via Docling; media files are passed as file paths with explicit tool instructions to call `multimodal_processor`.
 
 ### 3) Streamlit UI (`app.py`)
 - Per-chat configuration (framework, mode, provider, model, and specialized features).
@@ -55,6 +55,7 @@ Production-grade conversational AI agent with a Streamlit UI, LlamaIndex-based m
 ### LlamaIndex API mode
 - Uses **Gemini/OpenAI** for reasoning.
 - Document uploads are inserted as full text into prompt memory (no vector store).
+- Web search returns raw page content (no indexing).
 
 ### smolagents
 - CodeAgent-based assistant designed for tool-heavy tasks.
@@ -104,7 +105,7 @@ The UI opens at `http://localhost:8501`.
 ## Configuration
 
 ### Environment variables
-**Core keys**:
+**Core keys** (set exactly one):
 ```
 export GOOGLE_API_KEY="your-google-api-key"
 export OPENAI_API_KEY="your-openai-api-key"
@@ -128,12 +129,6 @@ export POSTGRES_CONNECTION_STRING="your-postgres-uri"
 **OpenAI transcription model (optional)**:
 ```
 export OPENAI_TRANSCRIBE_MODEL="gpt-4o-mini-transcribe"
-```
-
-### Local model selection
-You can override local models using:
-```
-export LOCAL_MODEL_ID="Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 ```
 
 ### Streamlit settings

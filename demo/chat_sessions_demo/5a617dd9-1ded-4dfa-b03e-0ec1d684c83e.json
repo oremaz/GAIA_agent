@@ -1,0 +1,81 @@
+{
+  "session_id": "5a617dd9-1ded-4dfa-b03e-0ec1d684c83e",
+  "title": "Llamaindex - gemini-3-flash-previ",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the kind of animal in the image? Be precise!\n\n[Attached: test_img_2.jpeg (image)]",
+      "timestamp": "2026-01-02T13:03:25.203377",
+      "metadata": {
+        "type": "multimodal_message",
+        "media_files": [
+          {
+            "filename": "test_img_2.jpeg",
+            "path": "/Users/ethanorel/conversational_ai_agent/.prompt_media/5a617dd9-1ded-4dfa-b03e-0ec1d684c83e/bce52ede-6e83-4dc9-9149-aac4347a6f7a_test_img_2.jpeg",
+            "type": "image"
+          }
+        ],
+        "media_paths": [
+          "/Users/ethanorel/conversational_ai_agent/.prompt_media/5a617dd9-1ded-4dfa-b03e-0ec1d684c83e/bce52ede-6e83-4dc9-9149-aac4347a6f7a_test_img_2.jpeg"
+        ]
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "Jack Russell Terrier",
+      "timestamp": "2026-01-02T13:04:00.783412",
+      "metadata": {}
+    },
+    {
+      "role": "user",
+      "content": "Now describe me more precisely the image and compare with the second one: similarities and differences. \n\n[Attached: test_img.jpeg (image)]",
+      "timestamp": "2026-01-02T13:05:04.005059",
+      "metadata": {
+        "type": "multimodal_message",
+        "media_files": [
+          {
+            "filename": "test_img.jpeg",
+            "path": "/Users/ethanorel/conversational_ai_agent/.prompt_media/5a617dd9-1ded-4dfa-b03e-0ec1d684c83e/57124ff0-c43b-4249-992f-5c21590350d0_test_img.jpeg",
+            "type": "image"
+          }
+        ],
+        "media_paths": [
+          "/Users/ethanorel/conversational_ai_agent/.prompt_media/5a617dd9-1ded-4dfa-b03e-0ec1d684c83e/57124ff0-c43b-4249-992f-5c21590350d0_test_img.jpeg"
+        ]
+      }
+    },
+    {
+      "role": "assistant",
+      "content": "The second image depicts a Jack Russell Terrier wearing red sunglasses and sitting on a yellow surfboard in a turquoise ocean under a blue sky. Compared to the first image, the main similarities are the breed and the alert expression. The primary differences are the setting (ocean vs. field), the use of props (sunglasses vs. natural), and the pose (sitting vs. standing/panting).",
+      "timestamp": "2026-01-02T13:05:45.215986",
+      "metadata": {}
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-01-02T12:41:27.711091",
+    "updated_at": "2026-01-02T13:05:45.216005",
+    "vector_store_id": "vs_5a617dd9-1ded-4dfa-b03e-0ec1d684c83e",
+    "agent_config": {
+      "framework": "llamaindex",
+      "mode": "api",
+      "llm_provider": "gemini",
+      "llm_model": "gemini-3-flash-preview",
+      "code_execution_enabled": true,
+      "use_specialized_code_model": false,
+      "img_generation_enabled": false,
+      "img_editing_enabled": false,
+      "media_analysis_enabled": false
+    }
+  },
+  "agent_config": {
+    "framework": "llamaindex",
+    "mode": "api",
+    "llm_provider": "gemini",
+    "llm_model": "gemini-3-flash-preview",
+    "code_execution_enabled": true,
+    "use_specialized_code_model": false,
+    "img_generation_enabled": false,
+    "img_editing_enabled": false,
+    "media_analysis_enabled": false
+  }
+}

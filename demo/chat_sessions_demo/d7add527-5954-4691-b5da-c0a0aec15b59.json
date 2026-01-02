@@ -1,0 +1,48 @@
+{
+  "session_id": "d7add527-5954-4691-b5da-c0a0aec15b59",
+  "title": "Smolagents - gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! What are the top 3 news of the day in Europe? ",
+      "timestamp": "2026-01-02T15:40:48.917918",
+      "metadata": {}
+    },
+    {
+      "role": "assistant",
+      "content": "Here are the top 3 news of the day in Europe:\n\n1. **Accident in Switzerland**: Teenage golf star named as first victim of Swiss ski resort fire.\n2. **UK Economy**: FTSE 100 breaks 'historic' 10,000 points mark for the first time.\n3. **Finland Politics**: Police in Finland Arrest 2 in Connection with Damage to Undersea Telecom Cable.",
+      "timestamp": "2026-01-02T15:40:59.995684",
+      "metadata": {
+        "trace_id": "00000000000000000000000000000000"
+      }
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-01-02T15:40:32.740794",
+    "updated_at": "2026-01-02T15:40:59.995701",
+    "vector_store_id": "vs_d7add527-5954-4691-b5da-c0a0aec15b59",
+    "agent_config": {
+      "framework": "smolagents",
+      "mode": "api",
+      "llm_provider": "gemini",
+      "llm_model": "gemini-2.5-flash",
+      "code_execution_enabled": true,
+      "use_specialized_code_model": false,
+      "img_generation_enabled": false,
+      "img_editing_enabled": false,
+      "media_analysis_enabled": false
+    },
+    "last_trace_id": "00000000000000000000000000000000"
+  },
+  "agent_config": {
+    "framework": "smolagents",
+    "mode": "api",
+    "llm_provider": "gemini",
+    "llm_model": "gemini-2.5-flash",
+    "code_execution_enabled": true,
+    "use_specialized_code_model": false,
+    "img_generation_enabled": false,
+    "img_editing_enabled": false,
+    "media_analysis_enabled": false
+  }
+}

@@ -30,6 +30,7 @@ Production-grade conversational AI agent with a Streamlit UI, LlamaIndex-based m
   - **OpenAI**: images via Responses API; audio/video via transcription models.
 - **Document loading** in memory (Docling-first). If Docling fails, the document is skipped.
 - **Used for the Hugging Face GAIA challenge** as the final assignment for the AI Agent course; GAIA task files: documents are injected into the prompt via Docling; media files are passed as file paths with explicit tool instructions to call `multimodal_processor`.
+- **Note**: Contains `llm_reformat()` function using Pydantic structured outputs for answer extraction, designed to comply with GAIA benchmark format constraints (number/string/comma-separated list formats).
 
 ### 3) Streamlit UI (`app.py`)
 - Per-chat configuration (framework, mode, provider, model, and specialized features).
@@ -147,6 +148,9 @@ Configured in `.streamlit/config.toml` (port, theme, uploads, logging).
 - **Embeddings are always Jina** (API and local).
 - **Vector stores are only used for LlamaIndex local mode**.
 - **smolagents has no local mode**.
+
+## Demo data
+See the `demo/` folder for sample chat session JSON files (`demo/chat_sessions_demo/`) and UI screenshots (`demo/UI_screenshots/`) useful for quick testing and reference.
 
 ## Troubleshooting
 

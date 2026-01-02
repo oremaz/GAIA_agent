@@ -5,10 +5,15 @@ import re
 import mimetypes
 import logging
 import sys
+import warnings
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from smolagents import CodeAgent, OpenAIServerModel, Tool, tool
+
+# Disable weave instrumentation for this module to avoid serialization issues with CodeAgent
+import os as _os
+_os.environ["WEAVE_DISABLED"] = "true"
 
 # Langfuse observability imports
 from opentelemetry.sdk.trace import TracerProvider
@@ -43,34 +48,30 @@ root_logger.setLevel(logging.INFO)
 logger.setLevel(logging.INFO)
 
 def llm_reformat(response: str, question: str) -> str:
-    """Extract the final answer from a response using an LLM.
+    """Extract the final answer from a response using an LLM with structured outputs.
 
     Args:
         response: Full model response text.
         question: Original user question.
 
     Returns:
-        Extracted final answer, or the original response on failure.
+        Extracted final answer using Pydantic structured outputs.
     """
+    from pydantic import BaseModel, Field
+    
+    class ExtractedAnswer(BaseModel):
+        """Structured format for extracted answer."""
+        reasoning: str = Field(description="Brief reasoning process")
+        final_answer: str = Field(description="The exact final answer extracted from the response")
+    
     format_prompt = f"""Extract the exact answer from the response below.
 
-Now extract the exact answer:
 Question: {question}
 Response: {response}
 
 Provide your reasoning, then the exact answer."""
 
     try:
-        def _extract_final(text: str) -> str:
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            if not lines:
-                return text.strip()
-            last = lines[-1]
-            for prefix in ("Answer:", "Final answer:", "FINAL ANSWER:"):
-                if last.startswith(prefix):
-                    last = last[len(prefix):].strip()
-            return last
-
         provider = _FORMAT_PROVIDER or "gemini"
         model_name = _FORMAT_MODEL_NAME or "gemini-3-pro-preview"
 
@@ -82,13 +83,18 @@ Provide your reasoning, then the exact answer."""
             if _OPENAI_CLIENT is None:
                 _OPENAI_CLIENT = OpenAI(api_key=api_key)
 
-            completion = _OPENAI_CLIENT.chat.completions.create(
+            # Use structured outputs with Pydantic
+            completion = _OPENAI_CLIENT.beta.chat.completions.parse(
                 model=model_name,
                 messages=[{"role": "user", "content": format_prompt}],
+                response_format=ExtractedAnswer,
             )
-            text = (completion.choices[0].message.content or "").strip()
-            return _extract_final(text) if text else response
+            
+            if completion.choices[0].message.parsed:
+                return completion.choices[0].message.parsed.final_answer
+            return response
 
+        # Gemini with structured outputs
         global _GENAI_CLIENT
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
@@ -96,12 +102,21 @@ Provide your reasoning, then the exact answer."""
         if _GENAI_CLIENT is None:
             _GENAI_CLIENT = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
 
+        # Use Gemini structured output
         formatting_response = _GENAI_CLIENT.models.generate_content(
             model=model_name,
-            contents=[format_prompt]
+            contents=[format_prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": ExtractedAnswer.model_json_schema(),
+            },
         )
-        text = (formatting_response.text or "").strip()
-        return _extract_final(text) if text else response
+        
+        # Parse JSON response
+        import json
+        parsed = json.loads(formatting_response.text)
+        return parsed.get("final_answer", response)
+        
     except Exception as e:
         logger.warning("LLM reformatting failed: %s", e)
         return response
@@ -130,14 +145,9 @@ class FinalAnswerTool(Tool):
             original_question: Optional original question for formatting.
 
         Returns:
-            Normalized answer if possible, otherwise the original answer.
+            The answer as provided (no LLM reformatting).
         """
-        if not original_question:
-            return answer
-        if isinstance(answer, (int, float)):
-            return answer
-        if isinstance(answer, str):
-            return llm_reformat(answer, original_question)
+        # Note: llm_reformat is available but disabled here to preserve full answers
         return answer
 
 @tool
@@ -866,6 +876,8 @@ class GAIAAgent:
 
     def _create_agent(self):
         """Create the CodeAgent with tools."""
+        import warnings
+        
         base_tools = [
             WebSearchTool(),
             visit_webpage,
@@ -877,19 +889,30 @@ class GAIAAgent:
 
         all_tools = base_tools + self.mcp_tools
 
-        self.agent = CodeAgent(
-            tools=all_tools,
-            model=self.model,
-            additional_authorized_imports=[
-                "math", "statistics", "itertools", "datetime",
-                "random", "re", "json", "csv", "os", "sys",
-                "collections", "functools", "pathlib",
-                "numpy", "pandas", "matplotlib", "seaborn",
-                "scipy", "sklearn", "requests", "bs4",
-                "PIL", "yaml", "tqdm"
-            ],
-            max_steps=6
-        )
+        # Suppress weave warnings about step_callbacks and serialization issues
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            # Also suppress weave logging
+            weave_logger = logging.getLogger("weave")
+            original_level = weave_logger.level
+            weave_logger.setLevel(logging.ERROR)
+            
+            try:
+                self.agent = CodeAgent(
+                    tools=all_tools,
+                    model=self.model,
+                    additional_authorized_imports=[
+                        "math", "statistics", "itertools", "datetime",
+                        "random", "re", "json", "csv", "os", "sys",
+                        "collections", "functools", "pathlib",
+                        "numpy", "pandas", "matplotlib", "seaborn",
+                        "scipy", "sklearn", "requests", "bs4",
+                        "PIL", "yaml", "tqdm"
+                    ],
+                    max_steps=6
+                )
+            finally:
+                weave_logger.setLevel(original_level)
 
     def _log_run_trace(self, prompt: str, response: str) -> Optional[str]:
         """Log input/output to Langfuse and return a trace id if available.
@@ -912,14 +935,22 @@ class GAIAAgent:
         }
 
         try:
-            trace = self.langfuse.trace(
+            # Use start_as_current_observation to create a trace-level span
+            with self.langfuse.start_as_current_observation(
+                as_type="span",
                 name="chat",
-                input=prompt,
-                output=response,
-                metadata=metadata,
-            )
+            ) as observation:
+                # Update with trace attributes
+                observation.update(
+                    input=prompt,
+                    output=response,
+                    metadata=metadata,
+                )
+                # Get the trace ID from the observation
+                trace_id = observation.trace_id
+            
             self.langfuse.flush()
-            return trace.id
+            return trace_id
         except Exception as e:
             logger.exception("Langfuse trace creation failed: %s", e)
             return None
@@ -1095,6 +1126,10 @@ class GAIAAgent:
             feedback_score: Score from 0-5 (0=very bad, 5=excellent).
             comment: Optional user comment.
         """
+        if not self.langfuse or not trace_id:
+            logger.warning("Langfuse client not available or trace_id is None")
+            return
+        
         try:
             self.langfuse.score(
                 trace_id=trace_id,
@@ -1102,7 +1137,6 @@ class GAIAAgent:
                 value=feedback_score,
                 comment=comment
             )
-            self.langfuse.flush()
             logger.info("User feedback added: %s/5", feedback_score)
         except Exception as e:
             logger.exception("Error adding user feedback: %s", e)

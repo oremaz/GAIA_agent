@@ -8,6 +8,7 @@ __pycache__/
 # Virtual environments
 env/
 venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/
@@ -33,6 +34,7 @@ venv.bak/
 chroma_db/
 .chat_sessions/
 offload*/
+.prompt_media
 
 # Logs
 *.log

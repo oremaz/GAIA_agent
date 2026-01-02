@@ -828,17 +828,6 @@ def render_chat_interface():
         st.markdown('<div class="main-header">AI Agent</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Create a new chat to get started</div>', unsafe_allow_html=True)
 
-        # Show example configurations
-        st.subheader("Quick Start")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.info("**LlamaIndex + API**\n\nBest for: Long documents, complex RAG\n\nFeatures:\n- Large context windows\n- Full document injection\n- No vector stores needed")
-
-        with col2:
-            st.info("**smolagents + API**\n\nBest for: Tool-heavy tasks, MCP integration\n\nFeatures:\n- GitHub, Slack, File system tools\n- Fast code execution\n- Flexible tool calling")
-
         return
 
     # Display session info
@@ -1506,23 +1495,6 @@ def render_settings():
                 st.success(f"{name}")
             else:
                 st.error(f"{name}")
-
-    # Model info
-    with st.sidebar.expander("Model Information"):
-        st.markdown("""
-        **Embeddings:** Always Jina v3 (4-bit)
-
-        **LlamaIndex:**
-        - API: Gemini/OpenAI
-        - Local: Qwen-VL, Ministral
-
-        **smolagents:**
-        - API only (no local mode)
-
-        **Vector Stores:**
-        - LlamaIndex + Local only
-        - Global (persistent) + Chat-specific
-        """)
 
     # Export/Import
     st.sidebar.subheader("Data Management")
